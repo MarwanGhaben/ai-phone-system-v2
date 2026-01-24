@@ -6,8 +6,9 @@ Centralized configuration management using pydantic-settings
 """
 
 import os
-from typing import List, Optional
-from pydantic import Field
+import json
+from typing import List, Optional, Union
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,8 +35,8 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     ws_port: int = 8001
-    allowed_origins: List[str] = Field(
-        default=["http://localhost:3000", "http://localhost:8000"],
+    allowed_origins: Union[List[str], str] = Field(
+        default="http://localhost:3000,http://localhost:8000",
         alias="ALLOWED_ORIGINS"
     )
 
@@ -131,6 +132,31 @@ class Settings(BaseSettings):
     # =====================================================
     enable_prometheus: bool = True
     prometheus_port: int = 9090
+
+    # =====================================================
+    # VALIDATORS
+    # =====================================================
+    @field_validator('allowed_origins', mode='before')
+    @classmethod
+    def parse_allowed_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        """Parse ALLOWED_ORIGINS from comma-separated string or JSON list"""
+        if isinstance(v, list):
+            return v
+
+        if isinstance(v, str):
+            # Try JSON parsing first
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            # Fall back to comma-separated parsing
+            origins = [origin.strip() for origin in v.split(',')]
+            return [o for o in origins if o]  # Filter out empty strings
+
+        return ["http://localhost:3000", "http://localhost:8000"]
 
 
 # Global settings instance
