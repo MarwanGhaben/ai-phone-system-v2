@@ -64,7 +64,7 @@ class LLMChunk:
     content: str  # Complete content so far
     is_final: bool = False
     finish_reason: Optional[str] = None
-    metadata: Dict[str] Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class LLMServiceBase(ABC):
