@@ -111,6 +111,11 @@ async def incoming_call(request: Request):
 
     twiml = await twilio.generate_twiml(ws_url)
 
+    # Log the TwiML for debugging
+    from loguru import logger
+    logger.info(f"Twilio: Generated TwiML with WebSocket URL: {ws_url}")
+    logger.debug(f"Twilio: Full TwiML:\n{twiml}")
+
     return HTMLResponse(content=twiml, media_type="application/xml")
 
 
