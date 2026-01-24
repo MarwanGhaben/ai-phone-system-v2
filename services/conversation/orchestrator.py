@@ -112,7 +112,13 @@ class ConversationOrchestrator:
 
     def _get_system_prompt(self) -> str:
         """Get system prompt for LLM"""
-        return """You are a professional phone receptionist for iFlex Tax, a Canadian accounting firm.
+        # Get accountant names from service
+        from services.config.accountants_service import get_accountants_service
+        acc_service = get_accountants_service()
+        accountant_names_en = acc_service.get_names_formatted("en")
+        accountant_names_ar = acc_service.get_names_formatted("ar")
+
+        return f"""You are a professional phone receptionist for iFlex Tax, a Canadian accounting firm.
 
 YOUR ROLE:
 - Be the first point of contact for callers
@@ -133,7 +139,8 @@ BEHAVIOR:
 - If unsure, offer to transfer to a human
 
 APPOINTMENT BOOKING:
-- Accountants available: Hussam Saadaldin, Rami Kahwaji, Abdul
+- Accountants available: {accountant_names_en}
+- In Arabic: {accountant_names_ar}
 - Ask: Individual or corporate client?
 - Ask: Preferred accountant?
 - Ask: Preferred date/time?

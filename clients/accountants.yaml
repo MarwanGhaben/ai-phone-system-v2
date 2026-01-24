@@ -1,0 +1,24 @@
+# =====================================================
+# AI Voice Platform v2 - Accountants Configuration
+# =====================================================
+# Add, remove, or update accountants here.
+# Changes take effect on app restart (no rebuild needed).
+
+accountants:
+  - name: "Hussam Saadaldin"
+    name_ar: "حسام سعد الدين"
+    email: "hussam@iflextax.ca"
+    staff_id: ""  # MS Bookings staff ID (optional)
+    service_id: "" # MS Bookings service ID (optional)
+
+  - name: "Rami Kahwaji"
+    name_ar: "رامي قهوجي"
+    email: "rami@iflextax.ca"
+    staff_id: ""
+    service_id: ""
+
+  - name: "Abdul ElFarra"
+    name_ar: "عبدول الفرا"
+    email: "abdul@iflextax.ca"
+    staff_id: ""
+    service_id: ""

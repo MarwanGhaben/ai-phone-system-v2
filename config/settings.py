@@ -105,32 +105,7 @@ class Settings(BaseSettings):
     ms_bookings_tenant_id: str = Field(default="", alias="MS_BOOKINGS_TENANT_ID")
     ms_bookings_client_id: str = Field(default="", alias="MS_BOOKINGS_CLIENT_ID")
     ms_bookings_client_secret: str = Field(default="", alias="MS_BOOKINGS_CLIENT_SECRET")
-    ms_bookings_booking_service_id: str = Field(default="", alias="MS_BOOKINGS_BOOKING_SERVICE_ID")
-
-    # Accountants configuration
-    accountants: dict = Field(default={
-        "Hussam Saadaldin": {
-            "name": "Hussam Saadaldin",
-            "name_ar": "حسام سعدالدين",
-            "service_id": "",
-            "staff_id": "",
-            "email": ""
-        },
-        "Rami Kahwaji": {
-            "name": "Rami Kahwaji",
-            "name_ar": "رامي قهوجي",
-            "service_id": "",
-            "staff_id": "",
-            "email": ""
-        },
-        "Abdul": {
-            "name": "Abdul",
-            "name_ar": "عبدول الفرا",
-            "service_id": "",
-            "staff_id": "",
-            "email": ""
-        }
-    })
+    ms_bookings_business_id: str = Field(default="", alias="MS_BOOKINGS_BUSINESS_ID")
 
     # =====================================================
     # SMS (Telnyx)

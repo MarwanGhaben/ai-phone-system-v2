@@ -136,7 +136,7 @@ async def websocket_call_handler(websocket: WebSocket):
 
 
 # =====================================================
-# ADMIN API (Basic)
+# ADMIN API
 # =====================================================
 
 @app.get("/api/stats")
@@ -154,6 +154,138 @@ async def list_calls():
     """List recent calls (TODO: implement database query)"""
     return {
         "calls": []  # TODO: Query from database
+    }
+
+
+# =====================================================
+# DASHBOARD API
+# =====================================================
+
+from services.dashboard.dashboard_service import get_dashboard_service
+
+@app.get("/api/dashboard/operational")
+async def get_operational_overview():
+    """Get operational overview for dashboard"""
+    dashboard = get_dashboard_service()
+    return await dashboard.get_operational_overview()
+
+
+@app.get("/api/dashboard/calls")
+async def get_dashboard_call_analytics():
+    """Get call analytics for dashboard"""
+    dashboard = get_dashboard_service()
+    return await dashboard.get_call_analytics()
+
+
+@app.get("/api/dashboard/api-usage")
+async def get_dashboard_api_monitoring():
+    """Get API usage monitoring for dashboard"""
+    dashboard = get_dashboard_service()
+    return await dashboard.get_api_monitoring()
+
+
+@app.get("/api/dashboard/health")
+async def get_dashboard_system_health():
+    """Get system health for dashboard"""
+    dashboard = get_dashboard_service()
+    return await dashboard.get_system_health()
+
+
+@app.get("/api/dashboard/bookings")
+async def get_dashboard_bookings():
+    """Get bookings overview for dashboard"""
+    dashboard = get_dashboard_service()
+    return await dashboard.get_bookings_overview()
+
+
+# =====================================================
+# KNOWLEDGE BASE API
+# =====================================================
+
+from services.knowledge.faq_service import get_kb_service
+
+@app.get("/api/accountants")
+async def get_accountants():
+    """Get all accountants from configuration"""
+    from services.config.accountants_service import get_accountants_service
+    acc_service = get_accountants_service()
+    return {"accountants": acc_service.get_all_accountants()}
+
+
+@app.get("/api/kb/categories")
+async def get_kb_categories():
+    """Get all FAQ categories"""
+    kb = get_kb_service()
+    return {"categories": kb.get_all_categories()}
+
+
+@app.get("/api/kb/faqs")
+async def get_kb_faqs(language: str = "en", category: str = None):
+    """Get all FAQs, optionally filtered by category"""
+    kb = get_kb_service()
+
+    if category:
+        faqs = kb.get_faqs_by_category(category, language)
+    else:
+        faqs = kb.get_all_faqs(language)
+
+    return {"faqs": faqs, "language": language}
+
+
+# =====================================================
+# CALENDAR API
+# =====================================================
+
+from services.calendar.ms_bookings_service import get_calendar_service
+
+@app.get("/api/calendar/staff")
+async def get_calendar_staff():
+    """Get all staff members from calendar"""
+    calendar = get_calendar_service()
+    staff = await calendar.get_staff_members()
+    return {
+        "staff": [
+            {"id": s.id, "name": s.name, "email": s.email, "role": s.role}
+            for s in staff
+        ]
+    }
+
+
+@app.get("/api/calendar/services")
+async def get_calendar_services():
+    """Get all services from calendar"""
+    calendar = get_calendar_service()
+    services = await calendar.get_services()
+    return {
+        "services": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "description": s.description,
+                "duration_minutes": s.duration_minutes,
+                "price": s.price
+            }
+            for s in services
+        ]
+    }
+
+
+@app.get("/api/calendar/availability")
+async def get_calendar_availability(service_id: str, staff_id: str = None, days_ahead: int = 7):
+    """Get available time slots"""
+    calendar = get_calendar_service()
+    slots = await calendar.get_available_slots(service_id, staff_id, days_ahead)
+    return {
+        "slots": [
+            {
+                "staff_id": s.staff_id,
+                "staff_name": s.staff_name,
+                "start_time": s.start_time.isoformat(),
+                "end_time": s.end_time.isoformat(),
+                "formatted": s.formatted
+            }
+            for s in slots
+        ]
     }
 
 

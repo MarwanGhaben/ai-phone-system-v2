@@ -1,0 +1,232 @@
+# IFlextax FAQ Database
+
+faqs:
+  - id: 1
+    category: "hours"
+    question_en: "What are your business hours?"
+    answer_en: "Our office is open Monday to Friday, 9 AM to 6 PM Eastern Time. However, you can book appointments outside these hours by request."
+    question_ar: "ما هي ساعات العمل؟"
+    answer_ar: "مكتبنا مفتوح من الاثنين إلى الجمعة، من الساعة 9 صباحاً حتى 6 مساءً بتوقيت شرق كندا. ومع ذلك، يمكنك حجز مواعيد خارج هذه الساعات عند الطلب."
+    keywords:
+      - "hours"
+      - "open"
+      - "time"
+      - "schedule"
+      - "available"
+      - "when"
+      - "business hours"
+      - "office hours"
+      - "ساعات"
+      - "مفتوح"
+      - "وقت"
+      - "متى"
+      - "مواعيد"
+      - "دوام"
+      - "شغل"
+      - "فتح"
+      - "يفتح"
+      - "ايه"
+
+  - id: 2
+    category: "pricing"
+    question_en: "How much do your tax preparation services cost?"
+    answer_en: "Our personal tax return preparation starts at $80. Corporate tax returns start at $300. The final price depends on the complexity of your tax situation. We provide a free initial consultation to give you an accurate quote."
+    question_ar: "كم تكلف خدمات إعداد الضرائب؟"
+    answer_ar: "تبدأ خدمة إعداد الإقرار الضريبي الشخصي من 80 دولاراً. الإقرارات الضريبية للشركات تبدأ من 300 دولار. السعر النهائي يعتمد على مدى تعقيد وضعك الضريبي. نقدم استشارة أولية مجانية."
+    keywords:
+      - "cost"
+      - "price"
+      - "fee"
+      - "charge"
+      - "how much"
+      - "expensive"
+      - "سعر"
+      - "كم"
+      - "تكلفة"
+      - "رسوم"
+
+  - id: 3
+    category: "services"
+    question_en: "Do you handle both personal and business taxes?"
+    answer_en: "Yes! We handle both personal tax returns and corporate tax returns. We also assist with sole proprietorships, partnerships, and corporations of all sizes."
+    answer_ar: "نعم! نتعامل مع الإقرارات الضريبية الشخصية والشركات. نساعد أيضاً في الملكية الفردية والشراكات والشركات من جميع الأحجام."
+    keywords:
+      - "personal"
+      - "business"
+      - "corporate"
+      - "company"
+      - "individual"
+      - "شخصي"
+      - "شركة"
+      - "أعمال"
+
+  - id: 4
+    category: "documents"
+    question_en: "What documents do I need for tax filing?"
+    answer_en: "For personal taxes, you'll need: T4 slips, T5 slips, receipts for deductions (medical, donations, childcare), RRSP contributions, and investment statements. For business taxes, we'll need: financial statements, expense receipts, payroll records, and GST/HST documentation."
+    answer_ar: "للضرائب الشخصية، ستحتاج إلى: قسائم T4، قسائم T5، إيصالات الخصومات (طبية، تبرعات، رعاية الأطفال)، مساهمات RRSP، وبيانات الاستثمار."
+    keywords:
+      - "documents"
+      - "paperwork"
+      - "need"
+      - "required"
+      - "bring"
+      - "T4"
+      - "receipts"
+      - "مستندات"
+      - "أوراق"
+
+  - id: 5
+    category: "audit"
+    question_en: "Can you help with tax problems or CRA audits?"
+    answer_en: "Yes, we assist clients with CRA audits, tax disputes, payment arrangements, and resolving tax debt issues. We can represent you in communications with the Canada Revenue Agency."
+    answer_ar: "نعم، نساعد العملاء في عمليات تدقيق CRA، والنزاعات الضريبية، وترتيبات الدفع، وحل مشاكل الديون الضريبية."
+    keywords:
+      - "audit"
+      - "CRA"
+      - "problem"
+      - "dispute"
+      - "debt"
+      - "owe"
+      - "trouble"
+      - "تدقيق"
+      - "مشكلة"
+
+  - id: 6
+    category: "bookkeeping"
+    question_en: "Do you offer bookkeeping services?"
+    answer_en: "Yes! We provide monthly bookkeeping services for small and medium businesses. This includes recording transactions, bank reconciliation, accounts payable and receivable, and generating financial reports."
+    answer_ar: "نعم! نقدم خدمات مسك الدفاتر الشهرية للشركات الصغيرة والمتوسطة. يشمل ذلك تسجيل المعاملات، والتسوية المصرفية، والحسابات المدينة والدائنة."
+    keywords:
+      - "bookkeeping"
+      - "monthly"
+      - "records"
+      - "accounting"
+      - "financial statements"
+      - "محاسبة"
+      - "دفاتر"
+
+  - id: 7
+    category: "gst"
+    question_en: "Can you file GST/HST returns?"
+    answer_en: "Absolutely. We prepare and file GST/HST returns on a monthly, quarterly, or annual basis, depending on your business requirements. We also help with GST/HST registration."
+    answer_ar: "بالتأكيد. نقوم بإعداد وتقديم إقرارات GST/HST على أساس شهري أو ربع سنوي أو سنوي، حسب متطلبات عملك."
+    keywords:
+      - "GST"
+      - "HST"
+      - "sales tax"
+      - "filing"
+      - "quarterly"
+
+  - id: 8
+    category: "incorporation"
+    question_en: "Do you help with business incorporation?"
+    answer_en: "Yes, we assist with incorporating your business in Canada. We handle the paperwork, registration, and initial setup including business number registration and tax account setup."
+    answer_ar: "نعم، نساعد في تأسيس عملك في كندا. نتعامل مع الأوراق والتسجيل والإعداد الأولي."
+    keywords:
+      - "incorporate"
+      - "incorporation"
+      - "register"
+      - "start business"
+      - "new company"
+      - "تأسيس"
+      - "شركة جديدة"
+
+  - id: 9
+    category: "deadline"
+    question_en: "What is the deadline for filing personal taxes in Canada?"
+    answer_en: "Personal tax returns are due by April 30th each year. If you or your spouse are self-employed, the deadline is June 15th, but any taxes owing are still due by April 30th."
+    answer_ar: "الإقرارات الضريبية الشخصية مستحقة بحلول 30 أبريل من كل عام. إذا كنت أنت أو زوجتك تعملان لحسابكما الخاص، فالموعد النهائي هو 15 يونيو."
+    keywords:
+      - "deadline"
+      - "due date"
+      - "when file"
+      - "April"
+      - "late"
+      - "موعد"
+      - "نهائي"
+
+  - id: 10
+    category: "provinces"
+    question_en: "Can you handle taxes for multiple provinces?"
+    answer_en: "Yes, we prepare tax returns for individuals and businesses across all Canadian provinces and territories. Each province has different rules, and we're familiar with all of them."
+    answer_ar: "نعم، نقوم بإعداد الإقرارات الضريبية للأفراد والشركات في جميع المقاطعات والأقاليم الكندية."
+    keywords:
+      - "province"
+      - "provincial"
+      - "location"
+      - "Ontario"
+      - "Quebec"
+      - "BC"
+      - "مقاطعة"
+
+  - id: 11
+    category: "language"
+    question_en: "Do you speak Arabic?"
+    answer_en: "Yes! We have Arabic-speaking staff members who can assist you in Arabic. We're proud to serve both English and Arabic-speaking clients."
+    answer_ar: "نعم! لدينا موظفون يتحدثون العربية ويمكنهم مساعدتك باللغة العربية. نحن فخورون بخدمة العملاء الناطقين بالإنجليزية والعربية."
+    keywords:
+      - "Arabic"
+      - "language"
+      - "speak"
+      - "bilingual"
+      - "عربي"
+      - "عربية"
+      - "تتكلم"
+      - "لغة"
+
+  - id: 12
+    category: "appointment"
+    question_en: "How do I book an appointment?"
+    answer_en: "I can help you book an appointment right now! We have three accountants available: Hussam Saadaldin, Abdul Rahman Mughrabi, and Rami Zayat. Would you like to schedule an appointment for an individual or a corporate?"
+    answer_ar: "يمكنني مساعدتك في حجز موعد الآن! لدينا ثلاثة محاسبين: حسام سعد الدين، عبد الرحمن المغربي، ورامي زيات. هل تريد حجز موعد لشخص أم لشركة؟"
+    keywords:
+      - "appointment"
+      - "book"
+      - "schedule"
+      - "meeting"
+      - "consultation"
+      - "موعد"
+      - "حجز"
+
+  - id: 13
+    category: "payroll"
+    question_en: "Do you offer payroll services?"
+    answer_en: "Yes, we provide complete payroll services including calculating pay, remitting source deductions, preparing T4 slips, and handling ROE (Record of Employment) forms."
+    answer_ar: "نعم، نقدم خدمات كشوف المرتبات الكاملة بما في ذلك حساب الأجور وإعداد قسائم T4."
+    keywords:
+      - "payroll"
+      - "employees"
+      - "T4"
+      - "pay"
+      - "salary"
+      - "wages"
+      - "رواتب"
+      - "موظفين"
+
+  - id: 14
+    category: "refund"
+    question_en: "Can you help maximize my tax refund?"
+    answer_en: "Yes! We review all available deductions and credits to ensure you get the maximum refund you're entitled to. This includes medical expenses, charitable donations, tuition, home office expenses, and more."
+    answer_ar: "نعم! نقوم بمراجعة جميع الخصومات والائتمانات المتاحة لضمان حصولك على أقصى استرداد تستحقه."
+    keywords:
+      - "refund"
+      - "maximize"
+      - "deductions"
+      - "credits"
+      - "save money"
+      - "استرداد"
+      - "خصومات"
+
+  - id: 15
+    category: "unfiled"
+    question_en: "What if I haven't filed taxes in several years?"
+    answer_en: "We can help! We specialize in catching up on unfiled tax returns. We'll prepare all missing years and help you work with CRA to minimize penalties and arrange payment plans if needed."
+    answer_ar: "يمكننا المساعدة! نحن متخصصون في اللحاق بالإقرارات الضريبية غير المقدمة. سنقوم بإعداد جميع السنوات المفقودة."
+    keywords:
+      - "haven't filed"
+      - "old returns"
+      - "back taxes"
+      - "years behind"
+      - "catch up"
+      - "لم أقدم"
