@@ -1,1 +1,29 @@
 *Commands to use.txt
+
+# SSL Certificates (never commit these!)
+nginx/ssl/
+certbot/
+
+# Logs
+logs/
+nginx/logs/
+
+# Environment variables (keep your secrets safe!)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# Database
+*.db
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db
