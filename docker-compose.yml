@@ -1,0 +1,133 @@
+# AI Voice Platform v2 - Docker Compose
+# One-command deployment: docker-compose up -d
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-voice-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ai_voice}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_voice_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_voice_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_voice}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - ai-voice-network
+
+  # Redis for session state and caching
+  redis:
+    image: redis:7-alpine
+    container_name: ai-voice-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - ai-voice-network
+
+  # Main Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-voice-app
+    environment:
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ai_voice}:${POSTGRES_PASSWORD:-ai_voice_pass}@postgres:5432/${POSTGRES_DB:-ai_voice_db}
+
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+
+      # Twilio
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_PHONE_NUMBER: ${TWILIO_PHONE_NUMBER}
+
+      # Deepgram STT
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
+
+      # ElevenLabs TTS
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-Rachel}
+
+      # OpenAI
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+
+      # Microsoft Graph
+      MS_BOOKINGS_TENANT_ID: ${MS_BOOKINGS_TENANT_ID}
+      MS_BOOKINGS_CLIENT_ID: ${MS_BOOKINGS_CLIENT_ID}
+      MS_BOOKINGS_CLIENT_SECRET: ${MS_BOOKINGS_CLIENT_SECRET}
+
+      # Security
+      SECRET_KEY: ${SECRET_KEY:-change-this-in-production}
+
+      # Environment
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "8000:8000"
+      - "8001:8001"  # WebSocket port
+    volumes:
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - ai-voice-network
+
+  # Nginx Reverse Proxy (optional, for production)
+  nginx:
+    image: nginx:alpine
+    container_name: ai-voice-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "443:443"
+      - "80:80"
+    depends_on:
+      - app
+    restart: unless-stopped
+    networks:
+      - ai-voice-network
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  ai-voice-network:
+    driver: bridge
