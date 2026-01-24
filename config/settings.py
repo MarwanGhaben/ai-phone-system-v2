@@ -36,8 +36,8 @@ class Settings(BaseSettings):
     api_port: int = 8000
     ws_port: int = 8001
     # Store as string internally to avoid JSON parsing issues
-    # Will be converted to List[str] by validator
-    _allowed_origins_str: str = Field(
+    # Will be converted to List[str] by property
+    allowed_origins_str: str = Field(
         default="http://localhost:3000,http://localhost:8000",
         alias="ALLOWED_ORIGINS"
     )
@@ -141,7 +141,7 @@ class Settings(BaseSettings):
     @property
     def allowed_origins(self) -> List[str]:
         """Get allowed origins as a list"""
-        return self._parse_origins_string(self._allowed_origins_str)
+        return self._parse_origins_string(self.allowed_origins_str)
 
     def _parse_origins_string(self, origins_str: str) -> List[str]:
         """Parse origins from comma-separated string"""
