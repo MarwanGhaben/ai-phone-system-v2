@@ -82,7 +82,25 @@ async def incoming_call(request: Request):
     Returns TwiML to connect to Media Stream
     """
     # Get WebSocket URL for this server
-    ws_url = f"ws://{request.headers.get('host', 'localhost:8001')}/ws/calls"
+    # Use the domain from settings or fall back to host header
+    domain = getattr(settings, 'public_domain', None)
+    if domain:
+        # Use configured public domain with secure WebSocket
+        ws_url = f"wss://{domain}/ws/calls"
+    else:
+        # Fallback to host header (for development)
+        host = request.headers.get('host', 'localhost:8001')
+        # Replace http/ws with https/wss
+        if host.startswith('http:'):
+            host = host.replace('http:', 'https:')
+        elif not host.startswith(('https:', 'wss:')):
+            # Determine protocol from X-Forwarded-Proto if available
+            proto = request.headers.get('X-Forwarded-Proto', 'https')
+            host = f"{proto}://{host}"
+        # Convert to WebSocket URL
+        ws_url = host.replace('https://', 'wss://').replace('http://', 'ws://')
+        if not ws_url.endswith('/ws/calls'):
+            ws_url = f"{ws_url}/ws/calls"
 
     from services.telephony.twilio_service import TwilioService
     twilio = TwilioService(

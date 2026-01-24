@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     ws_port: int = 8001
+    # Public domain for external access (used for Twilio webhooks)
+    public_domain: str = Field(default="", alias="PUBLIC_DOMAIN")
     # Store as string internally to avoid JSON parsing issues
     # Will be converted to List[str] by property
     allowed_origins_str: str = Field(
