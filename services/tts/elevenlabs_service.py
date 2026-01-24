@@ -16,7 +16,7 @@ try:
     ELEVENLABS_AVAILABLE = True
 except ImportError:
     ELEVENLABS_AVAILABLE = False
-    Voice = VoiceSettings = None
+    Voice = VoiceSettings = ElevenLabs = None
 
 from .tts_base import TTSServiceBase, TTSRequest, TTSResponse, TTSChunk, TTSStatus
 

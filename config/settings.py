@@ -35,7 +35,9 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     ws_port: int = 8001
-    allowed_origins: Union[List[str], str] = Field(
+    # Store as string internally to avoid JSON parsing issues
+    # Will be converted to List[str] by validator
+    _allowed_origins_str: str = Field(
         default="http://localhost:3000,http://localhost:8000",
         alias="ALLOWED_ORIGINS"
     )
@@ -134,29 +136,29 @@ class Settings(BaseSettings):
     prometheus_port: int = 9090
 
     # =====================================================
-    # VALIDATORS
+    # PROPERTIES
     # =====================================================
-    @field_validator('allowed_origins', mode='before')
-    @classmethod
-    def parse_allowed_origins(cls, v: Union[str, List[str]]) -> List[str]:
-        """Parse ALLOWED_ORIGINS from comma-separated string or JSON list"""
-        if isinstance(v, list):
-            return v
+    @property
+    def allowed_origins(self) -> List[str]:
+        """Get allowed origins as a list"""
+        return self._parse_origins_string(self._allowed_origins_str)
 
-        if isinstance(v, str):
-            # Try JSON parsing first
-            try:
-                parsed = json.loads(v)
-                if isinstance(parsed, list):
-                    return parsed
-            except (json.JSONDecodeError, TypeError):
-                pass
+    def _parse_origins_string(self, origins_str: str) -> List[str]:
+        """Parse origins from comma-separated string"""
+        if not origins_str:
+            return ["http://localhost:3000", "http://localhost:8000"]
 
-            # Fall back to comma-separated parsing
-            origins = [origin.strip() for origin in v.split(',')]
-            return [o for o in origins if o]  # Filter out empty strings
+        # Try JSON parsing first (for backward compatibility)
+        try:
+            parsed = json.loads(origins_str)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-        return ["http://localhost:3000", "http://localhost:8000"]
+        # Fall back to comma-separated parsing
+        origins = [origin.strip() for origin in origins_str.split(',')]
+        return [o for o in origins if o]  # Filter out empty strings
 
 
 # Global settings instance
