@@ -212,6 +212,39 @@ async def get_accountants():
     return {"accountants": acc_service.get_all_accountants()}
 
 
+@app.get("/api/callers/recent")
+async def get_recent_callers(limit: int = 10):
+    """Get recent callers"""
+    from services.callers.caller_service import get_caller_service
+    caller_service = get_caller_service()
+    return {"callers": caller_service.get_recent_callers(limit)}
+
+
+@app.get("/api/callers/frequent")
+async def get_frequent_callers(limit: int = 5, min_calls: int = 2):
+    """Get frequent callers (VIPs)"""
+    from services.callers.caller_service import get_caller_service
+    caller_service = get_caller_service()
+    return {"callers": caller_service.get_frequent_callers(limit, min_calls)}
+
+
+@app.get("/api/callers/stats")
+async def get_caller_stats():
+    """Get caller statistics"""
+    from services.callers.caller_service import get_caller_service
+    caller_service = get_caller_service()
+    all_callers = caller_service.get_all_callers()
+
+    total_unique = len(all_callers)
+    returning = sum(1 for c in all_callers.values() if c.get("call_count", 0) > 1)
+
+    return {
+        "total_unique": total_unique,
+        "returning": returning,
+        "new": total_unique - returning
+    }
+
+
 @app.get("/api/kb/categories")
 async def get_kb_categories():
     """Get all FAQ categories"""

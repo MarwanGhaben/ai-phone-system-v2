@@ -65,6 +65,11 @@ class ConversationContext:
     start_time: float = field(default_factory=asyncio.get_event_loop().time)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Caller recognition
+    caller_name: Optional[str] = None
+    is_known_caller: bool = False
+    name_collected: bool = False  # True if we already got their name
+
     def to_dict(self) -> dict:
         """Convert to dictionary for storage"""
         return {
@@ -74,6 +79,8 @@ class ConversationContext:
             "state": self.state.value,
             "turn_count": self.turn_count,
             "detected_intent": self.detected_intent.value,
+            "caller_name": self.caller_name,
+            "is_known_caller": self.is_known_caller,
             "metadata": self.metadata
         }
 
@@ -109,6 +116,13 @@ class ConversationOrchestrator:
 
         # System prompt for the AI
         self._system_prompt = self._get_system_prompt()
+
+        # Caller recognition service
+        from services.callers.caller_service import get_caller_service
+        self.caller_service = get_caller_service()
+
+        # Track which calls have greeted
+        self._greeted_calls: set = set()
 
     def _get_system_prompt(self) -> str:
         """Get system prompt for LLM"""
@@ -175,11 +189,21 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
         """
         logger.info(f"Orchestrator: Starting call {call_sid} from {phone_number}")
 
+        # Check if this is a returning caller
+        caller_info = self.caller_service.get_caller_info(phone_number)
+        caller_name = caller_info.get("name") if caller_info else None
+        caller_language = caller_info.get("language", "auto") if caller_info else "auto"
+
+        logger.info(f"Orchestrator: Caller info - name={caller_name}, language={caller_language}")
+
         # Create conversation context
         context = ConversationContext(
             call_sid=call_sid,
-            phone_number=phone_number
+            phone_number=phone_number,
+            language=caller_language
         )
+        context.caller_name = caller_name
+        context.is_known_caller = caller_name is not None
         self._conversations[call_sid] = context
 
         # Create Twilio handler
@@ -192,6 +216,10 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
         try:
             # Connect to STT
             await self.stt.connect()
+
+            # Send personalized greeting
+            greeting = self.caller_service.get_greeting_for_caller(phone_number, caller_language)
+            await self._speak_to_caller(call_sid, greeting, caller_language)
 
             # Handle the WebSocket connection
             await twilio_handler.handle_connection()
@@ -257,6 +285,28 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
 
         logger.info(f"Orchestrator: User said: {transcript}")
 
+        # ===== CALLER NAME EXTRACTION (New Callers) =====
+        if not context.is_known_caller and not context.name_collected:
+            extracted_name = self._extract_caller_name(transcript)
+            if extracted_name:
+                context.caller_name = extracted_name
+                context.name_collected = True
+                # Save caller info
+                self.caller_service.register_caller(
+                    context.phone_number,
+                    extracted_name,
+                    context.language
+                )
+                context.is_known_caller = True
+                logger.info(f"Orchestrator: Extracted and saved caller name: {extracted_name}")
+                # Acknowledge the name
+                if context.language == "ar":
+                    response = f"أهلاً {extracted_name}! كيف يمكنني مساعدتك اليوم؟"
+                else:
+                    response = f"Nice to meet you, {extracted_name}! How can I help you today?"
+                await self._speak_to_caller(call_sid, response, context.language)
+                return
+
         # Detect intent
         intent = await self._detect_intent(transcript, context.language)
         context.detected_intent = intent
@@ -300,9 +350,16 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
         if not context:
             return "I apologize, I'm having technical difficulties."
 
+        # Build system prompt with caller context
+        system_prompt = self._system_prompt
+
+        # Add caller name to prompt if known
+        if context.caller_name:
+            system_prompt += f"\n\nCALLER CONTEXT:\n- The caller's name is {context.caller_name}. Use their name naturally in your response to be warm and personal."
+
         # Build message list
         messages = [
-            Message(role=LLMRole.SYSTEM, content=self._system_prompt)
+            Message(role=LLMRole.SYSTEM, content=system_prompt)
         ]
 
         # Add conversation history (last 5 turns)
@@ -401,6 +458,55 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             return Intent.PAYROLL_INQUIRY
 
         return Intent.GENERAL_INQUIRY
+
+    def _extract_caller_name(self, transcript: str) -> Optional[str]:
+        """
+        Extract caller name from transcript
+
+        Handles various formats:
+        - "My name is John" → "John"
+        - "This is Ahmed" → "Ahmed"
+        - "أنا محمد" → "محمد"
+        - "I'm Sarah" → "Sarah"
+
+        Args:
+            transcript: User's transcript
+
+        Returns:
+            Extracted name or None
+        """
+        import re
+
+        transcript = transcript.strip()
+        if not transcript:
+            return None
+
+        # English patterns
+        en_patterns = [
+            r"(?:my name is|i'm|i am|this is|call me|it's) (\w+)",
+            r"^(\w+) here",  # "John here"
+            r"speaking (\w+)",  # "This is John speaking"
+        ]
+
+        for pattern in en_patterns:
+            match = re.search(pattern, transcript, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                # Filter out non-name words
+                if len(name) > 1 and name.lower() not in ["yes", "no", "not", "is", "it"]:
+                    return name.capitalize()
+
+        # Arabic patterns (basic)
+        # "أنا أحمد" → "أحمد"
+        if "أنا " in transcript or "انا " in transcript:
+            parts = transcript.split()
+            for i, part in enumerate(parts):
+                if part in ["أنا", "انا", "اسمي"]:
+                    if i + 1 < len(parts):
+                        name = parts[i + 1]
+                        return name
+
+        return None
 
     async def _detect_barge_in(self, audio_data: bytes) -> bool:
         """
