@@ -81,26 +81,42 @@ async def incoming_call(request: Request):
     Handle incoming call from Twilio
     Returns TwiML to connect to Media Stream
     """
+    # Debug: Print all settings and headers
+    print(f"DEBUG: public_domain from settings = '{getattr(settings, 'public_domain', 'NOT_FOUND')}'")
+    print(f"DEBUG: host header = '{request.headers.get('host')}'")
+    print(f"DEBUG: X-Forwarded-Host = '{request.headers.get('X-Forwarded-Host')}'")
+    print(f"DEBUG: X-Forwarded-Proto = '{request.headers.get('X-Forwarded-Proto')}'")
+
     # Get WebSocket URL for this server
     # Use the domain from settings or fall back to host header
     domain = getattr(settings, 'public_domain', None)
-    if domain:
+
+    # Check if domain is set and not empty
+    if domain and domain.strip():
         # Use configured public domain with secure WebSocket
-        ws_url = f"wss://{domain}/ws/calls"
+        ws_url = f"wss://{domain.strip()}/ws/calls"
+        print(f"DEBUG: Using PUBLIC_DOMAIN: {ws_url}")
     else:
-        # Fallback to host header (for development)
-        host = request.headers.get('host', 'localhost:8001')
-        # Replace http/ws with https/wss
-        if host.startswith('http:'):
-            host = host.replace('http:', 'https:')
-        elif not host.startswith(('https:', 'wss:')):
-            # Determine protocol from X-Forwarded-Proto if available
-            proto = request.headers.get('X-Forwarded-Proto', 'https')
-            host = f"{proto}://{host}"
-        # Convert to WebSocket URL
-        ws_url = host.replace('https://', 'wss://').replace('http://', 'ws://')
-        if not ws_url.endswith('/ws/calls'):
-            ws_url = f"{ws_url}/ws/calls"
+        # Try to get domain from X-Forwarded-Host header (set by reverse proxy)
+        forwarded_host = request.headers.get('X-Forwarded-Host', '')
+        if forwarded_host:
+            # Use the forwarded host (public domain)
+            ws_url = f"wss://{forwarded_host}/ws/calls"
+            print(f"DEBUG: Using X-Forwarded-Host: {ws_url}")
+        else:
+            # Last resort: use host header but warn
+            host = request.headers.get('host', 'localhost:8001')
+            print(f"WARNING: No PUBLIC_DOMAIN set, using host header: {host}")
+            # Convert to WebSocket URL
+            if host.startswith('http:'):
+                host = host.replace('http:', 'https:')
+            elif not host.startswith(('https:', 'wss:')):
+                proto = request.headers.get('X-Forwarded-Proto', 'https')
+                host = f"{proto}://{host}"
+            ws_url = host.replace('https://', 'wss://').replace('http://', 'ws://')
+            if not ws_url.endswith('/ws/calls'):
+                ws_url = f"{ws_url}/ws/calls"
+            print(f"DEBUG: Fallback WebSocket URL: {ws_url}")
 
     from services.telephony.twilio_service import TwilioService
     twilio = TwilioService(
@@ -112,8 +128,8 @@ async def incoming_call(request: Request):
     twiml = await twilio.generate_twiml(ws_url)
 
     # Log the WebSocket URL being sent to Twilio
-    print(f"DEBUG: Twilio WebSocket URL: {ws_url}")
-    logger.info(f"Twilio: Generated TwiML with WebSocket URL: {ws_url}")
+    print(f"DEBUG: FINAL WebSocket URL: {ws_url}")
+    print(f"DEBUG: Full TwiML:\n{twiml}")
 
     return HTMLResponse(content=twiml, media_type="application/xml")
 
