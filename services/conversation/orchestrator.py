@@ -235,34 +235,30 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             await self.stt.connect()
             logger.info(f"Orchestrator: STT connected")
 
-            # Get personalized greeting and prepare it
+            # Get personalized greeting and send it immediately
             logger.info(f"Orchestrator: Getting greeting...")
             greeting = self.caller_service.get_greeting_for_caller(phone_number, caller_language)
             logger.info(f"Orchestrator: Greeting: '{greeting[:50]}...'")
 
-            # Prepare greeting audio (synthesize and convert)
-            # This will be queued and sent from within the event loop
-            async def prepare_and_queue_greeting():
-                await asyncio.sleep(0.5)  # Wait for connection to stabilize
-                logger.info(f"Orchestrator: Preparing greeting audio...")
+            # Send greeting immediately (before starting event loop)
+            # This ensures state is properly managed and no race conditions
+            logger.info(f"Orchestrator: Sending greeting...")
+            context.state = ConversationState.SPEAKING
+            try:
                 await self._speak_to_caller(call_sid, greeting, caller_language)
-                logger.info(f"Orchestrator: Greeting queued, will be sent from event loop")
+                logger.info(f"Orchestrator: Greeting sent successfully")
+            except Exception as e:
+                logger.error(f"Orchestrator: Failed to send greeting: {e}")
+            finally:
+                context.state = ConversationState.LISTENING
 
-            # Start greeting preparation in background
-            greeting_task = asyncio.create_task(prepare_and_queue_greeting())
+            # Small delay after greeting before starting event loop
+            await asyncio.sleep(0.5)
 
-            # Handle the WebSocket connection (greeting will be sent from within)
+            # Now handle the WebSocket connection (incoming audio)
             logger.info(f"Orchestrator: Starting connection handler...")
             await twilio_handler.handle_connection()
             logger.info(f"Orchestrator: WebSocket handling complete")
-
-            # Cancel greeting task if still running
-            if not greeting_task.done():
-                greeting_task.cancel()
-                try:
-                    await greeting_task
-                except asyncio.CancelledError:
-                    pass
 
         except Exception as e:
             logger.error(f"Orchestrator: Exception in call {call_sid}: {e}")

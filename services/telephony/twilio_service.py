@@ -55,8 +55,8 @@ class TwilioMediaStreamHandler:
         self._is_connected = False
         self._is_streaming = False
 
-        # Pending audio to send (simplified - just one at a time)
-        self._pending_audio: Optional[bytes] = None
+        # Lock for sending audio (prevent concurrent sends)
+        self._send_lock = asyncio.Lock()
 
     async def handle_connection(self) -> None:
         """
@@ -76,26 +76,18 @@ class TwilioMediaStreamHandler:
             loop_count = 0
             while self._is_connected:
                 loop_count += 1
-                if loop_count % 10 == 0:  # Log every 1 second
-                    logger.info(f"Twilio: Event loop iteration {loop_count}, pending_audio={bool(self._pending_audio)}")
+                if loop_count % 50 == 0:  # Log every 5 seconds
+                    logger.debug(f"Twilio: Event loop running ({loop_count} iterations)")
 
-                # Wait for message with short timeout to check for pending audio
-                try:
-                    message = await asyncio.wait_for(
-                        self.websocket.receive_text(),
-                        timeout=0.1  # 100ms timeout
-                    )
-                    logger.info(f"Twilio: Received message: {message[:100] if len(message) > 100 else message}")
-                    await self._process_message(message)
-                except asyncio.TimeoutError:
-                    # Timeout is OK - check for pending audio
-                    pass
+                # Wait for message (no timeout - audio is sent immediately)
+                message = await self.websocket.receive_text()
 
-                # Check if we have pending audio to send
-                if self._pending_audio:
-                    logger.info(f"Twilio: Sending pending audio ({len(self._pending_audio)} bytes)...")
-                    await self._send_audio_now(self._pending_audio)
-                    self._pending_audio = None
+                # Log non-media events (media events are too verbose)
+                data = json.loads(message)
+                if data.get("event") != self.EVENT_MEDIA:
+                    logger.info(f"Twilio: Received message: {message[:150] if len(message) > 150 else message}")
+
+                await self._process_message(message)
 
         except WebSocketDisconnect:
             logger.info(f"Twilio: WebSocket disconnected for call {self.call_sid}")
@@ -206,8 +198,8 @@ class TwilioMediaStreamHandler:
         """
         Send audio to Twilio (play to caller)
 
-        Audio is marked as pending and will be sent from within the event loop
-        after the next incoming message is processed.
+        Audio is sent immediately in chunks for real-time playback.
+        Twilio Media Streams expects 20ms chunks (160 bytes at 8kHz μ-law).
 
         Args:
             audio_data: Audio data (μ-law 8kHz for Twilio)
@@ -220,44 +212,59 @@ class TwilioMediaStreamHandler:
             logger.error(f"Twilio: Cannot send audio - stream_sid is empty!")
             return
 
-        # Mark audio as pending - will be sent from event loop
-        self._pending_audio = audio_data
-        logger.info(f"Twilio: Marked {len(audio_data)} bytes audio as pending")
+        # Use lock to prevent concurrent sends
+        async with self._send_lock:
+            await self._send_audio_chunked(audio_data)
 
-    async def _send_audio_now(self, audio_data: bytes) -> None:
+    async def _send_audio_chunked(self, audio_data: bytes) -> None:
         """
-        Send audio to Twilio immediately (called from within event loop)
+        Send audio to Twilio in chunks
+
+        Twilio recommends sending audio in 20ms chunks (160 bytes at 8kHz μ-law).
+        We send chunks with small delays for real-time pacing.
 
         Args:
             audio_data: Audio data (μ-law 8kHz for Twilio)
         """
         total_bytes = len(audio_data)
+        chunk_size = 160  # 20ms at 8kHz μ-law (8000 Hz * 0.02s = 160 bytes)
 
-        logger.info(f"Twilio: Sending {total_bytes} bytes audio (streamSid={self.stream_sid})")
+        logger.info(f"Twilio: Sending {total_bytes} bytes audio in {chunk_size}-byte chunks (streamSid={self.stream_sid})")
 
         try:
-            # Encode entire audio to base64 (no chunking for now)
-            payload = base64.b64encode(audio_data).decode("utf-8")
+            chunk_count = 0
+            for i in range(0, total_bytes, chunk_size):
+                if not self._is_streaming:
+                    logger.warning(f"Twilio: Stopped sending audio - no longer streaming")
+                    return
 
-            # Create media event
-            media_event = {
-                "event": "media",
-                "streamSid": self.stream_sid,
-                "media": {
-                    "payload": payload
+                chunk = audio_data[i:i + chunk_size]
+                payload = base64.b64encode(chunk).decode("utf-8")
+
+                # Create media event
+                media_event = {
+                    "event": "media",
+                    "streamSid": self.stream_sid,
+                    "media": {
+                        "payload": payload
+                    }
                 }
-            }
 
-            logger.info(f"Twilio: Media event - event={media_event['event']}, streamSid={media_event['streamSid'][:20]}..., payload_len={len(payload)}")
-            logger.info(f"Twilio: First 200 chars of payload: {payload[:200]}")
+                await self.websocket.send_json(media_event)
+                chunk_count += 1
 
-            await self.websocket.send_json(media_event)
-            logger.info(f"Twilio: Audio sent successfully")
+                # Small delay for real-time pacing (20ms = 0.02s)
+                # Only delay between chunks, not after the last one
+                if i + chunk_size < total_bytes:
+                    await asyncio.sleep(0.02)
+
+            logger.info(f"Twilio: Audio sent successfully - {chunk_count} chunks, {total_bytes} bytes")
 
         except Exception as e:
             logger.error(f"Twilio: Failed to send audio: {e}")
             import traceback
             logger.error(f"Twilio: Traceback:\n{traceback.format_exc()}")
+            raise  # Re-raise so caller knows send failed
 
     async def send_event(self, event: str, **kwargs) -> None:
         """
