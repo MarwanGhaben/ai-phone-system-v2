@@ -236,34 +236,11 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             await self.stt.connect()
             logger.info(f"Orchestrator: STT connected")
 
-            # Get personalized greeting
-            logger.info(f"Orchestrator: Getting greeting...")
-            greeting = self.caller_service.get_greeting_for_caller(phone_number, caller_language)
-            logger.info(f"Orchestrator: Greeting: '{greeting[:50]}...'")
-
-            # Start the connection handler and send greeting concurrently
-            # The greeting must be sent AFTER the event loop starts
-            logger.info(f"Orchestrator: Starting connection handler...")
-
-            async def send_greeting_after_delay():
-                """Send greeting after a short delay to let connection stabilize"""
-                await asyncio.sleep(1.0)  # Wait 1 second for connection to stabilize
-                logger.info(f"Orchestrator: Speaking greeting to caller...")
-                await self._speak_to_caller(call_sid, greeting, caller_language)
-                logger.info(f"Orchestrator: Greeting sent")
-
-            # Run both tasks: the connection loop and the delayed greeting
-            greeting_task = asyncio.create_task(send_greeting_after_delay())
+            # Handle the WebSocket connection
+            # The AI will speak when it receives user input (no greeting sent upfront)
+            logger.info(f"Orchestrator: Starting connection handler (waiting for user to speak)...")
             await twilio_handler.handle_connection()
             logger.info(f"Orchestrator: WebSocket handling complete")
-
-            # Cancel greeting task if call ended
-            if not greeting_task.done():
-                greeting_task.cancel()
-                try:
-                    await greeting_task
-                except asyncio.CancelledError:
-                    pass
 
         except Exception as e:
             logger.error(f"Orchestrator: Exception in call {call_sid}: {e}")

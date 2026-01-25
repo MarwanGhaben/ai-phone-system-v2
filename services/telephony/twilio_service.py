@@ -54,6 +54,10 @@ class TwilioMediaStreamHandler:
         self._is_connected = False
         self._is_streaming = False
 
+        # Audio send queue - for sending audio from within the event loop
+        self._audio_queue: asyncio.Queue = None
+        self._send_task: asyncio.Task = None
+
     async def handle_connection(self) -> None:
         """
         Handle the WebSocket connection lifecycle
@@ -66,12 +70,40 @@ class TwilioMediaStreamHandler:
         - disconnected: Cleanup
         """
         self._is_connected = True
+        self._audio_queue = asyncio.Queue()
         logger.info(f"Twilio: Media stream connected for call {self.call_sid}, starting event loop...")
 
         try:
             while self._is_connected:
-                message = await self.websocket.receive_text()
-                await self._process_message(message)
+                # Wait for either incoming message or audio to send
+                # Use asyncio.wait with timeout to check both
+                done, pending = await asyncio.wait(
+                    [
+                        asyncio.create_task(self.websocket.receive_text()),
+                        asyncio.create_task(self._audio_queue.get())
+                    ],
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=0.1  # Small timeout to check _is_connected
+                )
+
+                # Process completed tasks
+                for task in done:
+                    if not task.cancel():
+                        if task.exception():
+                            raise task.exception()
+
+                        result = task.get()
+                        # Check if this is audio data (bytes) or a message (str)
+                        if isinstance(result, bytes):
+                            # Send audio to Twilio
+                            await self._send_audio_now(result)
+                        else:
+                            # Process incoming message
+                            await self._process_message(result)
+
+                # Cancel pending tasks
+                for task in pending:
+                    task.cancel()
 
         except WebSocketDisconnect:
             logger.info(f"Twilio: WebSocket disconnected for call {self.call_sid}")
@@ -180,40 +212,43 @@ class TwilioMediaStreamHandler:
 
     async def send_audio(self, audio_data: bytes) -> None:
         """
-        Send audio to Twilio (play to caller)
+        Queue audio to be sent to Twilio (play to caller)
 
-        Sends audio in chunks as recommended by Twilio (20ms chunks = 160 bytes at 8kHz).
+        This puts audio in a queue that will be sent from within the event loop.
+        This ensures audio is sent from the same context as the WebSocket receiver.
 
         Args:
             audio_data: Audio data (μ-law 8kHz for Twilio)
         """
-        from loguru import logger
-
         if not self._is_streaming:
-            logger.warning(f"Twilio: Cannot send audio - not streaming (_is_streaming={self._is_streaming})")
+            logger.warning(f"Twilio: Cannot send audio - not streaming")
             return
 
         if not self.stream_sid:
             logger.error(f"Twilio: Cannot send audio - stream_sid is empty!")
             return
 
-        # First send a "clear" event to clear any buffers
-        try:
-            clear_event = {
-                "event": "clear",
-                "streamSid": self.stream_sid
-            }
-            await self.websocket.send_json(clear_event)
-            logger.info(f"Twilio: Sent clear event")
-        except Exception as e:
-            logger.warning(f"Twilio: Failed to send clear event: {e}")
+        if self._audio_queue is None:
+            logger.warning(f"Twilio: Audio queue not initialized")
+            return
 
+        # Put audio in queue - will be sent from event loop
+        await self._audio_queue.put(audio_data)
+        logger.info(f"Twilio: Queued {len(audio_data)} bytes audio for sending")
+
+    async def _send_audio_now(self, audio_data: bytes) -> None:
+        """
+        Send audio to Twilio immediately (called from within event loop)
+
+        Args:
+            audio_data: Audio data (μ-law 8kHz for Twilio)
+        """
         # Chunk size: 20ms at 8kHz = 160 samples = 160 bytes for μ-law
         CHUNK_SIZE = 160
         total_bytes = len(audio_data)
         chunks_sent = 0
 
-        logger.info(f"Twilio: Sending {total_bytes} bytes audio in {total_bytes // CHUNK_SIZE + 1} chunks (streamSid={self.stream_sid})")
+        logger.info(f"Twilio: Sending {total_bytes} bytes audio in chunks (streamSid={self.stream_sid})")
 
         try:
             for i in range(0, total_bytes, CHUNK_SIZE):
@@ -236,11 +271,11 @@ class TwilioMediaStreamHandler:
                 await self.websocket.send_json(media_event)
                 chunks_sent += 1
 
-                # Log every 50 chunks to avoid spam
+                # Log every 50 chunks
                 if chunks_sent % 50 == 0:
                     logger.debug(f"Twilio: Sent {chunks_sent} chunks...")
 
-            logger.info(f"Twilio: Audio sent successfully ({chunks_sent} chunks, {total_bytes} bytes)")
+            logger.info(f"Twilio: Audio sent successfully ({chunks_sent} chunks)")
 
         except Exception as e:
             logger.error(f"Twilio: Failed to send audio: {e}")
