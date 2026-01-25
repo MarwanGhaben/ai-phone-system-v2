@@ -104,19 +104,19 @@ services:
     networks:
       - ai-voice-network
 
-  # Nginx Reverse Proxy
-  # Note: SSL is handled by Sophos Firewall (SSL termination)
-  # nginx receives HTTP and handles WebSocket upgrades
+  # Nginx Reverse Proxy with SSL
+  # Port 8443 is used for WebSocket (bypasses Sophos SSL termination)
   nginx:
     image: nginx:alpine
     container_name: ai-voice-nginx
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
       - ./nginx/www:/var/www/certbot:ro
       - ./nginx/logs:/var/log/nginx
     ports:
-      - "80:80"   # HTTP (SSL termination at Sophos)
-      - "443:443" # HTTPS (backup, direct SSL)
+      - "80:80"    # HTTP for health checks
+      - "8443:443"  # HTTPS WebSocket port (external 8443 -> internal 443)
     depends_on:
       - app
     restart: unless-stopped
