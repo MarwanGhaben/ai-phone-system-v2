@@ -217,33 +217,41 @@ class DeepgramSTT(STTServiceBase):
     def _on_transcript(self, *args, **kwargs):
         """Handle incoming transcript from Deepgram WebSocket"""
         try:
-            result = kwargs.get('result')
+            # Deepgram SDK passes result as first argument (positional)
+            # result is a LiveResultResponse object, NOT a dict
+            result = args[0] if args else kwargs.get('result')
             if not result:
                 return
 
-            # Extract transcript data
-            channel = result.get('channel', {})
-            alternatives = channel.get('alternatives', [])
-
-            if not alternatives:
+            # Access object attributes (not dict keys)
+            # result.channel.alternatives[0].transcript
+            if not hasattr(result, 'channel'):
                 return
 
-            best_alternative = alternatives[0]
-            transcript = best_alternative.get('transcript', '')
+            channel = result.channel
+            if not hasattr(channel, 'alternatives') or not channel.alternatives:
+                return
 
+            alternatives = channel.alternatives
+            best_alternative = alternatives[0]
+
+            if not hasattr(best_alternative, 'transcript'):
+                return
+
+            transcript = best_alternative.transcript
             if not transcript:
                 return
 
-            # Extract metadata
-            is_final = result.get('is_final', False)
-            confidence = best_alternative.get('confidence', 0.0)
+            # Extract metadata from object attributes
+            is_final = getattr(result, 'is_final', False)
+            confidence = getattr(best_alternative, 'confidence', 0.0)
 
             # Detect language from result
-            detected_language = channel.get('detected_language')
+            detected_language = getattr(channel, 'detected_language', None)
             if not detected_language:
                 # Map from full language code to ISO code
-                language_full = channel.get('language', self.language)
-                detected_language = language_full.split('-')[0]
+                language_full = getattr(channel, 'language', self.language)
+                detected_language = language_full.split('-')[0] if language_full else self.language
 
             # Create STT result
             stt_result = STTResult(
@@ -252,11 +260,11 @@ class DeepgramSTT(STTServiceBase):
                 confidence=confidence,
                 is_final=is_final,
                 alternatives=[
-                    alt.get('transcript', '') for alt in alternatives[1:4]  # Up to 3 alternatives
+                    alt.transcript for alt in alternatives[1:4] if hasattr(alt, 'transcript')
                 ],
                 metadata={
-                    'words': best_alternative.get('words', []),
-                    'duration': channel.get('duration', 0)
+                    'words': getattr(best_alternative, 'words', []),
+                    'duration': getattr(channel, 'duration', 0)
                 }
             )
 
