@@ -88,11 +88,11 @@ class TwilioMediaStreamHandler:
 
                 # Process completed tasks
                 for task in done:
-                    if not task.cancel():
+                    if not task.cancelled():
                         if task.exception():
                             raise task.exception()
 
-                        result = task.get()
+                        result = task.result()
                         # Check if this is audio data (bytes) or a message (str)
                         if isinstance(result, bytes):
                             # Send audio to Twilio
