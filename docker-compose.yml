@@ -1,8 +1,6 @@
 # AI Voice Platform v2 - Docker Compose
 # One-command deployment: docker-compose up -d
 
-version: '3.8'
-
 services:
   # PostgreSQL Database
   postgres:

@@ -43,6 +43,7 @@ class TwilioMediaStreamHandler:
             websocket: WebSocket connection from Twilio
         """
         self.call_sid = call_sid or "unknown"
+        self.stream_sid = ""
         self.websocket = websocket
 
         # Event handlers
@@ -117,8 +118,12 @@ class TwilioMediaStreamHandler:
     async def _on_start(self, data: dict) -> None:
         """Handle start event - call started streaming"""
         # Extract CallSid from start event if not already set
-        if not self.call_sid:
-            self.call_sid = data.get("callSid", "")
+        # CallSid is nested in data['start']['callSid']
+        if not self.call_sid or self.call_sid == "unknown":
+            start_data = data.get("start", {})
+            self.call_sid = start_data.get("callSid", "unknown")
+            # Also store streamSid for reference
+            self.stream_sid = start_data.get("streamSid", "")
 
         logger.info(f"Twilio: Start event for call {self.call_sid}")
         logger.info(f"Twilio: Full start event data: {data}")

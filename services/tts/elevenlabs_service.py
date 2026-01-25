@@ -11,8 +11,7 @@ from typing import AsyncIterator, Optional, List
 from loguru import logger
 
 try:
-    from elevenlabs import Voice, VoiceSettings, generate, stream, Voices
-    from elevenlabs.client import ElevenLabs
+    from elevenlabs import Voice, VoiceSettings, generate, stream, Voices, ElevenLabs
     ELEVENLABS_AVAILABLE = True
 except ImportError:
     ELEVENLABS_AVAILABLE = False
