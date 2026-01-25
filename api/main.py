@@ -163,42 +163,49 @@ async def websocket_call_handler(websocket: WebSocket):
     # Get orchestrator
     orchestrator = get_orchestrator()
 
-    # Import Twilio Media Stream handler
-    from services.telephony.twilio_service import TwilioMediaStreamHandler
     import json
 
-    # Create a wrapper handler that will call orchestrator when call starts
-    class OrchestratorTwilioHandler(TwilioMediaStreamHandler):
-        def __init__(self, orchestrator_ref, ws):
-            super().__init__(None, ws)
-            self.orchestrator = orchestrator_ref
-            self._call_started = False
+    # Read the first message to get call info, then pass to orchestrator
+    # We only need to peek at the start event to extract call_sid
+    call_sid = None
+    phone_number = None
 
-        async def _on_start(self, data: dict) -> None:
-            """Handle start event and trigger orchestrator"""
-            await super()._on_start(data)
+    try:
+        # Peek at messages until we get the start event
+        while call_sid is None:
+            message = await websocket.receive_text()
+            data = json.loads(message)
+            event = data.get("event")
 
-            # Extract call info from start event
-            start_data = data.get("start", {})
-            call_sid = start_data.get("callSid", "unknown")
+            if event == "start":
+                start_data = data.get("start", {})
+                call_sid = start_data.get("callSid", "unknown")
+                # Check if phone number is in custom parameters
+                phone_number = start_data.get("customParameters", {}).get("callerNumber")
+                logger.info(f"WebSocket: Got start event for call {call_sid}")
+                break
+            elif event == "connected":
+                logger.debug(f"WebSocket: Connected event received")
+                continue
+            elif event == "disconnect":
+                logger.info("WebSocket: Disconnected before start event")
+                return
 
-            # Get caller phone number from stream custom parameters or use default
-            # For now, we'll use a placeholder - the real number should come from Twilio
-            phone_number = start_data.get("customParameters", {}).get("callerNumber", "+0000000000")
+        # Use default phone number if not provided
+        if not phone_number:
+            phone_number = "+0000000000"
+            logger.warning(f"WebSocket: No phone number in custom parameters, using default")
 
-            logger.info(f"WebSocket: Starting call {call_sid} with orchestrator")
+        # Pass control to orchestrator - it will handle the rest
+        logger.info(f"WebSocket: Passing control to orchestrator for call {call_sid}")
+        await orchestrator.handle_call(call_sid, phone_number, websocket)
 
-            # Start the orchestrator's conversation handling
-            if not self._call_started:
-                self._call_started = True
-                # Create a task for the orchestrator to handle this call
-                asyncio.create_task(self.orchestrator.handle_call(call_sid, phone_number, websocket))
-
-    # Create handler and let it handle the connection
-    handler = OrchestratorTwilioHandler(orchestrator, websocket)
-    await handler.handle_connection()
-
-    logger.info(f"WebSocket: Connection ended")
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket: Disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket: Error: {e}")
+    finally:
+        logger.info(f"WebSocket: Connection ended")
 
 
 # =====================================================
