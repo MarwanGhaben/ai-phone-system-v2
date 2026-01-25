@@ -11,11 +11,11 @@ from typing import AsyncIterator, Optional, List
 from loguru import logger
 
 try:
-    from elevenlabs import Voice, VoiceSettings, generate, stream, Voices, ElevenLabs
+    from elevenlabs import generate, stream, Voice, VoiceSettings, set_api_key
     ELEVENLABS_AVAILABLE = True
 except ImportError:
     ELEVENLABS_AVAILABLE = False
-    Voice = VoiceSettings = ElevenLabs = None
+    generate = stream = Voice = VoiceSettings = set_api_key = None
 
 from .tts_base import TTSServiceBase, TTSRequest, TTSResponse, TTSChunk, TTSStatus
 
@@ -78,15 +78,11 @@ class ElevenLabsTTS(TTSServiceBase):
         self.similarity_boost = similarity_boost
         self.output_format = output_format
 
-        self._client: Optional[ElevenLabs] = None
+        # Set API key globally for elevenlabs 1.5.0
+        set_api_key(api_key)
+
         self._voices_cache: Optional[List[dict]] = None
         self._stop_event = asyncio.Event()
-
-    async def _get_client(self) -> ElevenLabs:
-        """Get or create ElevenLabs client"""
-        if self._client is None:
-            self._client = ElevenLabs(api_key=self.api_key)
-        return self._client
 
     async def synthesize(self, request: TTSRequest) -> TTSResponse:
         """
@@ -103,7 +99,6 @@ class ElevenLabsTTS(TTSServiceBase):
         self._stop_event.clear()
 
         try:
-            client = await self._get_client()
             voice_id = request.voice_id or self.default_voice_id
 
             logger.info(f"ElevenLabs: Synthesizing '{request.text[:50]}...' with voice {voice_id}")
@@ -111,16 +106,16 @@ class ElevenLabsTTS(TTSServiceBase):
             # Configure voice settings
             voice_settings = VoiceSettings(
                 stability=self.stability,
-                similarity_boost=self.similarity_boost,
-                model=self.model,
+                similarity_boost=self.similarity_boost
             )
 
-            # Generate audio
+            # Generate audio (elevenlabs 1.5.0 uses sync API)
             audio_generator = generate(
                 text=request.text,
                 voice=voice_id,
                 model=self.model,
-                voice_settings=voice_settings
+                voice_settings=voice_settings,
+                api_key=self.api_key
             )
 
             # Collect all audio data
@@ -174,23 +169,22 @@ class ElevenLabsTTS(TTSServiceBase):
         self._stop_event.clear()
 
         try:
-            client = await self._get_client()
             voice_id = request.voice_id or self.default_voice_id
 
             logger.info(f"ElevenLabs: Streaming '{request.text[:50]}...' with voice {voice_id}")
 
             voice_settings = VoiceSettings(
                 stability=self.stability,
-                similarity_boost=self.similarity_boost,
-                model=self.model,
+                similarity_boost=self.similarity_boost
             )
 
-            # Stream audio generation
+            # Stream audio generation (elevenlabs 1.5.0)
             audio_stream = stream(
                 text=request.text,
                 voice=voice_id,
                 model=self.model,
-                voice_settings=voice_settings
+                voice_settings=voice_settings,
+                api_key=self.api_key
             )
 
             chunk_index = 0
@@ -236,34 +230,11 @@ class ElevenLabsTTS(TTSServiceBase):
         Returns:
             List of voice metadata
         """
-        try:
-            if self._voices_cache is None:
-                client = await self._get_client()
-                voices: Voices = client.voices.get_all()
-
-                # Convert to simpler format
-                self._voices_cache = [
-                    {
-                        "voice_id": voice.voice_id,
-                        "name": voice.name,
-                        "category": voice.category,
-                        "labels": voice.labels or {},
-                    }
-                    for voice in voices
-                ]
-
-            # Filter by language if requested
-            if language != "all":
-                return [
-                    v for v in self._voices_cache
-                    if language in str(v.get("labels", {})).lower()
-                ]
-
-            return self._voices_cache
-
-        except Exception as e:
-            logger.error(f"ElevenLabs: Error fetching voices: {e}")
-            return []
+        # TODO: Implement for elevenlabs 1.5.0 (voices API changed)
+        # For now, return the popular voices defined in the class
+        return [
+            {"voice_id": k, **v} for k, v in self.POPULAR_VOICES.items()
+        ]
 
 
 # Factory function
