@@ -11,11 +11,11 @@ from typing import AsyncIterator, Optional, List
 from loguru import logger
 
 try:
-    from elevenlabs import generate, stream, Voice, VoiceSettings, set_api_key
+    from elevenlabs.client import ElevenLabs
     ELEVENLABS_AVAILABLE = True
 except ImportError:
     ELEVENLABS_AVAILABLE = False
-    generate = stream = Voice = VoiceSettings = set_api_key = None
+    ElevenLabs = None
 
 from .tts_base import TTSServiceBase, TTSRequest, TTSResponse, TTSChunk, TTSStatus
 
@@ -34,18 +34,18 @@ class ElevenLabsTTS(TTSServiceBase):
 
     # Popular voices for different languages/accents
     POPULAR_VOICES = {
-        # English voices
-        "Rachel": {"name": "Rachel", "gender": "F", "accent": "American"},
-        "Drew": {"name": "Drew", "gender": "M", "accent": "American"},
-        "Clyde": {"name": "Clyde", "gender": "M", "accent": "American"},
-        "Sarah": {"name": "Sarah", "gender": "F", "accent": "British"},
-        "Adam": {"name": "Adam", "gender": "M", "accent": "American"},
-        "Emily": {"name": "Emily", "gender": "F", "accent": "American"},
-        "Josh": {"name": "Josh", "gender": "M", "accent": "Canadian"},
+        # English voices (use voice_ids)
+        "Rachel": {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel", "gender": "F", "accent": "American"},
+        "Drew": {"voice_id": "29vD33N1CtxCmqQRPOHJ", "name": "Drew", "gender": "M", "accent": "American"},
+        "Clyde": {"voice_id": "2EiwWnXFnvU5JabPnv8n", "name": "Clyde", "gender": "M", "accent": "American"},
+        "Sarah": {"voice_id": "EXHAITRWHUWQO296QKJI", "name": "Sarah", "gender": "F", "accent": "British"},
+        "Adam": {"voice_id": "ADq4zsqJPsd4acy0B6B1", "name": "Adam", "gender": "M", "accent": "American"},
+        "Emily": {"voice_id": "AZnzlk1XvdvUeBnXmlld", "name": "Emily", "gender": "F", "accent": "American"},
+        "Josh": {"voice_id": "TxGEqnHWrfWFTfGW9XjX", "name": "Josh", "gender": "M", "accent": "Canadian"},
 
         # Multilingual voices (good for Arabic)
-        "Antoni": {"name": "Antoni", "gender": "M", "accent": "American", "languages": ["en", "es"]},
-        "Fin": {"name": "Fin", "gender": "M", "accent": "Irish", "languages": ["en", "es"]},
+        "Antoni": {"voice_id": "ErXwobaRi7UmFJ9fQaF1", "name": "Antoni", "gender": "M", "accent": "American", "languages": ["en", "es"]},
+        "Fin": {"voice_id": "YOZ27uZTVtijvd1HfGBq", "name": "Fin", "gender": "M", "accent": "Irish", "languages": ["en", "es"]},
     }
 
     def __init__(
@@ -62,7 +62,7 @@ class ElevenLabsTTS(TTSServiceBase):
 
         Args:
             api_key: ElevenLabs API key
-            default_voice_id: Default voice ID
+            default_voice_id: Default voice name (will be mapped to voice_id)
             model: Model to use (eleven_multilingual_v2 recommended)
             stability: Voice stability (0-1, lower = more expressive)
             similarity_boost: Voice similarity (0-1, higher = more similar to original)
@@ -78,11 +78,21 @@ class ElevenLabsTTS(TTSServiceBase):
         self.similarity_boost = similarity_boost
         self.output_format = output_format
 
-        # Set API key globally for elevenlabs 1.5.0
-        set_api_key(api_key)
-
+        # Create ElevenLabs client
+        self._client = Optional[ElevenLabs]
         self._voices_cache: Optional[List[dict]] = None
         self._stop_event = asyncio.Event()
+
+    def _get_client(self) -> ElevenLabs:
+        """Get or create ElevenLabs client"""
+        return ElevenLabs(api_key=self.api_key)
+
+    def _get_voice_id(self, voice_name: str) -> str:
+        """Convert voice name to voice_id"""
+        voice_info = self.POPULAR_VOICES.get(voice_name)
+        if voice_info:
+            return voice_info.get("voice_id", voice_name)
+        return voice_name  # Assume it's already a voice_id
 
     async def synthesize(self, request: TTSRequest) -> TTSResponse:
         """
@@ -99,48 +109,43 @@ class ElevenLabsTTS(TTSServiceBase):
         self._stop_event.clear()
 
         try:
-            voice_id = request.voice_id or self.default_voice_id
+            client = self._get_client()
+            voice_id = self._get_voice_id(request.voice_id or self.default_voice_id)
 
             logger.info(f"ElevenLabs: Synthesizing '{request.text[:50]}...' with voice {voice_id}")
 
-            # Configure voice settings
-            voice_settings = VoiceSettings(
-                stability=self.stability,
-                similarity_boost=self.similarity_boost
-            )
-
-            # Generate audio (elevenlabs 1.5.0 uses sync API)
-            audio_generator = generate(
+            # Generate audio using new API
+            audio = client.text_to_speech.convert(
                 text=request.text,
-                voice=voice_id,
-                model=self.model,
-                voice_settings=voice_settings,
-                api_key=self.api_key
+                voice_id=voice_id,
+                model_id=self.model,
+                output_format=self.output_format,
             )
 
-            # Collect all audio data
-            audio_buffer = bytearray()
-            duration_chunks = []
-
-            for chunk in audio_generator:
-                if self._stop_event.is_set():
-                    self._status = TTSStatus.INTERRUPTED
-                    logger.info("ElevenLabs: Synthesis interrupted")
-                    break
-
-                audio_buffer.extend(chunk)
-                duration_chunks.append(len(chunk))
-
-            # Calculate approximate duration
-            total_bytes = len(audio_buffer)
-            # MP3 at 128 kbps = 16 KB/sec
-            duration_ms = int((total_bytes / 16000) * 1000)
+            # audio is bytes directly in new API
+            if isinstance(audio, bytes):
+                audio_data = audio
+            else:
+                # If it's a generator, collect all chunks
+                audio_buffer = bytearray()
+                for chunk in audio:
+                    if self._stop_event.is_set():
+                        self._status = TTSStatus.INTERRUPTED
+                        logger.info("ElevenLabs: Synthesis interrupted")
+                        break
+                    audio_buffer.extend(chunk)
+                audio_data = bytes(audio_buffer)
 
             if not self._stop_event.is_set():
                 self._status = TTSStatus.IDLE
 
+            # Calculate approximate duration
+            total_bytes = len(audio_data)
+            # MP3 at 128 kbps = 16 KB/sec
+            duration_ms = int((total_bytes / 16000) * 1000)
+
             return TTSResponse(
-                audio_data=bytes(audio_buffer),
+                audio_data=audio_data,
                 sample_rate=44100,
                 format="mp3",
                 duration_ms=duration_ms,
@@ -169,22 +174,16 @@ class ElevenLabsTTS(TTSServiceBase):
         self._stop_event.clear()
 
         try:
-            voice_id = request.voice_id or self.default_voice_id
+            client = self._get_client()
+            voice_id = self._get_voice_id(request.voice_id or self.default_voice_id)
 
             logger.info(f"ElevenLabs: Streaming '{request.text[:50]}...' with voice {voice_id}")
 
-            voice_settings = VoiceSettings(
-                stability=self.stability,
-                similarity_boost=self.similarity_boost
-            )
-
-            # Stream audio generation (elevenlabs 1.5.0)
-            audio_stream = stream(
+            # Stream audio generation using new API
+            audio_stream = client.text_to_speech.convert_as_stream(
                 text=request.text,
-                voice=voice_id,
-                model=self.model,
-                voice_settings=voice_settings,
-                api_key=self.api_key
+                voice_id=voice_id,
+                model_id=self.model,
             )
 
             chunk_index = 0
@@ -230,11 +229,35 @@ class ElevenLabsTTS(TTSServiceBase):
         Returns:
             List of voice metadata
         """
-        # TODO: Implement for elevenlabs 1.5.0 (voices API changed)
-        # For now, return the popular voices defined in the class
-        return [
-            {"voice_id": k, **v} for k, v in self.POPULAR_VOICES.items()
-        ]
+        try:
+            client = self._get_client()
+            response = client.voices.get_all()
+
+            voices_list = []
+            if hasattr(response, 'voices'):
+                for voice in response.voices:
+                    voices_list.append({
+                        "voice_id": voice.voice_id,
+                        "name": voice.name,
+                        "category": voice.category if hasattr(voice, 'category') else None,
+                        "labels": voice.labels if hasattr(voice, 'labels') else {},
+                    })
+
+            # Filter by language if requested
+            if language != "all":
+                return [
+                    v for v in voices_list
+                    if language in str(v.get("labels", {})).lower()
+                ]
+
+            return voices_list
+
+        except Exception as e:
+            logger.error(f"ElevenLabs: Error fetching voices: {e}")
+            # Return popular voices as fallback
+            return [
+                {"voice_id": k, **v} for k, v in self.POPULAR_VOICES.items()
+            ]
 
 
 # Factory function
