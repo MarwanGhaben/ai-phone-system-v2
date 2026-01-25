@@ -188,7 +188,6 @@ class TwilioMediaStreamHandler:
             audio_data: Audio data (μ-law 8kHz for Twilio)
         """
         from loguru import logger
-        import asyncio
 
         if not self._is_streaming:
             logger.warning(f"Twilio: Cannot send audio - not streaming (_is_streaming={self._is_streaming})")
@@ -197,6 +196,17 @@ class TwilioMediaStreamHandler:
         if not self.stream_sid:
             logger.error(f"Twilio: Cannot send audio - stream_sid is empty!")
             return
+
+        # First send a "clear" event to clear any buffers
+        try:
+            clear_event = {
+                "event": "clear",
+                "streamSid": self.stream_sid
+            }
+            await self.websocket.send_json(clear_event)
+            logger.info(f"Twilio: Sent clear event")
+        except Exception as e:
+            logger.warning(f"Twilio: Failed to send clear event: {e}")
 
         # Chunk size: 20ms at 8kHz = 160 samples = 160 bytes for μ-law
         CHUNK_SIZE = 160
@@ -226,12 +236,11 @@ class TwilioMediaStreamHandler:
                 await self.websocket.send_json(media_event)
                 chunks_sent += 1
 
-                # Small delay between chunks (20ms = 0.02s) to maintain real-time pace
-                # This prevents overwhelming the connection and mimics natural speech timing
-                if i + CHUNK_SIZE < total_bytes:  # Don't delay after last chunk
-                    await asyncio.sleep(0.02)
+                # Log every 50 chunks to avoid spam
+                if chunks_sent % 50 == 0:
+                    logger.debug(f"Twilio: Sent {chunks_sent} chunks...")
 
-            logger.info(f"Twilio: Audio sent successfully ({chunks_sent} chunks)")
+            logger.info(f"Twilio: Audio sent successfully ({chunks_sent} chunks, {total_bytes} bytes)")
 
         except Exception as e:
             logger.error(f"Twilio: Failed to send audio: {e}")

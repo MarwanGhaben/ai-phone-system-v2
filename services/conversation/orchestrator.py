@@ -247,7 +247,7 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
 
             async def send_greeting_after_delay():
                 """Send greeting after a short delay to let connection stabilize"""
-                await asyncio.sleep(0.5)  # Wait 500ms for connection to stabilize
+                await asyncio.sleep(1.0)  # Wait 1 second for connection to stabilize
                 logger.info(f"Orchestrator: Speaking greeting to caller...")
                 await self._speak_to_caller(call_sid, greeting, caller_language)
                 logger.info(f"Orchestrator: Greeting sent")

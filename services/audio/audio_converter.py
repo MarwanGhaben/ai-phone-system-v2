@@ -52,6 +52,15 @@ def convert_to_mulaw(audio_data: bytes, input_format: str = "mp3", input_rate: i
         # Convert PCM to μ-law
         mulaw_audio = pcm_to_mulaw(raw_audio)
 
+        # Verify audio is not silent (check first 100 bytes)
+        if len(mulaw_audio) > 100:
+            sample_bytes = mulaw_audio[:100]
+            # Count non-zero bytes (μ-law silence is often 255, so check variety)
+            unique_values = len(set(sample_bytes))
+            logger.info(f"Audio conversion: {len(audio_data)} -> {len(mulaw_audio)} bytes μ-law, unique values in first 100 bytes: {unique_values}")
+            if unique_values < 10:
+                logger.warning(f"Audio may be silent or invalid - only {unique_values} unique values in first 100 bytes")
+
         return mulaw_audio
 
     except Exception as e:
