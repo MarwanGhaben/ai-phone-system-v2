@@ -192,52 +192,68 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             websocket: WebSocket connection from Twilio
             stream_sid: Twilio Media Stream SID (for sending audio back)
         """
-        logger.info(f"Orchestrator: Starting call {call_sid} from {phone_number}")
-
-        # Check if this is a returning caller
-        caller_info = self.caller_service.get_caller_info(phone_number)
-        caller_name = caller_info.get("name") if caller_info else None
-        caller_language = caller_info.get("language", "auto") if caller_info else "auto"
-
-        logger.info(f"Orchestrator: Caller info - name={caller_name}, language={caller_language}")
-
-        # Create conversation context
-        context = ConversationContext(
-            call_sid=call_sid,
-            phone_number=phone_number,
-            language=caller_language
-        )
-        context.caller_name = caller_name
-        context.is_known_caller = caller_name is not None
-        self._conversations[call_sid] = context
-
-        # Create Twilio handler
-        twilio_handler = TwilioMediaStreamHandler(call_sid, websocket)
-        self._twilio_handlers[call_sid] = twilio_handler
-
-        # IMPORTANT: Manually set streaming flag and stream_sid since we already consumed the start event in main.py
-        # The handler's handle_connection() won't see the start event, so we set this manually
-        twilio_handler._is_streaming = True
-        twilio_handler._is_connected = True
-        twilio_handler.stream_sid = stream_sid  # Critical: Use streamSid for media events, not callSid
-
-        # Set up media handler for incoming audio
-        twilio_handler.set_media_handler(self._handle_incoming_audio(call_sid))
+        import traceback
+        logger.info(f"Orchestrator: ===== START CALL {call_sid} from {phone_number}, stream_sid={stream_sid}")
 
         try:
+            # Check if this is a returning caller
+            logger.info(f"Orchestrator: Getting caller info for {phone_number}")
+            caller_info = self.caller_service.get_caller_info(phone_number)
+            caller_name = caller_info.get("name") if caller_info else None
+            caller_language = caller_info.get("language", "auto") if caller_info else "auto"
+
+            logger.info(f"Orchestrator: Caller info - name={caller_name}, language={caller_language}")
+
+            # Create conversation context
+            context = ConversationContext(
+                call_sid=call_sid,
+                phone_number=phone_number,
+                language=caller_language
+            )
+            context.caller_name = caller_name
+            context.is_known_caller = caller_name is not None
+            self._conversations[call_sid] = context
+            logger.info(f"Orchestrator: Conversation context created")
+
+            # Create Twilio handler
+            logger.info(f"Orchestrator: Creating Twilio handler")
+            twilio_handler = TwilioMediaStreamHandler(call_sid, websocket)
+            self._twilio_handlers[call_sid] = twilio_handler
+
+            # IMPORTANT: Manually set streaming flag and stream_sid since we already consumed the start event in main.py
+            # The handler's handle_connection() won't see the start event, so we set this manually
+            twilio_handler._is_streaming = True
+            twilio_handler._is_connected = True
+            twilio_handler.stream_sid = stream_sid  # Critical: Use streamSid for media events, not callSid
+            logger.info(f"Orchestrator: Handler configured - streaming=True, stream_sid={stream_sid}")
+
+            # Set up media handler for incoming audio
+            twilio_handler.set_media_handler(self._handle_incoming_audio(call_sid))
+            logger.info(f"Orchestrator: Media handler registered")
+
             # Connect to STT
+            logger.info(f"Orchestrator: Connecting to STT...")
             await self.stt.connect()
+            logger.info(f"Orchestrator: STT connected")
 
             # Send personalized greeting
+            logger.info(f"Orchestrator: Getting greeting...")
             greeting = self.caller_service.get_greeting_for_caller(phone_number, caller_language)
+            logger.info(f"Orchestrator: Greeting: '{greeting[:50]}...'")
+
+            logger.info(f"Orchestrator: Speaking greeting to caller...")
             await self._speak_to_caller(call_sid, greeting, caller_language)
+            logger.info(f"Orchestrator: Greeting sent, now handling WebSocket...")
 
             # Handle the WebSocket connection
             await twilio_handler.handle_connection()
+            logger.info(f"Orchestrator: WebSocket handling complete")
 
         except Exception as e:
-            logger.error(f"Orchestrator: Error in call {call_sid}: {e}")
+            logger.error(f"Orchestrator: Exception in call {call_sid}: {e}")
+            logger.error(f"Orchestrator: Traceback:\n{traceback.format_exc()}")
         finally:
+            logger.info(f"Orchestrator: ===== END CALL {call_sid}")
             await self.end_call(call_sid)
 
     def _handle_incoming_audio(self, call_sid: str):
@@ -408,12 +424,16 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             text: Text to speak
             language: Language code
         """
-        logger.info(f"Orchestrator: AI says: {text[:50]}...")
+        import traceback
+        logger.info(f"Orchestrator: _speak_to_caller START - text: '{text[:50]}...'")
 
         context = self._conversations.get(call_sid)
         twilio_handler = self._twilio_handlers.get(call_sid)
 
+        logger.info(f"Orchestrator: context={context is not None}, twilio_handler={twilio_handler is not None}")
+
         if not context or not twilio_handler:
+            logger.error(f"Orchestrator: Missing context or handler - context={context}, handler={twilio_handler}")
             return
 
         # Check if TTS is available
@@ -432,14 +452,13 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
                 voice_id="Rachel"  # Can be customized per language
             )
 
-            # Note: This sends audio as it's generated
-            # For Twilio, we need to convert to μ-law 8kHz
-            # This is handled by the TTS service or a converter
-
+            logger.info(f"Orchestrator: Synthesizing TTS...")
             # For now, synthesize full audio then send
             response = await self.tts.synthesize(request)
+            logger.info(f"Orchestrator: TTS response - format={response.format}, sample_rate={response.sample_rate}, bytes={len(response.audio_data)}")
 
             # Convert MP3 audio to μ-law 8kHz for Twilio
+            logger.info(f"Orchestrator: Converting audio to μ-law 8kHz...")
             from services.audio.audio_converter import convert_twilio_audio
             mulaw_audio = convert_twilio_audio(
                 response.audio_data,
@@ -448,17 +467,23 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             )
 
             if not mulaw_audio:
-                logger.error("Failed to convert audio to μ-law, not sending to caller")
+                logger.error("Orchestrator: Audio conversion returned empty bytes")
                 return
 
+            logger.info(f"Orchestrator: Audio converted - {len(mulaw_audio)} bytes μ-law")
+
             # Send to Twilio in correct format
+            logger.info(f"Orchestrator: Sending audio to Twilio (stream_sid={twilio_handler.stream_sid})...")
             await twilio_handler.send_audio(mulaw_audio)
+            logger.info(f"Orchestrator: Audio sent to Twilio successfully")
 
         except Exception as e:
-            logger.error(f"Orchestrator: Error speaking: {e}")
+            logger.error(f"Orchestrator: Exception in _speak_to_caller: {e}")
+            logger.error(f"Orchestrator: Traceback:\n{traceback.format_exc()}")
 
         finally:
             context.state = ConversationState.LISTENING
+            logger.info(f"Orchestrator: _speak_to_caller END")
 
     async def _detect_intent(self, text: str, language: str) -> Intent:
         """

@@ -72,6 +72,70 @@ async def health_check():
     }
 
 
+@app.get("/api/diagnostics")
+async def diagnostics():
+    """
+    Diagnostic endpoint to check all services
+    """
+    results = {}
+
+    # 1. Test ElevenLabs TTS
+    try:
+        from services.tts.elevenlabs_service import create_elevenlabs_tts
+        tts = create_elevenlabs_tts(settings.model_dump())
+        results["elevenlabs"] = {
+            "available": tts is not None,
+            "default_voice": getattr(tts, 'default_voice_id', 'N/A') if tts else None,
+            "model": getattr(tts, 'model', 'N/A') if tts else None
+        }
+    except Exception as e:
+        results["elevenlabs"] = {"error": str(e)}
+
+    # 2. Test Deepgram STT
+    try:
+        from services.stt.deepgram_service import create_deepgram_stt
+        stt = create_deepgram_stt(settings.model_dump())
+        results["deepgram"] = {
+            "available": stt is not None
+        }
+    except Exception as e:
+        results["deepgram"] = {"error": str(e)}
+
+    # 3. Test OpenAI LLM
+    try:
+        from services.llm.openai_service import create_openai_llm
+        llm = create_openai_llm(settings.model_dump())
+        results["openai"] = {
+            "available": llm is not None
+        }
+    except Exception as e:
+        results["openai"] = {"error": str(e)}
+
+    # 4. Test audio converter
+    try:
+        from services.audio.audio_converter import PYDUB_AVAILABLE
+        import subprocess
+        ffmpeg_check = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+        results["audio_converter"] = {
+            "pydub_available": PYDUB_AVAILABLE,
+            "ffmpeg_available": ffmpeg_check.returncode == 0
+        }
+    except Exception as e:
+        results["audio_converter"] = {"error": str(e)}
+
+    # 5. Test orchestrator
+    try:
+        orchestrator = get_orchestrator()
+        results["orchestrator"] = {
+            "available": orchestrator is not None,
+            "type": type(orchestrator).__name__ if orchestrator else None
+        }
+    except Exception as e:
+        results["orchestrator"] = {"error": str(e)}
+
+    return results
+
+
 # =====================================================
 # TWILIO WEBHOOK (TwiML)
 # =====================================================
@@ -159,11 +223,7 @@ async def websocket_call_handler(websocket: WebSocket):
     """
     # Accept WebSocket connection
     await websocket.accept()
-
-    # Get orchestrator
-    orchestrator = get_orchestrator()
-
-    import json
+    logger.info("WebSocket: Connection accepted")
 
     # Read the first message to get call info, then pass to orchestrator
     # We only need to peek at the start event to extract call_sid and stream_sid
@@ -172,6 +232,8 @@ async def websocket_call_handler(websocket: WebSocket):
     stream_sid = ""
 
     try:
+        import json
+
         # Peek at messages until we get the start event
         while call_sid is None:
             message = await websocket.receive_text()
@@ -184,10 +246,10 @@ async def websocket_call_handler(websocket: WebSocket):
                 stream_sid = start_data.get("streamSid", "")
                 # Check if phone number is in custom parameters
                 phone_number = start_data.get("customParameters", {}).get("callerNumber")
-                logger.info(f"WebSocket: Got start event for call {call_sid}, stream {stream_sid}")
+                logger.info(f"WebSocket: Got start event - call_sid={call_sid}, stream_sid={stream_sid}")
                 break
             elif event == "connected":
-                logger.debug(f"WebSocket: Connected event received")
+                logger.info("WebSocket: Connected event received")
                 continue
             elif event == "disconnect":
                 logger.info("WebSocket: Disconnected before start event")
@@ -196,18 +258,27 @@ async def websocket_call_handler(websocket: WebSocket):
         # Use default phone number if not provided
         if not phone_number:
             phone_number = "+0000000000"
-            logger.warning(f"WebSocket: No phone number in custom parameters, using default")
+            logger.warning(f"WebSocket: Using default phone number")
+
+        # Get orchestrator
+        logger.info(f"WebSocket: Getting orchestrator instance...")
+        from services.conversation.orchestrator import get_orchestrator
+        orchestrator = get_orchestrator()
+        logger.info(f"WebSocket: Got orchestrator: {type(orchestrator).__name__}")
 
         # Pass control to orchestrator - it will handle the rest
-        logger.info(f"WebSocket: Passing control to orchestrator for call {call_sid}")
+        logger.info(f"WebSocket: Calling orchestrator.handle_call({call_sid}, {phone_number}, ..., {stream_sid})")
         await orchestrator.handle_call(call_sid, phone_number, websocket, stream_sid)
+        logger.info(f"WebSocket: orchestrator.handle_call completed")
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket: Disconnected")
+        logger.info(f"WebSocket: Client disconnected")
     except Exception as e:
-        logger.error(f"WebSocket: Error: {e}")
+        import traceback
+        logger.error(f"WebSocket: Exception: {e}")
+        logger.error(f"WebSocket: Traceback:\n{traceback.format_exc()}")
     finally:
-        logger.info(f"WebSocket: Connection ended")
+        logger.info(f"WebSocket: Handler ended for call {call_sid}")
 
 
 # =====================================================

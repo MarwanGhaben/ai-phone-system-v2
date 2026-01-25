@@ -175,7 +175,14 @@ class TwilioMediaStreamHandler:
         Args:
             audio_data: Audio data (μ-law 8kHz for Twilio)
         """
+        from loguru import logger
+
         if not self._is_streaming:
+            logger.warning(f"Twilio: Cannot send audio - not streaming (_is_streaming={self._is_streaming})")
+            return
+
+        if not self.stream_sid:
+            logger.error(f"Twilio: Cannot send audio - stream_sid is empty!")
             return
 
         # Encode to base64
@@ -184,13 +191,15 @@ class TwilioMediaStreamHandler:
         # Create media event - IMPORTANT: Use streamSid not callSid
         media_event = {
             "event": "media",
-            "streamSid": self.stream_sid or self.call_sid,  # Fall back to call_sid if stream_sid not set
+            "streamSid": self.stream_sid,
             "media": {
                 "payload": payload
             }
         }
 
+        logger.debug(f"Twilio: Sending {len(audio_data)} bytes audio (streamSid={self.stream_sid})")
         await self.websocket.send_json(media_event)
+        logger.debug(f"Twilio: Audio sent successfully")
 
     async def send_event(self, event: str, **kwargs) -> None:
         """
