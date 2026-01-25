@@ -159,8 +159,8 @@ async def incoming_call(request: Request):
     # Check if domain is set and not empty
     if domain and domain.strip():
         # Use configured public domain with secure WebSocket
-        # Use standard port 443 (not 8443) for better compatibility
-        ws_url = f"wss://{domain.strip()}/ws/calls"
+        # IMPORTANT: Port 8443 bypasses Sophos for WebSocket
+        ws_url = f"wss://{domain.strip()}:8443/ws/calls"
         print(f"DEBUG: Using PUBLIC_DOMAIN: {ws_url}")
     else:
         # Try to get domain from X-Forwarded-Host header (set by reverse proxy)
