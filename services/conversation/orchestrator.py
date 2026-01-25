@@ -235,25 +235,26 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             await self.stt.connect()
             logger.info(f"Orchestrator: STT connected")
 
-            # Get personalized greeting and send it immediately
+            # Get personalized greeting - will be sent after event loop starts
             logger.info(f"Orchestrator: Getting greeting...")
             greeting = self.caller_service.get_greeting_for_caller(phone_number, caller_language)
             logger.info(f"Orchestrator: Greeting: '{greeting[:50]}...'")
 
-            # Send greeting immediately (before starting event loop)
-            # This ensures state is properly managed and no race conditions
-            logger.info(f"Orchestrator: Sending greeting...")
-            context.state = ConversationState.SPEAKING
-            try:
-                await self._speak_to_caller(call_sid, greeting, caller_language)
-                logger.info(f"Orchestrator: Greeting sent successfully")
-            except Exception as e:
-                logger.error(f"Orchestrator: Failed to send greeting: {e}")
-            finally:
-                context.state = ConversationState.LISTENING
+            # Create task to send greeting after event loop starts
+            # This ensures audio queue is ready when we try to send
+            async def send_greeting_after_delay():
+                await asyncio.sleep(1.0)  # Wait for event loop to fully start
+                logger.info(f"Orchestrator: Sending greeting...")
+                context.state = ConversationState.SPEAKING
+                try:
+                    await self._speak_to_caller(call_sid, greeting, caller_language)
+                    logger.info(f"Orchestrator: Greeting sent successfully")
+                except Exception as e:
+                    logger.error(f"Orchestrator: Failed to send greeting: {e}")
+                finally:
+                    context.state = ConversationState.LISTENING
 
-            # Small delay after greeting before starting event loop
-            await asyncio.sleep(0.5)
+            greeting_task = asyncio.create_task(send_greeting_after_delay())
 
             # Start transcript consumer as background task
             # This consumes transcripts from STT queue and processes them
@@ -275,6 +276,14 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
                     transcript_task.cancel()
                     try:
                         await transcript_task
+                    except asyncio.CancelledError:
+                        pass
+                # Cancel greeting task if still running
+                if not greeting_task.done():
+                    logger.info(f"Orchestrator: Cancelling greeting task...")
+                    greeting_task.cancel()
+                    try:
+                        await greeting_task
                     except asyncio.CancelledError:
                         pass
             logger.info(f"Orchestrator: WebSocket handling complete")
