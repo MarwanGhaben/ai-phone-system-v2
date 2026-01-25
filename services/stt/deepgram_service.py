@@ -121,8 +121,8 @@ class DeepgramSTT(STTServiceBase):
                 interim_results=True,   # Get interim results while speaking
             )
 
-            # Start the connection
-            if await self._live_connection.start(options):
+            # Start the connection (start() returns bool directly, not awaitable)
+            if self._live_connection.start(options):
                 self._status = STTStatus.CONNECTED
                 self._transcript_queue = asyncio.Queue()
                 self._is_listening = True
@@ -146,7 +146,7 @@ class DeepgramSTT(STTServiceBase):
 
         if self._live_connection:
             try:
-                await self._live_connection.finish()
+                self._live_connection.finish()  # Synchronous method
             except Exception as e:
                 logger.warning(f"Deepgram: Error disconnecting: {e}")
 
@@ -165,9 +165,9 @@ class DeepgramSTT(STTServiceBase):
             return
 
         try:
-            # Send audio data to Deepgram
+            # Send audio data to Deepgram (synchronous method)
             # Twilio sends 8kHz μ-law, Deepgram accepts various formats
-            await self._live_connection.send(audio_chunk.data)
+            self._live_connection.send(audio_chunk.data)
         except Exception as e:
             logger.error(f"Deepgram: Error sending audio: {e}")
 
