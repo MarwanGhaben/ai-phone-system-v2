@@ -217,14 +217,13 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
 
             # Create Twilio handler
             logger.info(f"Orchestrator: Creating Twilio handler")
-            twilio_handler = TwilioMediaStreamHandler(call_sid, websocket)
+            twilio_handler = TwilioMediaStreamHandler(call_sid, stream_sid, websocket)
             self._twilio_handlers[call_sid] = twilio_handler
 
-            # IMPORTANT: Manually set streaming flag and stream_sid since we already consumed the start event in main.py
+            # IMPORTANT: Manually set streaming flag since we already consumed the start event in main.py
             # The handler's handle_connection() won't see the start event, so we set this manually
             twilio_handler._is_streaming = True
             twilio_handler._is_connected = True
-            twilio_handler.stream_sid = stream_sid  # Critical: Use streamSid for media events, not callSid
             logger.info(f"Orchestrator: Handler configured - streaming=True, stream_sid={stream_sid}")
 
             # Set up media handler for incoming audio

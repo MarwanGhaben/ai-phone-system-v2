@@ -34,16 +34,17 @@ class TwilioMediaStreamHandler:
     EVENT_DISCONNECTED = "disconnected"
     EVENT_ERROR = "error"
 
-    def __init__(self, call_sid: str | None, websocket: WebSocket):
+    def __init__(self, call_sid: str | None, stream_sid: str, websocket: WebSocket):
         """
         Initialize media stream handler
 
         Args:
-            call_sid: Twilio call SID (optional, will be extracted from start event)
+            call_sid: Twilio call SID
+            stream_sid: Twilio Media Stream SID (from start event)
             websocket: WebSocket connection from Twilio
         """
         self.call_sid = call_sid or "unknown"
-        self.stream_sid = ""
+        self.stream_sid = stream_sid
         self.websocket = websocket
 
         # Event handlers
@@ -268,7 +269,7 @@ class TwilioMediaStreamHandler:
         """
         message = {
             "event": event,
-            "streamSid": self.call_sid,
+            "streamSid": self.stream_sid,
             **kwargs
         }
 
