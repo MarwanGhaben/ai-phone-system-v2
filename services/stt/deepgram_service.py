@@ -230,23 +230,24 @@ class DeepgramSTT(STTServiceBase):
     def _on_transcript(self, *args, **kwargs):
         """Handle incoming transcript from Deepgram WebSocket"""
         try:
-            # DEBUG: Log that callback was invoked
-            logger.info(f"Deepgram: _on_transcript CALLED - args={len(args)}, kwargs={list(kwargs.keys())}")
+            # Deepgram SDK 3.x passes result via kwargs, not positional args
+            # The first arg is the LiveClient itself, not the result
+            result = kwargs.get('result')
 
-            # Deepgram SDK passes result as first argument (positional)
-            # result is a LiveResultResponse object, NOT a dict
-            result = args[0] if args else kwargs.get('result')
             if not result:
-                logger.warning("Deepgram: _on_transcript called but no result found")
+                logger.warning("Deepgram: _on_transcript called but no result in kwargs")
+                logger.debug(f"Deepgram: args={[type(a).__name__ for a in args]}, kwargs_keys={list(kwargs.keys())}")
                 return
 
-            # DEBUG: Log the raw result
-            logger.info(f"Deepgram: Raw result type={type(result).__name__}, dir={sorted([x for x in dir(result) if not x.startswith('_')])}")
+            # result should be a LiveResultResponse object
+            logger.debug(f"Deepgram: Raw result type={type(result).__name__}")
 
-            # Access object attributes (not dict keys)
-            # result.channel.alternatives[0].transcript
+            # Try to get transcript from result object
+            # Deepgram SDK 3.x structure: result.channel.alternatives[0].transcript
             if not hasattr(result, 'channel'):
-                logger.warning("Deepgram: Result has no 'channel' attribute")
+                logger.warning(f"Deepgram: Result type {type(result).__name__} has no 'channel' attribute")
+                # Try to see if result has a different structure
+                logger.debug(f"Deepgram: Result attributes: {[attr for attr in dir(result) if not attr.startswith('_')][:20]}")
                 return
 
             channel = result.channel
@@ -263,7 +264,7 @@ class DeepgramSTT(STTServiceBase):
 
             transcript = best_alternative.transcript
             if not transcript:
-                logger.info(f"Deepgram: Empty transcript received (is_final={getattr(result, 'is_final', False)})")
+                logger.debug(f"Deepgram: Empty transcript received (is_final={getattr(result, 'is_final', False)})")
                 return
 
             # Extract metadata from object attributes
@@ -277,8 +278,11 @@ class DeepgramSTT(STTServiceBase):
                 language_full = getattr(channel, 'language', self.language)
                 detected_language = language_full.split('-')[0] if language_full else self.language
 
-            # DEBUG: Log every transcript
-            logger.info(f"Deepgram: Transcript [{'FINAL' if is_final else 'interim'}] [{detected_language}]: '{transcript}' (confidence={confidence})")
+            # Log final transcripts
+            if is_final:
+                logger.info(f"Deepgram: Final transcript [{detected_language}]: {transcript}")
+            else:
+                logger.debug(f"Deepgram: Interim transcript: {transcript}")
 
             # Create STT result
             stt_result = STTResult(
@@ -298,7 +302,6 @@ class DeepgramSTT(STTServiceBase):
             # Put in queue for consumption
             if self._transcript_queue:
                 self._transcript_queue.put_nowait(stt_result)
-                logger.debug(f"Deepgram: Put transcript in queue, queue_size={self._transcript_queue.qsize()}")
             else:
                 logger.warning("Deepgram: Transcript queue is None!")
 
