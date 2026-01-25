@@ -182,7 +182,7 @@ LANGUAGE DETECTION:
 
 Remember: This is a real phone call. Be concise. Be helpful. Be human."""
 
-    async def handle_call(self, call_sid: str, phone_number: str, websocket) -> None:
+    async def handle_call(self, call_sid: str, phone_number: str, websocket, stream_sid: str = "") -> None:
         """
         Handle a complete phone call
 
@@ -190,6 +190,7 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             call_sid: Twilio Call SID
             phone_number: Caller's phone number
             websocket: WebSocket connection from Twilio
+            stream_sid: Twilio Media Stream SID (for sending audio back)
         """
         logger.info(f"Orchestrator: Starting call {call_sid} from {phone_number}")
 
@@ -214,10 +215,11 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
         twilio_handler = TwilioMediaStreamHandler(call_sid, websocket)
         self._twilio_handlers[call_sid] = twilio_handler
 
-        # IMPORTANT: Manually set streaming flag since we already consumed the start event in main.py
+        # IMPORTANT: Manually set streaming flag and stream_sid since we already consumed the start event in main.py
         # The handler's handle_connection() won't see the start event, so we set this manually
         twilio_handler._is_streaming = True
         twilio_handler._is_connected = True
+        twilio_handler.stream_sid = stream_sid  # Critical: Use streamSid for media events, not callSid
 
         # Set up media handler for incoming audio
         twilio_handler.set_media_handler(self._handle_incoming_audio(call_sid))

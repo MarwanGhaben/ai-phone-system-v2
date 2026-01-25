@@ -181,10 +181,10 @@ class TwilioMediaStreamHandler:
         # Encode to base64
         payload = base64.b64encode(audio_data).decode("utf-8")
 
-        # Create media event
+        # Create media event - IMPORTANT: Use streamSid not callSid
         media_event = {
             "event": "media",
-            "streamSid": self.call_sid,
+            "streamSid": self.stream_sid or self.call_sid,  # Fall back to call_sid if stream_sid not set
             "media": {
                 "payload": payload
             }

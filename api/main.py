@@ -166,9 +166,10 @@ async def websocket_call_handler(websocket: WebSocket):
     import json
 
     # Read the first message to get call info, then pass to orchestrator
-    # We only need to peek at the start event to extract call_sid
+    # We only need to peek at the start event to extract call_sid and stream_sid
     call_sid = None
     phone_number = None
+    stream_sid = ""
 
     try:
         # Peek at messages until we get the start event
@@ -180,9 +181,10 @@ async def websocket_call_handler(websocket: WebSocket):
             if event == "start":
                 start_data = data.get("start", {})
                 call_sid = start_data.get("callSid", "unknown")
+                stream_sid = start_data.get("streamSid", "")
                 # Check if phone number is in custom parameters
                 phone_number = start_data.get("customParameters", {}).get("callerNumber")
-                logger.info(f"WebSocket: Got start event for call {call_sid}")
+                logger.info(f"WebSocket: Got start event for call {call_sid}, stream {stream_sid}")
                 break
             elif event == "connected":
                 logger.debug(f"WebSocket: Connected event received")
@@ -198,7 +200,7 @@ async def websocket_call_handler(websocket: WebSocket):
 
         # Pass control to orchestrator - it will handle the rest
         logger.info(f"WebSocket: Passing control to orchestrator for call {call_sid}")
-        await orchestrator.handle_call(call_sid, phone_number, websocket)
+        await orchestrator.handle_call(call_sid, phone_number, websocket, stream_sid)
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket: Disconnected")
