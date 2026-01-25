@@ -116,8 +116,7 @@ services:
       - ./nginx/www:/var/www/certbot:ro
       - ./nginx/logs:/var/log/nginx
     ports:
-      - "443:443"
-      - "80:80"
+      - "8443:443"  # Use external port 8443 for WebSocket SSL
     depends_on:
       - app
     restart: unless-stopped

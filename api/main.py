@@ -94,14 +94,15 @@ async def incoming_call(request: Request):
     # Check if domain is set and not empty
     if domain and domain.strip():
         # Use configured public domain with secure WebSocket
-        ws_url = f"wss://{domain.strip()}/ws/calls"
+        # Add port 8443 for WebSocket SSL (bypasses Sophos SSL termination)
+        ws_url = f"wss://{domain.strip()}:8443/ws/calls"
         print(f"DEBUG: Using PUBLIC_DOMAIN: {ws_url}")
     else:
         # Try to get domain from X-Forwarded-Host header (set by reverse proxy)
         forwarded_host = request.headers.get('X-Forwarded-Host', '')
         if forwarded_host:
             # Use the forwarded host (public domain)
-            ws_url = f"wss://{forwarded_host}/ws/calls"
+            ws_url = f"wss://{forwarded_host}:8443/ws/calls"
             print(f"DEBUG: Using X-Forwarded-Host: {ws_url}")
         else:
             # Last resort: use host header but warn
@@ -116,6 +117,9 @@ async def incoming_call(request: Request):
             ws_url = host.replace('https://', 'wss://').replace('http://', 'ws://')
             if not ws_url.endswith('/ws/calls'):
                 ws_url = f"{ws_url}/ws/calls"
+            # Ensure port 8443 for external access
+            if ':8443' not in ws_url:
+                ws_url = ws_url.replace('/ws/calls', ':8443/ws/calls')
             print(f"DEBUG: Fallback WebSocket URL: {ws_url}")
 
     from services.telephony.twilio_service import TwilioService
