@@ -236,18 +236,34 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             await self.stt.connect()
             logger.info(f"Orchestrator: STT connected")
 
-            # Send personalized greeting
+            # Get personalized greeting
             logger.info(f"Orchestrator: Getting greeting...")
             greeting = self.caller_service.get_greeting_for_caller(phone_number, caller_language)
             logger.info(f"Orchestrator: Greeting: '{greeting[:50]}...'")
 
-            logger.info(f"Orchestrator: Speaking greeting to caller...")
-            await self._speak_to_caller(call_sid, greeting, caller_language)
-            logger.info(f"Orchestrator: Greeting sent, now handling WebSocket...")
+            # Start the connection handler and send greeting concurrently
+            # The greeting must be sent AFTER the event loop starts
+            logger.info(f"Orchestrator: Starting connection handler...")
 
-            # Handle the WebSocket connection
+            async def send_greeting_after_delay():
+                """Send greeting after a short delay to let connection stabilize"""
+                await asyncio.sleep(0.5)  # Wait 500ms for connection to stabilize
+                logger.info(f"Orchestrator: Speaking greeting to caller...")
+                await self._speak_to_caller(call_sid, greeting, caller_language)
+                logger.info(f"Orchestrator: Greeting sent")
+
+            # Run both tasks: the connection loop and the delayed greeting
+            greeting_task = asyncio.create_task(send_greeting_after_delay())
             await twilio_handler.handle_connection()
             logger.info(f"Orchestrator: WebSocket handling complete")
+
+            # Cancel greeting task if call ended
+            if not greeting_task.done():
+                greeting_task.cancel()
+                try:
+                    await greeting_task
+                except asyncio.CancelledError:
+                    pass
 
         except Exception as e:
             logger.error(f"Orchestrator: Exception in call {call_sid}: {e}")
