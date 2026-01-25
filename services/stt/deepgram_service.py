@@ -101,8 +101,21 @@ class DeepgramSTT(STTServiceBase):
             # Note: SDK 3.x API changed - use live.v() instead of listen.websocket.v()
             self._live_connection = self._deepgram.listen.live.v("1")
 
-            # Set up event handlers
+            # Set up event handlers - DEBUG: log all possible events
+            logger.info(f"Deepgram: Setting up event handlers...")
+            logger.info(f"Deepgram: LiveTranscriptionEvents available: {[e for e in dir(LiveTranscriptionEvents) if not e.startswith('_')]}")
+
+            # Register transcript handler
             self._live_connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
+            logger.info(f"Deepgram: Registered Transcript event handler")
+
+            # DEBUG: Register handlers for other events to see what Deepgram sends
+            self._live_connection.on(LiveTranscriptionEvents.Open, self._on_open)
+            self._live_connection.on(LiveTranscriptionEvents.Close, self._on_close)
+            self._live_connection.on(LiveTranscriptionEvents.Error, self._on_error)
+            self._live_connection.on(LiveTranscriptionEvents.Warning, self._on_warning)
+            self._live_connection.on(LiveTranscriptionEvents.Metadata, self._on_metadata)
+            logger.info(f"Deepgram: Registered all event handlers")
 
             # Configure live options
             # Official Deepgram SDK 3.x LiveOptions parameters:
@@ -309,6 +322,26 @@ class DeepgramSTT(STTServiceBase):
             logger.error(f"Deepgram: Error processing transcript: {e}")
             import traceback
             logger.error(f"Deepgram: Traceback:\n{traceback.format_exc()}")
+
+    def _on_open(self, *args, **kwargs):
+        """Handle Deepgram connection opened event"""
+        logger.info(f"Deepgram: WebSocket OPENED - args={len(args)}, kwargs={list(kwargs.keys())}")
+
+    def _on_close(self, *args, **kwargs):
+        """Handle Deepgram connection closed event"""
+        logger.info(f"Deepgram: WebSocket CLOSED - args={len(args)}, kwargs={list(kwargs.keys())}")
+
+    def _on_error(self, *args, **kwargs):
+        """Handle Deepgram error event"""
+        logger.error(f"Deepgram: WebSocket ERROR - args={len(args)}, kwargs={list(kwargs.keys())}")
+
+    def _on_warning(self, *args, **kwargs):
+        """Handle Deepgram warning event"""
+        logger.warning(f"Deepgram: WebSocket WARNING - args={len(args)}, kwargs={list(kwargs.keys())}")
+
+    def _on_metadata(self, *args, **kwargs):
+        """Handle Deepgram metadata event"""
+        logger.info(f"Deepgram: METADATA - args={len(args)}, kwargs={list(kwargs.keys())}")
 
 
 # Factory function for easy instantiation
