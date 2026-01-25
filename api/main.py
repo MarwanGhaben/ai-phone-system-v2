@@ -94,32 +94,36 @@ async def incoming_call(request: Request):
     # Check if domain is set and not empty
     if domain and domain.strip():
         # Use configured public domain with secure WebSocket
-        # Add port 8443 for WebSocket SSL (bypasses Sophos SSL termination)
-        ws_url = f"wss://{domain.strip()}:8443/ws/calls"
+        # Port 443 works through Sophos SSL termination
+        ws_url = f"wss://{domain.strip()}/ws/calls"
         print(f"DEBUG: Using PUBLIC_DOMAIN: {ws_url}")
     else:
         # Try to get domain from X-Forwarded-Host header (set by reverse proxy)
         forwarded_host = request.headers.get('X-Forwarded-Host', '')
         if forwarded_host:
             # Use the forwarded host (public domain)
-            ws_url = f"wss://{forwarded_host}:8443/ws/calls"
+            ws_url = f"wss://{forwarded_host}/ws/calls"
             print(f"DEBUG: Using X-Forwarded-Host: {ws_url}")
         else:
             # Last resort: use host header but warn
-            host = request.headers.get('host', 'localhost:8001')
+            host = request.headers.get('host', 'localhost:8000')
             print(f"WARNING: No PUBLIC_DOMAIN set, using host header: {host}")
-            # Convert to WebSocket URL
+            # Convert to WebSocket URL - use standard port 443 (no port in URL)
             if host.startswith('http:'):
                 host = host.replace('http:', 'https:')
             elif not host.startswith(('https:', 'wss:')):
                 proto = request.headers.get('X-Forwarded-Proto', 'https')
                 host = f"{proto}://{host}"
+            # Remove port if present (use standard 443)
+            if ':443' in host:
+                host = host.split(':443')[0]
+            elif ':80' in host:
+                host = host.split(':80')[0]
+            elif ':' in host and not (host.count(':') > 1):  # IPv6 has multiple colons
+                host = host.split(':')[0]
             ws_url = host.replace('https://', 'wss://').replace('http://', 'ws://')
             if not ws_url.endswith('/ws/calls'):
                 ws_url = f"{ws_url}/ws/calls"
-            # Ensure port 8443 for external access
-            if ':8443' not in ws_url:
-                ws_url = ws_url.replace('/ws/calls', ':8443/ws/calls')
             print(f"DEBUG: Fallback WebSocket URL: {ws_url}")
 
     from services.telephony.twilio_service import TwilioService
