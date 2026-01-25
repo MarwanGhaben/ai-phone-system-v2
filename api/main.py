@@ -153,12 +153,16 @@ async def websocket_call_handler(websocket: WebSocket):
     # Accept WebSocket connection
     await websocket.accept()
 
+    # DEBUG: Log all query parameters
+    print(f"DEBUG WebSocket: Raw query_params = {dict(websocket.query_params)}")
+    print(f"DEBUG WebSocket: Query string = {websocket.scope.get('query_string', b'').decode()}")
+
     # Extract call parameters from query string
     call_sid = websocket.query_params.get("CallSid", "")
     phone_number = websocket.query_params.get("From", "").replace(":", "")
 
     if not call_sid:
-        logger.warning("WebSocket: Missing CallSid, closing connection")
+        logger.warning(f"WebSocket: Missing CallSid, closing connection. Params: {dict(websocket.query_params)}")
         await websocket.close()
         return
 
