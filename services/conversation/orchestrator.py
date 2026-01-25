@@ -238,7 +238,7 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
         finally:
             await self.end_call(call_sid)
 
-    async def _handle_incoming_audio(self, call_sid: str):
+    def _handle_incoming_audio(self, call_sid: str):
         """
         Handle incoming audio from caller
 
