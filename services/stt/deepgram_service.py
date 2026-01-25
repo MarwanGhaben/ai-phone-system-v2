@@ -105,20 +105,18 @@ class DeepgramSTT(STTServiceBase):
             self._live_connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
 
             # Configure live options
+            # Note: 'paragraphs' is NOT supported in LiveOptions (only for pre-recorded transcription)
             options = LiveOptions(
                 model=self.model,
                 language=self.language if not self.detect_language else None,  # None = auto-detect
                 smart_format=self.smart_format,
                 punctuate=self.punctuate,
-                paragraphs=self.paragraphs,
                 profanity_filter=self.profanity_filter,
                 filler_words=False,
                 # Don't send final results until speaker pauses
                 interim_results=True,
+                detect_language=self.detect_language,
             )
-
-            if self.detect_language:
-                options.detect_language = True
 
             # Start the connection
             if await self._live_connection.start(options):
