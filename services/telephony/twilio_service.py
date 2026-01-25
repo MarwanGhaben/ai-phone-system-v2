@@ -34,15 +34,15 @@ class TwilioMediaStreamHandler:
     EVENT_DISCONNECTED = "disconnected"
     EVENT_ERROR = "error"
 
-    def __init__(self, call_sid: str, websocket: WebSocket):
+    def __init__(self, call_sid: str | None, websocket: WebSocket):
         """
         Initialize media stream handler
 
         Args:
-            call_sid: Twilio call SID
+            call_sid: Twilio call SID (optional, will be extracted from start event)
             websocket: WebSocket connection from Twilio
         """
-        self.call_sid = call_sid
+        self.call_sid = call_sid or "unknown"
         self.websocket = websocket
 
         # Event handlers
@@ -116,7 +116,12 @@ class TwilioMediaStreamHandler:
 
     async def _on_start(self, data: dict) -> None:
         """Handle start event - call started streaming"""
+        # Extract CallSid from start event if not already set
+        if not self.call_sid:
+            self.call_sid = data.get("callSid", "")
+
         logger.info(f"Twilio: Start event for call {self.call_sid}")
+        logger.info(f"Twilio: Full start event data: {data}")
 
         # Send clear message
         await self.send_event("clear")

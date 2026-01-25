@@ -149,38 +149,23 @@ async def websocket_call_handler(websocket: WebSocket):
 
     This is where the real-time audio streaming happens.
     Twilio connects here when a call comes in.
+
+    Note: Twilio sends CallSid in the 'start' event payload, not query string.
     """
-    # Accept WebSocket connection
+    # Accept WebSocket connection without requiring CallSid in query params
     await websocket.accept()
 
-    # DEBUG: Log all query parameters
-    print(f"DEBUG WebSocket: Raw query_params = {dict(websocket.query_params)}")
-    print(f"DEBUG WebSocket: Query string = {websocket.scope.get('query_string', b'').decode()}")
-    print(f"DEBUG WebSocket: Full scope = {websocket.scope}")
-    print(f"DEBUG WebSocket: Headers = {websocket.scope.get('headers', [])}")
-
-    # Extract call parameters from query string
-    call_sid = websocket.query_params.get("CallSid", "")
-    phone_number = websocket.query_params.get("From", "").replace(":", "")
-
-    if not call_sid:
-        logger.warning(f"WebSocket: Missing CallSid, closing connection. Params: {dict(websocket.query_params)}")
-        await websocket.close()
-        return
-
-    logger.info(f"WebSocket: New call {call_sid} from {phone_number}")
-
-    # Get orchestrator and handle the call
+    # Get orchestrator
     orchestrator = get_orchestrator()
 
     # Import Twilio handler
     from services.conversation.orchestrator import TwilioMediaStreamHandler
 
-    # Create handler and process
-    handler = TwilioMediaStreamHandler(call_sid, websocket)
+    # Create handler - it will wait for start event to get CallSid
+    handler = TwilioMediaStreamHandler(None, websocket)
     await handler.handle_connection()
 
-    logger.info(f"WebSocket: Call {call_sid} ended")
+    logger.info(f"WebSocket: Call {handler.call_sid if handler.call_sid else 'unknown'} ended")
 
 
 # =====================================================
