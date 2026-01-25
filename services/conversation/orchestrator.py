@@ -102,10 +102,14 @@ class ConversationOrchestrator:
         """Initialize orchestrator with all services"""
         settings = get_settings()
 
-        # Initialize services
+        # Initialize services (may return None if not available)
         self.stt = create_deepgram_stt(settings.model_dump())
         self.tts = create_elevenlabs_tts(settings.model_dump())
         self.llm = create_openai_llm(settings.model_dump())
+
+        # Log service availability
+        if not self.tts:
+            logger.warning("TTS service not available - audio responses will be limited")
 
         # Active conversations
         self._conversations: Dict[str, ConversationContext] = {}
@@ -251,7 +255,8 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
                 if await self._detect_barge_in(audio_data):
                     logger.info("Orchestrator: User interrupted!")
                     context.state = ConversationState.INTERRUPTED
-                    await self.tts.stop()  # Stop TTS
+                    if self.tts:
+                        await self.tts.stop()  # Stop TTS
                 return
 
             # Stream to STT
@@ -402,6 +407,12 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
         twilio_handler = self._twilio_handlers.get(call_sid)
 
         if not context or not twilio_handler:
+            return
+
+        # Check if TTS is available
+        if not self.tts:
+            logger.warning("TTS not available, cannot speak to caller")
+            context.state = ConversationState.LISTENING
             return
 
         try:

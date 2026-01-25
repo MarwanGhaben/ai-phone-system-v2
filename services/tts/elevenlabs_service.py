@@ -268,7 +268,7 @@ class ElevenLabsTTS(TTSServiceBase):
 
 
 # Factory function
-def create_elevenlabs_tts(config: dict) -> ElevenLabsTTS:
+def create_elevenlabs_tts(config: dict) -> ElevenLabsTTS | None:
     """
     Factory function to create ElevenLabs TTS service from config
 
@@ -276,13 +276,21 @@ def create_elevenlabs_tts(config: dict) -> ElevenLabsTTS:
         config: Configuration dictionary (from Settings)
 
     Returns:
-        Configured ElevenLabsTTS instance
+        Configured ElevenLabsTTS instance or None if not available
     """
-    return ElevenLabsTTS(
-        api_key=config.get('elevenlabs_api_key'),
-        default_voice_id=config.get('elevenlabs_voice_id', 'Rachel'),
-        model=config.get('elevenlabs_model', 'eleven_multilingual_v2'),
-        stability=config.get('elevenlabs_stability', 0.5),
-        similarity_boost=config.get('elevenlabs_similarity_boost', 0.75),
-        output_format=config.get('elevenlabs_output_format', 'mp3_44100_128')
-    )
+    if not ELEVENLABS_AVAILABLE:
+        logger.warning("ElevenLabs is not available, TTS will be disabled")
+        return None
+
+    try:
+        return ElevenLabsTTS(
+            api_key=config.get('elevenlabs_api_key'),
+            default_voice_id=config.get('elevenlabs_voice_id', 'Rachel'),
+            model=config.get('elevenlabs_model', 'eleven_multilingual_v2'),
+            stability=config.get('elevenlabs_stability', 0.5),
+            similarity_boost=config.get('elevenlabs_similarity_boost', 0.75),
+            output_format=config.get('elevenlabs_output_format', 'mp3_44100_128')
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize ElevenLabs TTS: {e}")
+        return None
