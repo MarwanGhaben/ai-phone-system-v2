@@ -72,13 +72,19 @@ class TwilioMediaStreamHandler:
         logger.info(f"Twilio: Media stream connected for call {self.call_sid}, starting event loop...")
 
         try:
+            loop_count = 0
             while self._is_connected:
+                loop_count += 1
+                if loop_count % 10 == 0:  # Log every 1 second
+                    logger.info(f"Twilio: Event loop iteration {loop_count}, pending_audio={bool(self._pending_audio)}")
+
                 # Wait for message with short timeout to check for pending audio
                 try:
                     message = await asyncio.wait_for(
                         self.websocket.receive_text(),
                         timeout=0.1  # 100ms timeout
                     )
+                    logger.info(f"Twilio: Received message: {message[:100] if len(message) > 100 else message}")
                     await self._process_message(message)
                 except asyncio.TimeoutError:
                     # Timeout is OK - check for pending audio
@@ -86,7 +92,7 @@ class TwilioMediaStreamHandler:
 
                 # Check if we have pending audio to send
                 if self._pending_audio:
-                    logger.info(f"Twilio: Sending pending audio...")
+                    logger.info(f"Twilio: Sending pending audio ({len(self._pending_audio)} bytes)...")
                     await self._send_audio_now(self._pending_audio)
                     self._pending_audio = None
 
