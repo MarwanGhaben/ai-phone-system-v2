@@ -255,9 +255,28 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             # Small delay after greeting before starting event loop
             await asyncio.sleep(0.5)
 
+            # Start transcript consumer as background task
+            # This consumes transcripts from STT queue and processes them
+            logger.info(f"Orchestrator: Starting transcript consumer...")
+            transcript_task = asyncio.create_task(
+                self._consume_stt_transcripts(call_sid),
+                name=f"transcript_consumer_{call_sid}"
+            )
+
             # Now handle the WebSocket connection (incoming audio)
+            # This runs concurrently with transcript consumer
             logger.info(f"Orchestrator: Starting connection handler...")
-            await twilio_handler.handle_connection()
+            try:
+                await twilio_handler.handle_connection()
+            finally:
+                # Cancel transcript task when connection ends
+                if not transcript_task.done():
+                    logger.info(f"Orchestrator: Cancelling transcript consumer...")
+                    transcript_task.cancel()
+                    try:
+                        await transcript_task
+                    except asyncio.CancelledError:
+                        pass
             logger.info(f"Orchestrator: WebSocket handling complete")
 
         except Exception as e:
@@ -298,6 +317,48 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             await self.stt.stream_audio(AudioChunk(data=audio_data))
 
         return process_audio
+
+    async def _consume_stt_transcripts(self, call_sid: str) -> None:
+        """
+        Consume transcripts from STT service queue and process them
+
+        This runs as a background task alongside the WebSocket event loop.
+        It continuously polls for transcripts and processes them.
+
+        Args:
+            call_sid: Call identifier
+        """
+        context = self._conversations.get(call_sid)
+        if not context:
+            logger.warning(f"Orchestrator: No context found for call {call_sid}")
+            return
+
+        logger.info(f"Orchestrator: Transcript consumer started for call {call_sid}")
+
+        try:
+            # get_transcript() returns an async iterator
+            async for result in self.stt.get_transcript():
+                if not result or not result.text:
+                    continue
+
+                logger.info(f"Orchestrator: Got transcript: '{result.text}' (is_final={result.is_final})")
+
+                # Process the transcript
+                await self.process_transcript(call_sid, result.text, result.language, result.is_final)
+
+                # If call ended, stop consuming
+                if context.state == ConversationState.ENDED:
+                    logger.info(f"Orchestrator: Call ended, stopping transcript consumer")
+                    break
+
+        except asyncio.CancelledError:
+            logger.info(f"Orchestrator: Transcript consumer cancelled for call {call_sid}")
+        except Exception as e:
+            logger.error(f"Orchestrator: Error in transcript consumer: {e}")
+            import traceback
+            logger.error(f"Orchestrator: Traceback:\n{traceback.format_exc()}")
+        finally:
+            logger.info(f"Orchestrator: Transcript consumer stopped for call {call_sid}")
 
     async def process_transcript(self, call_sid: str, transcript: str, language: str, is_final: bool):
         """
