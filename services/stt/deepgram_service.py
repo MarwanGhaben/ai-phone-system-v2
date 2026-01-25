@@ -105,17 +105,20 @@ class DeepgramSTT(STTServiceBase):
             self._live_connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
 
             # Configure live options
-            # Note: 'paragraphs' is NOT supported in LiveOptions (only for pre-recorded transcription)
+            # Official Deepgram SDK 3.x LiveOptions parameters:
+            # - model, language, encoding, channels, sample_rate
+            # - smart_format, punctuate, interim_results
+            # - vad_events, utterance_end_ms
+            # NOT supported: paragraphs, detect_language, profanity_filter, filler_words
             options = LiveOptions(
                 model=self.model,
-                language=self.language if not self.detect_language else None,  # None = auto-detect
+                language=self.language,  # Use configured language (no auto-detect in live mode)
+                encoding="mulaw",       # Twilio sends μ-law encoded audio
+                channels=1,             # Mono audio
+                sample_rate=8000,       # Twilio uses 8kHz
                 smart_format=self.smart_format,
                 punctuate=self.punctuate,
-                profanity_filter=self.profanity_filter,
-                filler_words=False,
-                # Don't send final results until speaker pauses
-                interim_results=True,
-                detect_language=self.detect_language,
+                interim_results=True,   # Get interim results while speaking
             )
 
             # Start the connection
