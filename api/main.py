@@ -156,6 +156,8 @@ async def websocket_call_handler(websocket: WebSocket):
     # DEBUG: Log all query parameters
     print(f"DEBUG WebSocket: Raw query_params = {dict(websocket.query_params)}")
     print(f"DEBUG WebSocket: Query string = {websocket.scope.get('query_string', b'').decode()}")
+    print(f"DEBUG WebSocket: Full scope = {websocket.scope}")
+    print(f"DEBUG WebSocket: Headers = {websocket.scope.get('headers', [])}")
 
     # Extract call parameters from query string
     call_sid = websocket.query_params.get("CallSid", "")
