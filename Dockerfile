@@ -27,6 +27,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     postgresql-client \
     curl \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Python dependencies from builder

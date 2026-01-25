@@ -432,9 +432,20 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
             # For now, synthesize full audio then send
             response = await self.tts.synthesize(request)
 
-            # Send to Twilio
-            # TODO: Convert MP3 to μ-law 8kHz for Twilio
-            await twilio_handler.send_audio(response.audio_data)
+            # Convert MP3 audio to μ-law 8kHz for Twilio
+            from services.audio.audio_converter import convert_twilio_audio
+            mulaw_audio = convert_twilio_audio(
+                response.audio_data,
+                input_format=response.format,
+                input_rate=response.sample_rate
+            )
+
+            if not mulaw_audio:
+                logger.error("Failed to convert audio to μ-law, not sending to caller")
+                return
+
+            # Send to Twilio in correct format
+            await twilio_handler.send_audio(mulaw_audio)
 
         except Exception as e:
             logger.error(f"Orchestrator: Error speaking: {e}")
