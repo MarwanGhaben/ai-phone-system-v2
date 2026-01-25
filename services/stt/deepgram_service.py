@@ -167,9 +167,22 @@ class DeepgramSTT(STTServiceBase):
         try:
             # Send audio data to Deepgram (synchronous method)
             # Twilio sends 8kHz μ-law, Deepgram accepts various formats
+
+            # DEBUG: Log audio being sent
+            data_size = len(audio_chunk.data) if audio_chunk.data else 0
+            if data_size > 0:
+                # Only log first chunk and every 50 chunks to avoid spam
+                if not hasattr(self, '_chunk_count'):
+                    self._chunk_count = 0
+                self._chunk_count += 1
+                if self._chunk_count == 1 or self._chunk_count % 50 == 0:
+                    logger.info(f"Deepgram: Sending audio chunk #{self._chunk_count}, size={data_size} bytes")
+
             self._live_connection.send(audio_chunk.data)
         except Exception as e:
             logger.error(f"Deepgram: Error sending audio: {e}")
+            import traceback
+            logger.error(f"Deepgram: Traceback:\n{traceback.format_exc()}")
 
     async def get_transcript(self) -> AsyncIterator[STTResult]:
         """
@@ -217,29 +230,40 @@ class DeepgramSTT(STTServiceBase):
     def _on_transcript(self, *args, **kwargs):
         """Handle incoming transcript from Deepgram WebSocket"""
         try:
+            # DEBUG: Log that callback was invoked
+            logger.info(f"Deepgram: _on_transcript CALLED - args={len(args)}, kwargs={list(kwargs.keys())}")
+
             # Deepgram SDK passes result as first argument (positional)
             # result is a LiveResultResponse object, NOT a dict
             result = args[0] if args else kwargs.get('result')
             if not result:
+                logger.warning("Deepgram: _on_transcript called but no result found")
                 return
+
+            # DEBUG: Log the raw result
+            logger.info(f"Deepgram: Raw result type={type(result).__name__}, dir={sorted([x for x in dir(result) if not x.startswith('_')])}")
 
             # Access object attributes (not dict keys)
             # result.channel.alternatives[0].transcript
             if not hasattr(result, 'channel'):
+                logger.warning("Deepgram: Result has no 'channel' attribute")
                 return
 
             channel = result.channel
             if not hasattr(channel, 'alternatives') or not channel.alternatives:
+                logger.warning("Deepgram: Channel has no alternatives")
                 return
 
             alternatives = channel.alternatives
             best_alternative = alternatives[0]
 
             if not hasattr(best_alternative, 'transcript'):
+                logger.warning("Deepgram: Best alternative has no 'transcript' attribute")
                 return
 
             transcript = best_alternative.transcript
             if not transcript:
+                logger.info(f"Deepgram: Empty transcript received (is_final={getattr(result, 'is_final', False)})")
                 return
 
             # Extract metadata from object attributes
@@ -252,6 +276,9 @@ class DeepgramSTT(STTServiceBase):
                 # Map from full language code to ISO code
                 language_full = getattr(channel, 'language', self.language)
                 detected_language = language_full.split('-')[0] if language_full else self.language
+
+            # DEBUG: Log every transcript
+            logger.info(f"Deepgram: Transcript [{'FINAL' if is_final else 'interim'}] [{detected_language}]: '{transcript}' (confidence={confidence})")
 
             # Create STT result
             stt_result = STTResult(
@@ -271,13 +298,14 @@ class DeepgramSTT(STTServiceBase):
             # Put in queue for consumption
             if self._transcript_queue:
                 self._transcript_queue.put_nowait(stt_result)
-
-            # Log final results
-            if is_final:
-                logger.info(f"Deepgram: Final transcript [{detected_language}]: {transcript}")
+                logger.debug(f"Deepgram: Put transcript in queue, queue_size={self._transcript_queue.qsize()}")
+            else:
+                logger.warning("Deepgram: Transcript queue is None!")
 
         except Exception as e:
             logger.error(f"Deepgram: Error processing transcript: {e}")
+            import traceback
+            logger.error(f"Deepgram: Traceback:\n{traceback.format_exc()}")
 
 
 # Factory function for easy instantiation
