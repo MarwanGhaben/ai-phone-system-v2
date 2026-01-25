@@ -224,39 +224,28 @@ class TwilioMediaStreamHandler:
         Args:
             audio_data: Audio data (μ-law 8kHz for Twilio)
         """
-        # Chunk size: 20ms at 8kHz = 160 samples = 160 bytes for μ-law
-        CHUNK_SIZE = 160
         total_bytes = len(audio_data)
-        chunks_sent = 0
 
-        logger.info(f"Twilio: Sending {total_bytes} bytes audio in chunks (streamSid={self.stream_sid})")
+        logger.info(f"Twilio: Sending {total_bytes} bytes audio (streamSid={self.stream_sid})")
 
         try:
-            for i in range(0, total_bytes, CHUNK_SIZE):
-                chunk = audio_data[i:i + CHUNK_SIZE]
-                if not chunk:
-                    break
+            # Encode entire audio to base64 (no chunking for now)
+            payload = base64.b64encode(audio_data).decode("utf-8")
 
-                # Encode chunk to base64
-                payload = base64.b64encode(chunk).decode("utf-8")
-
-                # Create media event
-                media_event = {
-                    "event": "media",
-                    "streamSid": self.stream_sid,
-                    "media": {
-                        "payload": payload
-                    }
+            # Create media event
+            media_event = {
+                "event": "media",
+                "streamSid": self.stream_sid,
+                "media": {
+                    "payload": payload
                 }
+            }
 
-                await self.websocket.send_json(media_event)
-                chunks_sent += 1
+            logger.info(f"Twilio: Media event - event={media_event['event']}, streamSid={media_event['streamSid'][:20]}..., payload_len={len(payload)}")
+            logger.info(f"Twilio: First 200 chars of payload: {payload[:200]}")
 
-                # Log every 50 chunks
-                if chunks_sent % 50 == 0:
-                    logger.debug(f"Twilio: Sent {chunks_sent} chunks...")
-
-            logger.info(f"Twilio: Audio sent successfully ({chunks_sent} chunks)")
+            await self.websocket.send_json(media_event)
+            logger.info(f"Twilio: Audio sent successfully")
 
         except Exception as e:
             logger.error(f"Twilio: Failed to send audio: {e}")
