@@ -214,6 +214,11 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
         twilio_handler = TwilioMediaStreamHandler(call_sid, websocket)
         self._twilio_handlers[call_sid] = twilio_handler
 
+        # IMPORTANT: Manually set streaming flag since we already consumed the start event in main.py
+        # The handler's handle_connection() won't see the start event, so we set this manually
+        twilio_handler._is_streaming = True
+        twilio_handler._is_connected = True
+
         # Set up media handler for incoming audio
         twilio_handler.set_media_handler(self._handle_incoming_audio(call_sid))
 
