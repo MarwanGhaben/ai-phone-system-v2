@@ -66,11 +66,10 @@ class TwilioMediaStreamHandler:
         - disconnected: Cleanup
         """
         self._is_connected = True
-        logger.info(f"Twilio: Media stream connected for call {self.call_sid}")
+        logger.info(f"Twilio: Media stream connected for call {self.call_sid}, starting event loop...")
 
         try:
             while self._is_connected:
-                # Receive message from Twilio
                 message = await self.websocket.receive_text()
                 await self._process_message(message)
 
@@ -78,7 +77,10 @@ class TwilioMediaStreamHandler:
             logger.info(f"Twilio: WebSocket disconnected for call {self.call_sid}")
         except Exception as e:
             logger.error(f"Twilio: Error in connection: {e}")
+            import traceback
+            logger.error(f"Twilio: Traceback:\n{traceback.format_exc()}")
         finally:
+            logger.info(f"Twilio: handle_connection() finally block for call {self.call_sid}")
             await self.cleanup()
 
     async def _process_message(self, message: str) -> None:
@@ -197,9 +199,12 @@ class TwilioMediaStreamHandler:
             }
         }
 
-        logger.debug(f"Twilio: Sending {len(audio_data)} bytes audio (streamSid={self.stream_sid})")
-        await self.websocket.send_json(media_event)
-        logger.debug(f"Twilio: Audio sent successfully")
+        logger.info(f"Twilio: Sending {len(audio_data)} bytes audio (streamSid={self.stream_sid}, _is_connected={self._is_connected})")
+        try:
+            await self.websocket.send_json(media_event)
+            logger.info(f"Twilio: Audio sent successfully")
+        except Exception as e:
+            logger.error(f"Twilio: Failed to send audio: {e}")
 
     async def send_event(self, event: str, **kwargs) -> None:
         """
