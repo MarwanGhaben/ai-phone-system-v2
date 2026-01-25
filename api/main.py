@@ -4,6 +4,7 @@ AI Voice Platform v2 - Main FastAPI Application
 =====================================================
 """
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -156,20 +157,48 @@ async def websocket_call_handler(websocket: WebSocket):
 
     Note: Twilio sends CallSid in the 'start' event payload, not query string.
     """
-    # Accept WebSocket connection without requiring CallSid in query params
+    # Accept WebSocket connection
     await websocket.accept()
 
     # Get orchestrator
     orchestrator = get_orchestrator()
 
-    # Import Twilio handler
-    from services.conversation.orchestrator import TwilioMediaStreamHandler
+    # Import Twilio Media Stream handler
+    from services.telephony.twilio_service import TwilioMediaStreamHandler
+    import json
 
-    # Create handler - it will wait for start event to get CallSid
-    handler = TwilioMediaStreamHandler(None, websocket)
+    # Create a wrapper handler that will call orchestrator when call starts
+    class OrchestratorTwilioHandler(TwilioMediaStreamHandler):
+        def __init__(self, orchestrator_ref, ws):
+            super().__init__(None, ws)
+            self.orchestrator = orchestrator_ref
+            self._call_started = False
+
+        async def _on_start(self, data: dict) -> None:
+            """Handle start event and trigger orchestrator"""
+            await super()._on_start(data)
+
+            # Extract call info from start event
+            start_data = data.get("start", {})
+            call_sid = start_data.get("callSid", "unknown")
+
+            # Get caller phone number from stream custom parameters or use default
+            # For now, we'll use a placeholder - the real number should come from Twilio
+            phone_number = start_data.get("customParameters", {}).get("callerNumber", "+0000000000")
+
+            logger.info(f"WebSocket: Starting call {call_sid} with orchestrator")
+
+            # Start the orchestrator's conversation handling
+            if not self._call_started:
+                self._call_started = True
+                # Create a task for the orchestrator to handle this call
+                asyncio.create_task(self.orchestrator.handle_call(call_sid, phone_number, websocket))
+
+    # Create handler and let it handle the connection
+    handler = OrchestratorTwilioHandler(orchestrator, websocket)
     await handler.handle_connection()
 
-    logger.info(f"WebSocket: Call {handler.call_sid if handler.call_sid else 'unknown'} ended")
+    logger.info(f"WebSocket: Connection ended")
 
 
 # =====================================================
