@@ -98,7 +98,8 @@ class DeepgramSTT(STTServiceBase):
             )
 
             # Create live transcription connection
-            self._live_connection = self._deepgram.listen.websocket.v("1")
+            # Note: SDK 3.x API changed - use live.v() instead of listen.websocket.v()
+            self._live_connection = self._deepgram.listen.live.v("1")
 
             # Set up event handlers
             self._live_connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
@@ -133,7 +134,9 @@ class DeepgramSTT(STTServiceBase):
 
         except Exception as e:
             self._status = STTStatus.ERROR
+            import traceback
             logger.error(f"Deepgram: Connection error: {e}")
+            logger.error(f"Deepgram: Traceback:\n{traceback.format_exc()}")
             return False
 
     async def disconnect(self) -> None:
