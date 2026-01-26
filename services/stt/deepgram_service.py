@@ -125,13 +125,10 @@ class DeepgramSTT(STTServiceBase):
             # NOT supported: paragraphs, detect_language, profanity_filter, filler_words
 
             # Language selection
-            # Use "mul" for multilingual mode (English + Arabic + 100+ languages)
-            # Requires Deepgram pay-as-you-go or higher tier
-            # Falls back to self.language if multilingual is disabled
-            if self.detect_language:
-                stt_language = "mul"  # Multilingual auto-detection
-            else:
-                stt_language = self.language
+            # NOTE: Multilingual ("mul") requires Deepgram project to have this feature enabled
+            # For now, always use self.language (en-US) to avoid HTTP 400 errors
+            # To enable multilingual, contact Deepgram support or check project settings
+            stt_language = self.language
 
             options = LiveOptions(
                 model=self.model,
