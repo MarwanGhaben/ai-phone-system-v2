@@ -268,23 +268,23 @@ class TwilioMediaStreamHandler:
         """
         Send audio to Twilio in chunks
 
-        Twilio Media Streams handles timing internally - we send chunks as fast
-        as possible without delays. Each chunk is a base64-encoded μ-law payload.
+        CRITICAL: Twilio Media Streams requires 20ms chunks (160 bytes at 8kHz μ-law).
+        Sending larger chunks causes Twilio to buffer indefinitely or reject the audio.
 
         Args:
             audio_data: Audio data (μ-law 8kHz for Twilio)
         """
         total_bytes = len(audio_data)
-        # Use larger chunks to avoid overwhelming Twilio with too many messages
-        # 3200 bytes = 400ms at 8kHz μ-law (good balance between latency and throughput)
-        chunk_size = 3200
+        # CRITICAL: Use 160 bytes = 20ms at 8kHz μ-law
+        # This is the Twilio Media Streams standard chunk size
+        chunk_size = 160
 
         logger.info(f"Twilio: Sending {total_bytes} bytes audio in {chunk_size}-byte chunks (streamSid={self.stream_sid})")
 
         try:
             # Send clear event first to ensure clean state
             await self.send_event("clear")
-            logger.info(f"Twilio: Sent clear event before audio")
+            logger.debug(f"Twilio: Sent clear event before audio")
 
             chunk_count = 0
             for i in range(0, total_bytes, chunk_size):
