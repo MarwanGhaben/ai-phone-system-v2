@@ -266,55 +266,44 @@ class TwilioMediaStreamHandler:
 
     async def _send_audio_chunked(self, audio_data: bytes) -> None:
         """
-        Send audio to Twilio in chunks
+        Send audio to Twilio
 
-        CRITICAL: Twilio Media Streams requires 20ms chunks (160 bytes at 8kHz μ-law).
-        Sending larger chunks causes Twilio to buffer indefinitely or reject the audio.
+        Sending as single payload (no chunking) to match Twilio's examples.
+        Chunking seems to cause issues, so try sending everything at once.
 
         Args:
             audio_data: Audio data (μ-law 8kHz for Twilio)
         """
         total_bytes = len(audio_data)
-        # CRITICAL: Use 160 bytes = 20ms at 8kHz μ-law
-        # This is the Twilio Media Streams standard chunk size
-        chunk_size = 160
 
-        logger.info(f"Twilio: Sending {total_bytes} bytes audio in {chunk_size}-byte chunks (streamSid={self.stream_sid})")
+        logger.info(f"Twilio: Sending {total_bytes} bytes audio as single payload (streamSid={self.stream_sid})")
 
         try:
-            # Send clear event first to ensure clean state
+            # Send clear event first
             await self.send_event("clear")
             logger.debug(f"Twilio: Sent clear event before audio")
 
-            chunk_count = 0
-            for i in range(0, total_bytes, chunk_size):
-                if not self._is_streaming:
-                    logger.warning(f"Twilio: Stopped sending audio - no longer streaming")
-                    return
+            # Encode entire audio to base64
+            payload = base64.b64encode(audio_data).decode("utf-8")
 
-                chunk = audio_data[i:i + chunk_size]
-                payload = base64.b64encode(chunk).decode("utf-8")
+            # DEBUG: Log first 200 chars of payload
+            logger.info(f"Twilio: Payload preview (first 200 chars): {payload[:200]}")
+            logger.info(f"Twilio: Payload length: {len(payload)} chars")
 
-                # Create media event
-                media_event = {
-                    "event": "media",
-                    "streamSid": self.stream_sid,
-                    "media": {
-                        "payload": payload
-                    }
+            # Create media event
+            media_event = {
+                "event": "media",
+                "streamSid": self.stream_sid,
+                "media": {
+                    "payload": payload
                 }
+            }
 
-                await self.websocket.send_json(media_event)
-                chunk_count += 1
+            # DEBUG: Log the full event
+            logger.info(f"Twilio: Media event structure: event={media_event['event']}, streamSid={media_event['streamSid'][:20]}..., has_media={'media' in media_event}")
 
-                # Small yield to allow event loop to process incoming messages
-                # But NO artificial delay - let Twilio handle buffering
-                await asyncio.sleep(0)
-
-            # Send mark event to indicate audio is complete
-            await self.send_event("mark", name="audio_complete")
-
-            logger.info(f"Twilio: Audio sent successfully - {chunk_count} chunks, {total_bytes} bytes")
+            await self.websocket.send_json(media_event)
+            logger.info(f"Twilio: Audio sent successfully - {total_bytes} bytes as single payload")
 
         except Exception as e:
             logger.error(f"Twilio: Failed to send audio: {e}")
