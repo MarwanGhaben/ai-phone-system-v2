@@ -301,9 +301,11 @@ class TwilioMediaStreamHandler:
                 payload = base64.b64encode(chunk).decode("utf-8")
 
                 # Create media event for this chunk
+                # IMPORTANT: track="outbound" tells Twilio to play this audio to caller
                 media_event = {
                     "event": "media",
                     "streamSid": self.stream_sid,
+                    "track": "outbound",  # Required for Twilio to play audio
                     "media": {
                         "payload": payload
                     }
@@ -403,7 +405,7 @@ class TwilioService:
         twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Start>
-        <Stream url="{websocket_url}" />
+        <Stream url="{websocket_url}" track="both" />
     </Start>
     <Pause length="60" />
 </Response>'''
