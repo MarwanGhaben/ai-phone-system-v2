@@ -396,6 +396,9 @@ class TwilioService:
         """
         Generate TwiML for connecting to Media Stream
 
+        Using <Connect><Stream> for BIDIRECTIONAL audio.
+        <Start><Stream> only sends audio TO the server (unidirectional).
+
         Args:
             websocket_url: WebSocket URL for Media Stream
 
@@ -404,10 +407,9 @@ class TwilioService:
         """
         twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Start>
-        <Stream url="{websocket_url}" track="both_tracks" />
-    </Start>
-    <Pause length="60" />
+    <Connect>
+        <Stream url="{websocket_url}" />
+    </Connect>
 </Response>'''
         return twiml
 
