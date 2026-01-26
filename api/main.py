@@ -165,34 +165,34 @@ async def incoming_call(request: Request):
     else:
         # Try to get domain from X-Forwarded-Host header (set by reverse proxy)
         forwarded_host = request.headers.get('X-Forwarded-Host', '')
-        if forwarded_host:
-            # Use the forwarded host (public domain) with standard port
-            # Remove any port from the forwarded host
+        forwarded_proto = request.headers.get('X-Forwarded-Proto', '')
+
+        if forwarded_host and forwarded_proto == 'https':
+            # Reverse proxy with SSL - use wss://
             if ':' in forwarded_host:
                 forwarded_host = forwarded_host.split(':')[0]
             ws_url = f"wss://{forwarded_host}/ws/calls"
-            print(f"DEBUG: Using X-Forwarded-Host: {ws_url}")
+            print(f"DEBUG: Using X-Forwarded-Host (SSL): {ws_url}")
+        elif forwarded_host and forwarded_proto == 'http':
+            # Reverse proxy without SSL - use ws://
+            if ':' in forwarded_host:
+                forwarded_host = forwarded_host.split(':')[0]
+            ws_url = f"ws://{forwarded_host}/ws/calls"
+            print(f"DEBUG: Using X-Forwarded-Host (non-SSL): {ws_url}")
         else:
-            # Last resort: use host header but warn
+            # Direct access (no reverse proxy) - use ws:// with actual host and port
             host = request.headers.get('host', 'localhost:8000')
-            print(f"WARNING: No PUBLIC_DOMAIN set, using host header: {host}")
-            # Convert to WebSocket URL - use standard port 443 (no port in URL)
-            if host.startswith('http:'):
-                host = host.replace('http:', 'https:')
-            elif not host.startswith(('https:', 'wss:')):
-                proto = request.headers.get('X-Forwarded-Proto', 'https')
-                host = f"{proto}://{host}"
-            # Remove port if present (use standard 443)
-            if ':443' in host:
-                host = host.split(':443')[0]
-            elif ':80' in host:
-                host = host.split(':80')[0]
-            elif ':' in host and not (host.count(':') > 1):  # IPv6 has multiple colons
-                host = host.split(':')[0]
-            ws_url = host.replace('https://', 'wss://').replace('http://', 'ws://')
-            if not ws_url.endswith('/ws/calls'):
-                ws_url = f"{ws_url}/ws/calls"
-            print(f"DEBUG: Fallback WebSocket URL: {ws_url}")
+            print(f"DEBUG: Direct access mode, using host header: {host}")
+
+            # Build WebSocket URL based on the actual host
+            # If host contains a port, use it; otherwise default to 8000 for ws://
+            if ':' not in host:
+                # No port in host - add default port based on protocol
+                host = f"{host}:8000"
+
+            # For direct IP access, always use ws:// (not wss://) since we don't have SSL
+            ws_url = f"ws://{host}/ws/calls"
+            print(f"DEBUG: Direct WebSocket URL: {ws_url}")
 
     from services.telephony.twilio_service import TwilioService
     twilio = TwilioService(
