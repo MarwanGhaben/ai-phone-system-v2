@@ -392,6 +392,12 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
         if not is_final:
             return
 
+        # IMPORTANT: Ignore transcripts while AI is speaking (barge-in prevention)
+        # This prevents the AI's own voice from confusing the STT
+        if context.state == ConversationState.SPEAKING:
+            logger.info(f"Orchestrator: Ignoring transcript while AI speaking: '{transcript}'")
+            return
+
         logger.info(f"Orchestrator: User said: {transcript}")
 
         # ===== CALLER NAME EXTRACTION (New Callers) =====
@@ -438,11 +444,11 @@ Remember: This is a real phone call. Be concise. Be helpful. Be human."""
         context.turn_count += 1
         context.state = ConversationState.SPEAKING
 
-        # Stream response to caller
+        # Stream response to caller (this waits for audio to complete)
         await self._speak_to_caller(call_sid, response, context.language)
 
-        # Back to listening
-        context.state = ConversationState.LISTENING
+        # State is set back to LISTENING inside _speak_to_caller finally block
+        # Do NOT set it here to avoid race condition
 
     async def _get_ai_response(self, call_sid: str, user_input: str) -> str:
         """
