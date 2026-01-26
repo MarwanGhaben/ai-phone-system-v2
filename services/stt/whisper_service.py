@@ -331,8 +331,7 @@ class WhisperSTT(STTServiceBase):
                 model=self.model,
                 file=("audio.wav", io.BytesIO(wav_data), "audio/wav"),
                 language=None if is_final else (self.language or None),  # Auto-detect if not set
-                response_format="verbose_json",
-                timestamp_granularities=["word"]
+                response_format="verbose_json"
             )
 
             elapsed = time.time() - start_time
