@@ -244,6 +244,7 @@ class TwilioMediaStreamHandler:
         Send audio to Twilio (play to caller)
 
         Audio is queued and sent from the event loop's send task.
+        NOTE: This clears any pending audio before sending new audio (interruption).
 
         Args:
             audio_data: Audio data (μ-law 8kHz for Twilio)
@@ -260,7 +261,23 @@ class TwilioMediaStreamHandler:
             logger.error(f"Twilio: Cannot send audio - queue not initialized!")
             return
 
-        # Put audio in queue - will be sent by send task
+        # CRITICAL: Clear any pending audio before sending new audio
+        # This prevents old audio from playing after new audio (repeating bug)
+        cleared = 0
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+                cleared += 1
+            except asyncio.QueueEmpty:
+                break
+
+        if cleared > 0:
+            logger.info(f"Twilio: Cleared {cleared} pending audio(s) from queue")
+
+        # Send clear event to Twilio to stop any currently playing audio
+        await self.send_event("clear")
+
+        # Put new audio in queue - will be sent by send task
         await self._audio_queue.put(audio_data)
         logger.info(f"Twilio: Queued {len(audio_data)} bytes audio for sending")
 
@@ -283,9 +300,8 @@ class TwilioMediaStreamHandler:
         logger.info(f"Twilio: Sending {total_bytes} bytes audio in {CHUNK_SIZE}-byte chunks (streamSid={self.stream_sid})")
 
         try:
-            # Send clear event ONCE before starting audio
-            await self.send_event("clear")
-            logger.debug(f"Twilio: Sent clear event before audio")
+            # Note: clear event is already sent in send_audio() before queuing
+            # No need to send it again here
 
             # Calculate number of chunks
             num_chunks = (len(audio_data) + CHUNK_SIZE - 1) // CHUNK_SIZE
