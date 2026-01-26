@@ -91,15 +91,34 @@ async def diagnostics():
     except Exception as e:
         results["elevenlabs"] = {"error": str(e)}
 
-    # 2. Test Deepgram STT
+    # 2. Test STT services
+    # Test Deepgram
     try:
         from services.stt.deepgram_service import create_deepgram_stt
         stt = create_deepgram_stt(settings.model_dump())
         results["deepgram"] = {
-            "available": stt is not None
+            "available": stt is not None,
+            "language_support": "English only (no Arabic)"
         }
     except Exception as e:
         results["deepgram"] = {"error": str(e)}
+
+    # Test Whisper
+    try:
+        from services.stt.whisper_service import create_whisper_stt
+        stt = create_whisper_stt(settings.model_dump())
+        results["whisper"] = {
+            "available": stt is not None,
+            "language_support": "50+ languages including Arabic"
+        }
+    except Exception as e:
+        results["whisper"] = {"error": str(e)}
+
+    # Show active STT provider
+    results["stt_provider"] = {
+        "active": settings.stt_provider,
+        "recommendation": "Use 'whisper' for Arabic support"
+    }
 
     # 3. Test OpenAI LLM
     try:

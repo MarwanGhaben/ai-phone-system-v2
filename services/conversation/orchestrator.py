@@ -21,7 +21,7 @@ from enum import Enum
 from loguru import logger
 
 from config.settings import get_settings
-from services.stt.deepgram_service import create_deepgram_stt
+from services.stt import create_stt_service
 from services.tts.elevenlabs_service import create_elevenlabs_tts
 from services.llm.openai_service import create_openai_llm, Message, LLMRole
 from services.telephony.twilio_service import TwilioMediaStreamHandler
@@ -103,11 +103,13 @@ class ConversationOrchestrator:
         settings = get_settings()
 
         # Initialize services (may return None if not available)
-        self.stt = create_deepgram_stt(settings.model_dump())
+        # Use configurable STT provider (deepgram or whisper for Arabic)
+        self.stt = create_stt_service(settings.stt_provider, settings.model_dump())
         self.tts = create_elevenlabs_tts(settings.model_dump())
         self.llm = create_openai_llm(settings.model_dump())
 
         # Log service availability
+        logger.info(f"STT provider: {settings.stt_provider} (Whisper supports Arabic, Deepgram is English-only)")
         if not self.tts:
             logger.warning("TTS service not available - audio responses will be limited")
 

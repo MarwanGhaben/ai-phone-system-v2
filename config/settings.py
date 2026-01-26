@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     twilio_phone_number: str = Field(..., alias="TWILIO_PHONE_NUMBER")
 
     # =====================================================
+    # STT (Speech-to-Text) Provider
+    # =====================================================
+    stt_provider: str = Field(default="deepgram", alias="STT_PROVIDER")  # 'deepgram' or 'whisper'
+
+    # =====================================================
     # DEEPGRAM STT
     # =====================================================
     deepgram_api_key: str = Field(..., alias="DEEPGRAM_API_KEY")
@@ -83,6 +88,16 @@ class Settings(BaseSettings):
     deepgram_punctuate: bool = True
     deepgram_profanity_filter: bool = True
     deepgram_diairize: bool = False  # Not needed for single-caller scenarios
+
+    # =====================================================
+    # OPENAI WHISPER STT
+    # =====================================================
+    # Uses same openai_api_key from OPENAI section
+    whisper_model: str = Field(default="whisper-1", alias="WHISPER_MODEL")
+    whisper_language: str = Field(default="", alias="WHISPER_LANGUAGE")  # Empty = auto-detect, or 'en', 'ar', etc.
+    whisper_silence_threshold: float = Field(default=0.3, alias="WHISPER_SILENCE_THRESHOLD")
+    whisper_silence_duration: float = Field(default=1.0, alias="WHISPER_SILENCE_DURATION")  # Seconds of silence to trigger transcription
+    whisper_min_audio_length: float = Field(default=0.5, alias="WHISPER_MIN_AUDIO_LENGTH")  # Minimum seconds before transcribing
 
     # =====================================================
     # ELEVENLABS TTS
