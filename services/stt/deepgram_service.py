@@ -180,7 +180,7 @@ class DeepgramSTT(STTServiceBase):
             audio_chunk: Audio data (typically 8kHz μ-law from Twilio)
         """
         if self._status != STTStatus.CONNECTED or not self._is_listening:
-            logger.warning("Deepgram: Cannot stream - not connected")
+            # Silently skip - don't log spam
             return
 
         try:
@@ -199,9 +199,15 @@ class DeepgramSTT(STTServiceBase):
 
             self._live_connection.send(audio_chunk.data)
         except Exception as e:
-            logger.error(f"Deepgram: Error sending audio: {e}")
-            import traceback
-            logger.error(f"Deepgram: Traceback:\n{traceback.format_exc()}")
+            # If we can't send, mark as disconnected to stop trying
+            if "Connection" in str(e) or "closed" in str(e).lower():
+                logger.info(f"Deepgram: Connection closed, stopping stream")
+                self._is_listening = False
+                self._status = STTStatus.DISCONNECTED
+            else:
+                logger.error(f"Deepgram: Error sending audio: {e}")
+                import traceback
+                logger.error(f"Deepgram: Traceback:\n{traceback.format_exc()}")
 
     async def get_transcript(self) -> AsyncIterator[STTResult]:
         """

@@ -314,7 +314,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             if not context or context.state == ConversationState.ENDED:
                 return
 
-            # Skip if we're speaking and user hasn't interrupted
+            # Skip if we're speaking (barge-in prevention)
             if context.state == ConversationState.SPEAKING:
                 # Check for barge-in (user speech during AI speech)
                 if await self._detect_barge_in(audio_data):
@@ -322,6 +322,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     context.state = ConversationState.INTERRUPTED
                     if self.tts:
                         await self.tts.stop()  # Stop TTS
+                # ALWAYS skip STT while speaking (whether interrupted or not)
+                # This prevents AI's own voice from being transcribed
                 return
 
             # Stream to STT
