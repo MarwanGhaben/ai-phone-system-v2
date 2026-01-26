@@ -70,6 +70,53 @@ class ConversationContext:
     is_known_caller: bool = False
     name_collected: bool = False  # True if we already got their name
 
+    # =====================================================
+    # CONVERSATION HISTORY (Phase 1.2 fix)
+    # =====================================================
+    # Stores the conversation as a list of message dicts:
+    # [
+    #     {"role": "user", "content": "Hello"},
+    #     {"role": "assistant", "content": "Hi! How can I help?"},
+    #     {"role": "user", "content": "I need tax help"},
+    #     {"role": "assistant", "content": "Sure, what do you need?"},
+    # ]
+    # This is sent to the LLM with each request for context.
+    conversation_history: list = field(default_factory=list)
+
+    # Maximum history to keep (prevent token overflow)
+    MAX_HISTORY = 10  # Keep last 10 turns (20 messages)
+
+    def add_user_message(self, message: str) -> None:
+        """Add user message to history"""
+        self.conversation_history.append({
+            "role": "user",
+            "content": message
+        })
+        self._trim_history()
+
+    def add_assistant_message(self, message: str) -> None:
+        """Add assistant message to history"""
+        self.conversation_history.append({
+            "role": "assistant",
+            "content": message
+        })
+        self._trim_history()
+
+    def _trim_history(self) -> None:
+        """Keep history within MAX_HISTORY limit"""
+        if len(self.conversation_history) > self.MAX_HISTORY * 2:
+            # Remove oldest messages (keep most recent)
+            self.conversation_history = self.conversation_history[-(self.MAX_HISTORY * 2):]
+
+    def get_history_for_llm(self) -> list:
+        """
+        Get conversation history formatted for LLM
+
+        Returns:
+            List of message dicts compatible with OpenAI API
+        """
+        return self.conversation_history.copy()
+
     def to_dict(self) -> dict:
         """Convert to dictionary for storage"""
         return {
@@ -81,7 +128,8 @@ class ConversationContext:
             "detected_intent": self.detected_intent.value,
             "caller_name": self.caller_name,
             "is_known_caller": self.is_known_caller,
-            "metadata": self.metadata
+            "metadata": self.metadata,
+            "conversation_length": len(self.conversation_history)
         }
 
 
@@ -96,26 +144,37 @@ class ConversationOrchestrator:
     4. Streams LLM response to TTS for audio
     5. Sends audio back to Twilio
     6. Handles interruption (barge-in) at any time
+
+    ARCHITECTURE NOTES:
+    - TTS and LLM are shared (stateless, thread-safe)
+    - STT is created PER-CALL (to avoid queue/buffer sharing issues)
+    - Each call has its own context, handler, and STT instance
     """
 
     def __init__(self):
-        """Initialize orchestrator with all services"""
+        """Initialize orchestrator with shared services"""
         settings = get_settings()
 
-        # Initialize services (may return None if not available)
-        # Use configurable STT provider (deepgram or whisper for Arabic)
-        self.stt = create_stt_service(settings.stt_provider, settings.model_dump())
+        # SHARED SERVICES (stateless, thread-safe)
         self.tts = create_elevenlabs_tts(settings.model_dump())
         self.llm = create_openai_llm(settings.model_dump())
 
+        # STT is created PER-CALL in handle_call()
+        # This prevents queue/buffer sharing between calls
+        self._stt_provider = settings.stt_provider
+        self._stt_config = settings.model_dump()
+
         # Log service availability
-        logger.info(f"STT provider: {settings.stt_provider} (Whisper supports Arabic, Deepgram is English-only)")
+        logger.info(f"STT provider: {self._stt_provider} (Whisper supports Arabic, Deepgram is English-only)")
         if not self.tts:
             logger.warning("TTS service not available - audio responses will be limited")
 
-        # Active conversations
+        # PER-CALL STORAGE
+        # Each call gets its own: context, handler, STT instance, state lock
         self._conversations: Dict[str, ConversationContext] = {}
         self._twilio_handlers: Dict[str, TwilioMediaStreamHandler] = {}
+        self._call_stt_instances: Dict[str, Any] = {}  # Per-call STT instances
+        self._call_state_locks: Dict[str, asyncio.Lock] = {}  # Per-call state locks
 
         # Barge-in detection
         self._energy_threshold: float = settings.interruption_energy_threshold
@@ -201,7 +260,22 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         logger.info(f"Orchestrator: ===== START CALL {call_sid} from {phone_number}, stream_sid={stream_sid}")
 
         try:
-            # Check if this is a returning caller
+            # =====================================================
+            # STEP 1: Create per-call STT instance
+            # =====================================================
+            # CRITICAL: Each call gets its own STT instance to avoid
+            # queue/buffer sharing between concurrent calls
+            logger.info(f"Orchestrator: Creating per-call STT instance (provider={self._stt_provider})")
+            call_stt = create_stt_service(self._stt_provider, self._stt_config)
+            self._call_stt_instances[call_sid] = call_stt
+
+            # Create per-call state lock for thread-safe state changes
+            state_lock = asyncio.Lock()
+            self._call_state_locks[call_sid] = state_lock
+
+            # =====================================================
+            # STEP 2: Get caller info
+            # =====================================================
             logger.info(f"Orchestrator: Getting caller info for {phone_number}")
             caller_info = self.caller_service.get_caller_info(phone_number)
             caller_name = caller_info.get("name") if caller_info else None
@@ -209,7 +283,9 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
             logger.info(f"Orchestrator: Caller info - name={caller_name}, language={caller_language}")
 
-            # Create conversation context
+            # =====================================================
+            # STEP 3: Create conversation context
+            # =====================================================
             context = ConversationContext(
                 call_sid=call_sid,
                 phone_number=phone_number,
@@ -220,7 +296,9 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             self._conversations[call_sid] = context
             logger.info(f"Orchestrator: Conversation context created")
 
-            # Create Twilio handler
+            # =====================================================
+            # STEP 4: Create Twilio handler
+            # =====================================================
             logger.info(f"Orchestrator: Creating Twilio handler")
             twilio_handler = TwilioMediaStreamHandler(call_sid, stream_sid, websocket)
             self._twilio_handlers[call_sid] = twilio_handler
@@ -231,45 +309,51 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             twilio_handler._is_connected = True
             logger.info(f"Orchestrator: Handler configured - streaming=True, stream_sid={stream_sid}")
 
+            # =====================================================
+            # STEP 5: Connect to per-call STT
+            # =====================================================
+            logger.info(f"Orchestrator: Connecting to STT...")
+            await call_stt.connect()
+            logger.info(f"Orchestrator: STT connected")
+
             # Set up media handler for incoming audio
             twilio_handler.set_media_handler(self._handle_incoming_audio(call_sid))
             logger.info(f"Orchestrator: Media handler registered")
 
-            # Connect to STT
-            logger.info(f"Orchestrator: Connecting to STT...")
-            await self.stt.connect()
-            logger.info(f"Orchestrator: STT connected")
-
-            # Get personalized greeting - will be sent after event loop starts
+            # =====================================================
+            # STEP 6: Get greeting and send it
+            # =====================================================
             logger.info(f"Orchestrator: Getting greeting...")
             greeting = self.caller_service.get_greeting_for_caller(phone_number, caller_language)
             logger.info(f"Orchestrator: Greeting: '{greeting[:50]}...'")
 
-            # Create task to send greeting after event loop starts
-            # This ensures audio queue is ready when we try to send
-            async def send_greeting_after_delay():
-                await asyncio.sleep(1.0)  # Wait for event loop to fully start
-                logger.info(f"Orchestrator: Sending greeting...")
+            # Send greeting immediately (no delay - this was causing race conditions)
+            # We wait for STT to be ready first
+            await asyncio.sleep(0.5)  # Brief pause for audio queue to stabilize
+            logger.info(f"Orchestrator: Sending greeting...")
+            async with state_lock:
                 context.state = ConversationState.SPEAKING
-                try:
-                    await self._speak_to_caller(call_sid, greeting, caller_language)
-                    logger.info(f"Orchestrator: Greeting sent successfully")
-                except Exception as e:
-                    logger.error(f"Orchestrator: Failed to send greeting: {e}")
-                finally:
+            try:
+                await self._speak_to_caller(call_sid, greeting, caller_language)
+                logger.info(f"Orchestrator: Greeting sent successfully")
+            except Exception as e:
+                logger.error(f"Orchestrator: Failed to send greeting: {e}")
+            finally:
+                async with state_lock:
                     context.state = ConversationState.LISTENING
 
-            greeting_task = asyncio.create_task(send_greeting_after_delay())
-
-            # Start transcript consumer as background task
-            # This consumes transcripts from STT queue and processes them
+            # =====================================================
+            # STEP 7: Start transcript consumer for this call's STT
+            # =====================================================
             logger.info(f"Orchestrator: Starting transcript consumer...")
             transcript_task = asyncio.create_task(
                 self._consume_stt_transcripts(call_sid),
                 name=f"transcript_consumer_{call_sid}"
             )
 
-            # Now handle the WebSocket connection (incoming audio)
+            # =====================================================
+            # STEP 8: Handle WebSocket connection (incoming audio)
+            # =====================================================
             # This runs concurrently with transcript consumer
             logger.info(f"Orchestrator: Starting connection handler...")
             try:
@@ -281,14 +365,6 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     transcript_task.cancel()
                     try:
                         await transcript_task
-                    except asyncio.CancelledError:
-                        pass
-                # Cancel greeting task if still running
-                if not greeting_task.done():
-                    logger.info(f"Orchestrator: Cancelling greeting task...")
-                    greeting_task.cancel()
-                    try:
-                        await greeting_task
                     except asyncio.CancelledError:
                         pass
             logger.info(f"Orchestrator: WebSocket handling complete")
@@ -305,7 +381,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         Handle incoming audio from caller
 
         This is called by the Twilio handler when audio arrives.
-        It streams the audio to STT and processes the transcript.
+        It streams the audio to this call's STT instance.
 
         Args:
             call_sid: Call identifier
@@ -316,30 +392,43 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             if not context or context.state == ConversationState.ENDED:
                 return
 
+            # Get this call's STT instance
+            call_stt = self._call_stt_instances.get(call_sid)
+            if not call_stt:
+                logger.warning(f"Orchestrator: No STT instance for call {call_sid}")
+                return
+
+            # Get state lock for this call
+            state_lock = self._call_state_locks.get(call_sid)
+
             # Skip if we're speaking (barge-in prevention)
-            if context.state == ConversationState.SPEAKING:
+            async with state_lock:
+                current_state = context.state
+
+            if current_state == ConversationState.SPEAKING:
                 # Check for barge-in (user speech during AI speech)
                 if await self._detect_barge_in(audio_data):
                     logger.info("Orchestrator: User interrupted!")
-                    context.state = ConversationState.INTERRUPTED
+                    async with state_lock:
+                        context.state = ConversationState.LISTENING  # Don't use INTERRUPTED state
                     if self.tts:
                         await self.tts.stop()  # Stop TTS
                 # ALWAYS skip STT while speaking (whether interrupted or not)
                 # This prevents AI's own voice from being transcribed
                 return
 
-            # Stream to STT
+            # Stream to this call's STT instance
             from services.stt.stt_base import AudioChunk
-            await self.stt.stream_audio(AudioChunk(data=audio_data))
+            await call_stt.stream_audio(AudioChunk(data=audio_data))
 
         return process_audio
 
     async def _consume_stt_transcripts(self, call_sid: str) -> None:
         """
-        Consume transcripts from STT service queue and process them
+        Consume transcripts from this call's STT service queue
 
         This runs as a background task alongside the WebSocket event loop.
-        It continuously polls for transcripts and processes them.
+        Each call has its own STT instance, so this consumes from the correct queue.
 
         Args:
             call_sid: Call identifier
@@ -349,11 +438,17 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.warning(f"Orchestrator: No context found for call {call_sid}")
             return
 
+        # Get this call's STT instance
+        call_stt = self._call_stt_instances.get(call_sid)
+        if not call_stt:
+            logger.error(f"Orchestrator: No STT instance for call {call_sid}")
+            return
+
         logger.info(f"Orchestrator: Transcript consumer started for call {call_sid}")
 
         try:
-            # get_transcript() returns an async iterator
-            async for result in self.stt.get_transcript():
+            # get_transcript() returns an async iterator from THIS CALL's STT
+            async for result in call_stt.get_transcript():
                 if not result or not result.text:
                     continue
 
@@ -407,6 +502,11 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         logger.info(f"Orchestrator: User said: {transcript}")
 
+        # =====================================================
+        # ADD USER MESSAGE TO CONVERSATION HISTORY (Phase 1.2)
+        # =====================================================
+        context.add_user_message(transcript)
+
         # ===== CALLER NAME EXTRACTION (New Callers) =====
         if not context.is_known_caller and not context.name_collected:
             extracted_name = self._extract_caller_name(transcript)
@@ -443,13 +543,26 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             await self._handle_transfer(call_sid)
             return
 
-        # Get AI response
-        context.state = ConversationState.THINKING
+        # Get state lock for this call
+        state_lock = self._call_state_locks.get(call_sid)
+        if not state_lock:
+            logger.error(f"Orchestrator: No state lock for call {call_sid}")
+            return
+
+        # =====================================================
+        // STATE TRANSITION: LISTENING -> THINKING -> SPEAKING
+        // Using lock to prevent race conditions
+        // =====================================================
+        async with state_lock:
+            context.state = ConversationState.THINKING
+
         response = await self._get_ai_response(call_sid, transcript)
 
         context.ai_response = response
         context.turn_count += 1
-        context.state = ConversationState.SPEAKING
+
+        async with state_lock:
+            context.state = ConversationState.SPEAKING
 
         # Stream response to caller (this waits for audio to complete)
         await self._speak_to_caller(call_sid, response, context.language)
@@ -460,6 +573,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
     async def _get_ai_response(self, call_sid: str, user_input: str) -> str:
         """
         Get AI response for user input
+
+        NOW INCLUDES CONVERSATION HISTORY (Phase 1.2 fix)
 
         Args:
             call_sid: Call identifier
@@ -479,19 +594,25 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         if context.caller_name:
             system_prompt += f"\n\nCALLER CONTEXT:\n- The caller's name is {context.caller_name}. Use their name naturally in your response to be warm and personal."
 
-        # Build message list
+        # =====================================================
+        # BUILD MESSAGES WITH CONVERSATION HISTORY (Phase 1.2)
+        # =====================================================
         messages = [
             Message(role=LLMRole.SYSTEM, content=system_prompt)
         ]
 
-        # Add conversation history (last 5 turns)
-        # In production, this would come from database
-        if context.turn_count > 0:
-            # TODO: Fetch from database
-            pass
+        # Add conversation history from context
+        # This gives the LLM context about what was discussed
+        history = context.get_history_for_llm()
+        for msg in history:
+            # Convert to Message objects
+            if msg["role"] == "user":
+                messages.append(Message(role=LLMRole.USER, content=msg["content"]))
+            elif msg["role"] == "assistant":
+                messages.append(Message(role=LLMRole.ASSISTANT, content=msg["content"]))
 
-        # Add current user message
-        messages.append(Message(role=LLMRole.USER, content=user_input))
+        # Note: user_input is already in history (added in process_transcript)
+        # So we don't need to add it again here
 
         # Get streaming response
         from services.llm.llm_base import LLMRequest, LLMChunk
@@ -507,7 +628,14 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         async for chunk in self.llm.chat_stream(request):
             full_response += chunk.delta
 
-        return full_response.strip()
+        response = full_response.strip()
+
+        # =====================================================
+        # ADD ASSISTANT RESPONSE TO HISTORY (Phase 1.2)
+        # =====================================================
+        context.add_assistant_message(response)
+
+        return response
 
     async def _speak_to_caller(self, call_sid: str, text: str, language: str) -> None:
         """
@@ -523,6 +651,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         context = self._conversations.get(call_sid)
         twilio_handler = self._twilio_handlers.get(call_sid)
+        state_lock = self._call_state_locks.get(call_sid)
 
         logger.info(f"Orchestrator: context={context is not None}, twilio_handler={twilio_handler is not None}")
 
@@ -533,7 +662,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # Check if TTS is available
         if not self.tts:
             logger.warning("TTS not available, cannot speak to caller")
-            context.state = ConversationState.LISTENING
+            async with state_lock:
+                context.state = ConversationState.LISTENING
             return
 
         try:
@@ -576,7 +706,12 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.error(f"Orchestrator: Traceback:\n{traceback.format_exc()}")
 
         finally:
-            context.state = ConversationState.LISTENING
+            # =====================================================
+            // STATE TRANSITION: SPEAKING -> LISTENING
+            // Using lock to prevent race conditions
+            // =====================================================
+            async with state_lock:
+                context.state = ConversationState.LISTENING
             logger.info(f"Orchestrator: _speak_to_caller END")
 
     async def _detect_intent(self, text: str, language: str) -> Intent:
@@ -699,8 +834,17 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         if call_sid in self._conversations:
             self._conversations[call_sid].state = ConversationState.ENDED
 
-        # Disconnect STT
-        await self.stt.disconnect()
+        # =====================================================
+        # CRITICAL: Disconnect and cleanup this call's STT instance
+        # =====================================================
+        if call_sid in self._call_stt_instances:
+            logger.info(f"Orchestrator: Disconnecting call-specific STT for {call_sid}")
+            await self._call_stt_instances[call_sid].disconnect()
+            del self._call_stt_instances[call_sid]
+
+        # Clean up state lock
+        if call_sid in self._call_state_locks:
+            del self._call_state_locks[call_sid]
 
         # Clean up handlers
         if call_sid in self._twilio_handlers:
