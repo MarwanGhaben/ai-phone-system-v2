@@ -50,7 +50,12 @@ class AccountantsService:
             self._accountants_by_name = {}
 
             for acc in self._accountants:
+                # Add main name
                 self._accountants_by_name[acc['name'].lower()] = acc
+
+                # Add aliases if present (for name variations like "Hossam" vs "Hussam")
+                for alias in acc.get('aliases', []):
+                    self._accountants_by_name[alias.lower()] = acc
 
             logger.info(f"Loaded {len(self._accountants)} accountants from {self.config_path}")
 

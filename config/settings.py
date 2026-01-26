@@ -76,7 +76,8 @@ class Settings(BaseSettings):
     # =====================================================
     deepgram_api_key: str = Field(..., alias="DEEPGRAM_API_KEY")
     deepgram_model: str = "nova-2"  # nova-2 is the fastest and most accurate
-    deepgram_language: str = "en-US"  # Will be overridden for auto-detect
+    deepgram_language: str = "en-US"  # en-US, ar (Arabic), or mul (multilingual)
+    deepgram_multilingual: bool = Field(default=False, alias="DEEPGRAM_MULTILINGUAL")  # Set True for Arabic/English support
     deepgram_smart_format: bool = True
     deepgram_paragraphs: bool = True
     deepgram_punctuate: bool = True
