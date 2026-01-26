@@ -123,9 +123,14 @@ class DeepgramSTT(STTServiceBase):
             # - smart_format, punctuate, interim_results
             # - vad_events, utterance_end_ms
             # NOT supported: paragraphs, detect_language, profanity_filter, filler_words
+
+            # Use multilingual mode to support English AND Arabic
+            # "mul" enables automatic language detection for 100+ languages
+            stt_language = "mul" if self.detect_language else self.language
+
             options = LiveOptions(
                 model=self.model,
-                language=self.language,  # Use configured language (no auto-detect in live mode)
+                language=stt_language,  # "mul" for multilingual (en, ar, es, etc.)
                 encoding="mulaw",       # Twilio sends μ-law encoded audio
                 channels=1,             # Mono audio
                 sample_rate=8000,       # Twilio uses 8kHz
@@ -135,6 +140,7 @@ class DeepgramSTT(STTServiceBase):
             )
 
             # Start the connection (start() returns bool directly, not awaitable)
+            logger.info(f"Deepgram: Starting with language={stt_language}, model={self.model}")
             if self._live_connection.start(options):
                 self._status = STTStatus.CONNECTED
                 self._transcript_queue = asyncio.Queue()

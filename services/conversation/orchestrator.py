@@ -150,11 +150,13 @@ SERVICES OFFERED:
 - Bookkeeping services
 - Corporate tax planning
 
-BEHAVIOR:
-- Keep responses conversational and brief (2-3 sentences max - this is a phone call)
-- Sound natural, like a helpful human
-- Don't repeat yourself
-- If unsure, offer to transfer to a human
+CRITICAL - RESPONSE STYLE:
+- Keep responses EXTREMELY BRIEF (1-2 sentences, max 50 words)
+- This is a VOICE call - long responses frustrate callers
+- Get straight to the point
+- Don't repeat the question back
+- Don't list multiple options at once
+- Ask ONE question at a time
 
 APPOINTMENT BOOKING:
 - Accountants available: {accountant_names_en}
@@ -176,11 +178,12 @@ TRANSFER SCRIPT:
 "بالتأكيد، سأحولك الآن." (Arabic)
 
 LANGUAGE DETECTION:
-- Automatically detect if caller speaks English or Arabic
-- Respond in the same language
-- If switching, acknowledge the change
+- If caller speaks Arabic, respond in Arabic
+- If caller speaks English, respond in English
+- Keep Arabic responses brief and natural
+- Use simple, conversational Arabic
 
-Remember: This is a real phone call. Be concise. Be helpful. Be human."""
+Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
     async def handle_call(self, call_sid: str, phone_number: str, websocket, stream_sid: str = "") -> None:
         """
