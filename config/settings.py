@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     # =====================================================
     # STT (Speech-to-Text) Provider
     # =====================================================
-    stt_provider: str = Field(default="deepgram", alias="STT_PROVIDER")  # 'deepgram' or 'whisper'
+    stt_provider: str = Field(default="elevenlabs", alias="STT_PROVIDER")  # 'deepgram', 'whisper', or 'elevenlabs'
 
     # =====================================================
     # DEEPGRAM STT
@@ -108,6 +108,13 @@ class Settings(BaseSettings):
     elevenlabs_stability: float = 0.5  # 0-1, lower = more expressive
     elevenlabs_similarity_boost: float = 0.75  # 0-1, higher = more similar to original
     elevenlabs_output_format: str = "mp3_44100_128"
+
+    # =====================================================
+    # ELEVENLABS STT (Scribe v2 Realtime)
+    # =====================================================
+    elevenlabs_stt_model: str = Field(default="scribe_v2_realtime", alias="ELEVENLABS_STT_MODEL")
+    elevenlabs_stt_language: str = Field(default="", alias="ELEVENLABS_STT_LANGUAGE")  # Empty = auto-detect
+    elevenlabs_stt_sample_rate: int = Field(default=16000, alias="ELEVENLABS_STT_SAMPLE_RATE")
 
     # =====================================================
     # OPENAI

@@ -165,7 +165,12 @@ class ConversationOrchestrator:
         self._stt_config = settings.model_dump()
 
         # Log service availability
-        logger.info(f"STT provider: {self._stt_provider} (Whisper supports Arabic, Deepgram is English-only)")
+        stt_info = {
+            'whisper': 'Whisper - batch mode, supports Arabic',
+            'deepgram': 'Deepgram - real-time, English-only',
+            'elevenlabs': 'ElevenLabs Scribe v2 - real-time 150ms latency, supports Arabic'
+        }
+        logger.info(f"STT provider: {self._stt_provider} ({stt_info.get(self._stt_provider, 'unknown')})")
         if not self.tts:
             logger.warning("TTS service not available - audio responses will be limited")
 
