@@ -51,7 +51,7 @@ class WhisperSTT(STTServiceBase):
         api_key: str,
         language: str = "en",  # Whisper uses ISO 639-1 codes (en, ar, not en-US)
         model: str = "whisper-1",
-        silence_threshold: float = 0.3,  # Energy threshold for silence detection
+        silence_threshold: float = 0.02,  # Energy threshold for silence detection (μ-law silence ~0.004)
         silence_duration: float = 1.0,  # Seconds of silence to trigger transcription
         min_audio_length: float = 0.5,  # Minimum audio length before transcribing
     ):
