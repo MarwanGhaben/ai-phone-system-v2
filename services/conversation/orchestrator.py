@@ -550,9 +550,9 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             return
 
         # =====================================================
-        // STATE TRANSITION: LISTENING -> THINKING -> SPEAKING
-        // Using lock to prevent race conditions
-        // =====================================================
+        # STATE TRANSITION: LISTENING -> THINKING -> SPEAKING
+        # Using lock to prevent race conditions
+        # =====================================================
         async with state_lock:
             context.state = ConversationState.THINKING
 
@@ -707,9 +707,9 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         finally:
             # =====================================================
-            // STATE TRANSITION: SPEAKING -> LISTENING
-            // Using lock to prevent race conditions
-            // =====================================================
+            # STATE TRANSITION: SPEAKING -> LISTENING
+            # Using lock to prevent race conditions
+            # =====================================================
             async with state_lock:
                 context.state = ConversationState.LISTENING
             logger.info(f"Orchestrator: _speak_to_caller END")
