@@ -56,7 +56,8 @@ class TwilioMediaStreamHandler:
         self._is_streaming = False
 
         # Queue for audio to send (consumed by event loop)
-        self._audio_queue: asyncio.Queue = None
+        # Initialize immediately so audio can be queued before handle_connection() starts
+        self._audio_queue: asyncio.Queue = asyncio.Queue()
 
     async def handle_connection(self) -> None:
         """
@@ -66,7 +67,6 @@ class TwilioMediaStreamHandler:
         Runs both tasks concurrently: receiving messages and sending audio.
         """
         self._is_connected = True
-        self._audio_queue = asyncio.Queue()
         logger.info(f"Twilio: Media stream connected for call {self.call_sid}, starting event loop...")
 
         # Create tasks for receiving and sending
