@@ -176,9 +176,9 @@ class WhisperSTT(STTServiceBase):
             if not hasattr(self, '_chunk_count'):
                 self._chunk_count = 0
             self._chunk_count += 1
-            if self._chunk_count == 1 or self._chunk_count % 50 == 0:
+            if self._chunk_count == 1 or self._chunk_count % 100 == 0:
                 duration = self._total_samples / 8000  # 8kHz sample rate
-                logger.debug(f"Whisper: Buffered {self._chunk_count} chunks, {duration:.2f}s audio")
+                logger.info(f"Whisper: Buffered {self._chunk_count} chunks, {duration:.2f}s audio")
 
         except Exception as e:
             logger.error(f"Whisper: Error buffering audio: {e}")
@@ -289,7 +289,7 @@ class WhisperSTT(STTServiceBase):
                 if (silence_duration >= self.silence_duration and
                     buffer_duration >= self.min_audio_length):
 
-                    logger.debug(f"Whisper: Silence detected ({silence_duration:.1f}s), transcribing...")
+                    logger.info(f"Whisper: Silence detected ({silence_duration:.1f}s), buffer={buffer_duration:.1f}s, transcribing...")
                     await self._transcribe_buffer()
 
             except asyncio.CancelledError:

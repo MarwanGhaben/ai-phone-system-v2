@@ -210,6 +210,7 @@ class TwilioMediaStreamHandler:
             data: Media data with base64 encoded audio
         """
         if not self._is_streaming:
+            logger.debug(f"Twilio: _on_media skipping - not streaming")
             return
 
         # Extract base64 encoded μ-law audio
@@ -223,6 +224,8 @@ class TwilioMediaStreamHandler:
             # Pass to registered handler
             if self._on_media_received:
                 await self._on_media_received(audio_data)
+            else:
+                logger.warning(f"Twilio: _on_media - no handler registered!")
 
     async def _on_stop(self, data: dict) -> None:
         """Handle stop event - call stopped streaming"""

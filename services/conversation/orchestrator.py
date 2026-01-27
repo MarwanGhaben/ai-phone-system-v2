@@ -388,8 +388,16 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         """
         async def process_audio(audio_data: bytes):
             """Process audio chunk"""
+            # Debug: Track audio chunks
+            if not hasattr(process_audio, '_chunk_count'):
+                process_audio._chunk_count = 0
+            process_audio._chunk_count += 1
+            if process_audio._chunk_count == 1 or process_audio._chunk_count % 100 == 0:
+                logger.info(f"Orchestrator: process_audio called - chunk #{process_audio._chunk_count}, {len(audio_data)} bytes")
+
             context = self._conversations.get(call_sid)
             if not context or context.state == ConversationState.ENDED:
+                logger.debug(f"Orchestrator: process_audio skipping - no context or call ended")
                 return
 
             # Get this call's STT instance
@@ -420,6 +428,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Stream to this call's STT instance
             from services.stt.stt_base import AudioChunk
             await call_stt.stream_audio(AudioChunk(data=audio_data))
+            if process_audio._chunk_count == 1:
+                logger.info(f"Orchestrator: First audio chunk sent to STT")
 
         return process_audio
 
