@@ -88,6 +88,8 @@ class ElevenLabsSTT(STTServiceBase):
                 "model_id": self.model,
                 "audio_format": "pcm_16000",
                 "sample_rate": str(self.sample_rate),
+                "commit_strategy": "vad",
+                "vad_silence_threshold_secs": "0.5",
             }
 
             # Add language if specified
