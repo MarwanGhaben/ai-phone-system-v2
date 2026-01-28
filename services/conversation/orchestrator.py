@@ -431,13 +431,25 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             if current_state == ConversationState.SPEAKING:
                 # Check for barge-in (user speech during AI speech)
                 if await self._detect_barge_in(audio_data):
-                    logger.info("Orchestrator: User interrupted!")
+                    logger.info("Orchestrator: === BARGE-IN DETECTED === User interrupted!")
                     async with state_lock:
-                        context.state = ConversationState.LISTENING  # Don't use INTERRUPTED state
+                        context.state = ConversationState.LISTENING
+
+                    # Stop TTS generation
                     if self.tts:
-                        await self.tts.stop()  # Stop TTS
-                # ALWAYS skip STT while speaking (whether interrupted or not)
-                # This prevents AI's own voice from being transcribed
+                        await self.tts.stop()
+
+                    # Stop audio playback on Twilio immediately
+                    twilio_handler = self._twilio_handlers.get(call_sid)
+                    if twilio_handler:
+                        await twilio_handler.clear_audio()
+
+                    # Feed this audio chunk to STT so the user's words aren't lost
+                    from services.stt.stt_base import AudioChunk
+                    await call_stt.stream_audio(AudioChunk(data=audio_data))
+                    return
+
+                # Skip STT while AI is speaking (prevents echo)
                 return
 
             # Stream to this call's STT instance
@@ -1114,18 +1126,38 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         """
         Detect if user is speaking during AI speech (barge-in)
 
+        Uses energy-based detection with consecutive frame requirement
+        to avoid false triggers from noise bursts.
+
         Args:
             audio_data: Audio chunk to analyze
 
         Returns:
             True if user is speaking (barge-in detected)
         """
-        # Simple energy-based detection
-        # Calculate audio energy
-        energy = sum(abs(byte - 128) for byte in audio_data[:1000]) / 1000
+        # Calculate audio energy (μ-law: silence is ~128, speech deviates from 128)
+        sample_count = min(len(audio_data), 1000)
+        if sample_count == 0:
+            return False
 
-        if energy > self._energy_threshold * 100:
-            return True
+        energy = sum(abs(byte - 128) for byte in audio_data[:sample_count]) / sample_count
+
+        # Track consecutive high-energy frames to avoid false triggers
+        if not hasattr(self, '_barge_in_consecutive'):
+            self._barge_in_consecutive = 0
+
+        # Threshold: 0.3 * 100 = 30 is default. Use lower value (15) for better sensitivity.
+        threshold = self._energy_threshold * 50  # More sensitive (was *100)
+
+        if energy > threshold:
+            self._barge_in_consecutive += 1
+            # Require 3 consecutive high-energy frames (~60ms of speech) to trigger
+            if self._barge_in_consecutive >= 3:
+                logger.info(f"Orchestrator: Barge-in triggered - energy={energy:.1f}, threshold={threshold:.1f}, consecutive={self._barge_in_consecutive}")
+                self._barge_in_consecutive = 0
+                return True
+        else:
+            self._barge_in_consecutive = 0
 
         return False
 

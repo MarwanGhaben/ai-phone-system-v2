@@ -54,6 +54,7 @@ class TwilioMediaStreamHandler:
         # State
         self._is_connected = False
         self._is_streaming = False
+        self._interrupted = False  # Set to True to abort current audio playback
 
         # Queue for audio to send (consumed by event loop)
         # Initialize immediately so audio can be queued before handle_connection() starts
@@ -284,17 +285,45 @@ class TwilioMediaStreamHandler:
         await self._audio_queue.put(audio_data)
         logger.info(f"Twilio: Queued {len(audio_data)} bytes audio for sending")
 
+    async def clear_audio(self) -> None:
+        """
+        Clear all pending and currently playing audio (for barge-in).
+        Sends a 'clear' event to Twilio to stop playback immediately.
+        """
+        self._interrupted = True
+
+        # Drain the queue
+        cleared = 0
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+                cleared += 1
+            except asyncio.QueueEmpty:
+                break
+
+        # Tell Twilio to stop playing any buffered audio
+        try:
+            await self.send_event("clear")
+        except Exception as e:
+            logger.warning(f"Twilio: Failed to send clear event: {e}")
+
+        if cleared > 0:
+            logger.info(f"Twilio: Barge-in cleared {cleared} queued audio(s)")
+        logger.info(f"Twilio: Audio playback interrupted")
+
     async def _send_audio_chunked(self, audio_data: bytes) -> None:
         """
         Send audio to Twilio with proper chunking
 
         Twilio Media Streams requires audio in 20ms chunks (160 bytes at 8kHz μ-law).
         Sending larger payloads can cause playback issues.
+        Checks _interrupted flag each chunk to allow barge-in to abort playback.
 
         Args:
             audio_data: Audio data (μ-law 8kHz for Twilio)
         """
         total_bytes = len(audio_data)
+        self._interrupted = False  # Reset at start of new playback
 
         # Twilio Media Streams: 20ms = 160 bytes at 8kHz μ-law
         CHUNK_SIZE = 160  # 20ms at 8kHz μ-law
@@ -312,6 +341,12 @@ class TwilioMediaStreamHandler:
 
             # Send each chunk
             for i in range(num_chunks):
+                # Check if interrupted by barge-in
+                if self._interrupted:
+                    logger.info(f"Twilio: Audio playback interrupted at chunk {i+1}/{num_chunks} (barge-in)")
+                    await self.send_event("clear")
+                    return
+
                 start = i * CHUNK_SIZE
                 end = min(start + CHUNK_SIZE, len(audio_data))
                 chunk = audio_data[start:end]
