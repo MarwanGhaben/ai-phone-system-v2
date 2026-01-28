@@ -100,9 +100,10 @@ class ElevenLabsSTT(STTServiceBase):
             logger.info(f"ElevenLabs STT: Connecting to {self.WEBSOCKET_URL} with model={self.model}")
 
             # Connect with API key in header for authentication
+            # websockets 12.x uses 'extra_headers', not 'additional_headers'
             self._websocket = await websockets.connect(
                 ws_url,
-                additional_headers={"xi-api-key": self.api_key},
+                extra_headers={"xi-api-key": self.api_key},
                 ping_interval=30,
                 ping_timeout=10,
             )
