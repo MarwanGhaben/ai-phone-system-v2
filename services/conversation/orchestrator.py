@@ -847,6 +847,23 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
             if result.success:
                 logger.info(f"Orchestrator: BOOKING CREATED - id={result.appointment_id}, time={result.start_time}, staff={result.staff_name}")
+
+                # Send SMS confirmation + schedule 24hr reminder
+                display_staff = result.staff_name or accountant_name or "your accountant"
+                display_time = appointment_time.strftime('%A, %B %d at %I:%M %p')
+                display_customer = customer_name or "there"
+                caller_phone = context.phone_number if context else ""
+                caller_lang = context.language if context else "en"
+
+                asyncio.create_task(self._send_booking_sms(
+                    phone_number=caller_phone,
+                    customer_name=display_customer,
+                    staff_name=display_staff,
+                    appointment_time_str=display_time,
+                    appointment_dt=appointment_time,
+                    language=caller_lang,
+                ))
+
                 return f"BOOKING_SUCCESS: Appointment booked successfully. Appointment ID: {result.appointment_id}. Time: {result.start_time}. Staff: {result.staff_name or accountant_name}. Customer: {result.customer_name}."
             else:
                 logger.error(f"Orchestrator: BOOKING FAILED - {result.error_message}")
@@ -857,6 +874,58 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             import traceback
             logger.error(traceback.format_exc())
             return f"BOOKING_ERROR: System error while booking: {str(e)}. Apologize and offer to transfer."
+
+    async def _send_booking_sms(
+        self,
+        phone_number: str,
+        customer_name: str,
+        staff_name: str,
+        appointment_time_str: str,
+        appointment_dt,
+        language: str,
+    ) -> None:
+        """
+        Send booking confirmation SMS and schedule a 24hr reminder.
+        Runs as a fire-and-forget background task so it doesn't block the call.
+        """
+        from services.sms.telnyx_sms_service import get_sms_service
+        from services.sms.reminder_scheduler import get_reminder_scheduler
+
+        sms = get_sms_service()
+        if not sms.is_available():
+            logger.warning("Orchestrator: SMS not configured - skipping confirmation")
+            return
+
+        # 1. Send immediate confirmation
+        try:
+            sent = await sms.send_booking_confirmation(
+                to_number=phone_number,
+                customer_name=customer_name,
+                staff_name=staff_name,
+                appointment_time=appointment_time_str,
+                language=language,
+            )
+            if sent:
+                logger.info(f"Orchestrator: Booking confirmation SMS sent to {phone_number}")
+            else:
+                logger.warning(f"Orchestrator: Failed to send confirmation SMS to {phone_number}")
+        except Exception as e:
+            logger.error(f"Orchestrator: SMS confirmation error: {e}")
+
+        # 2. Schedule 24hr reminder
+        try:
+            scheduler = get_reminder_scheduler()
+            scheduler.schedule_reminder(
+                phone_number=phone_number,
+                customer_name=customer_name,
+                staff_name=staff_name,
+                appointment_time_str=appointment_time_str,
+                appointment_dt=appointment_dt,
+                language=language,
+            )
+            logger.info(f"Orchestrator: 24hr reminder scheduled for {phone_number}")
+        except Exception as e:
+            logger.error(f"Orchestrator: Reminder scheduling error: {e}")
 
     async def _get_ai_response(self, call_sid: str, user_input: str) -> str:
         """

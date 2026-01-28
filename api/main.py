@@ -35,7 +35,17 @@ logger.add(lambda msg: print(msg, end=""), level=settings.log_level)
 async def lifespan(app: FastAPI):
     """Application lifespan management"""
     logger.info("AI Voice Platform v2 starting up...")
+
+    # Start the SMS reminder scheduler (checks every 60s for due reminders)
+    from services.sms.reminder_scheduler import get_reminder_scheduler
+    reminder_scheduler = get_reminder_scheduler()
+    reminder_scheduler.start()
+    logger.info("SMS reminder scheduler started")
+
     yield
+
+    # Stop reminder scheduler
+    reminder_scheduler.stop()
     logger.info("AI Voice Platform v2 shutting down...")
 
 
