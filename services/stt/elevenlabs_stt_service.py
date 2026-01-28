@@ -82,12 +82,27 @@ class ElevenLabsSTT(STTServiceBase):
             self._status = STTStatus.CONNECTING
             logger.info("ElevenLabs STT: Connecting to Scribe v2 Realtime...")
 
-            # Build WebSocket URL with authentication
-            ws_url = f"{self.WEBSOCKET_URL}?xi-api-key={self.api_key}"
+            # Build WebSocket URL with config as query parameters
+            # ElevenLabs Scribe Realtime uses query params for session config
+            params = {
+                "model_id": self.model,
+                "audio_format": "pcm_16000",
+                "sample_rate": str(self.sample_rate),
+            }
 
-            # Connect to WebSocket
+            # Add language if specified
+            if self.language:
+                params["language_code"] = self.language
+
+            query_string = "&".join(f"{k}={v}" for k, v in params.items())
+            ws_url = f"{self.WEBSOCKET_URL}?{query_string}"
+
+            logger.info(f"ElevenLabs STT: Connecting to {self.WEBSOCKET_URL} with model={self.model}")
+
+            # Connect with API key in header for authentication
             self._websocket = await websockets.connect(
                 ws_url,
+                additional_headers={"xi-api-key": self.api_key},
                 ping_interval=30,
                 ping_timeout=10,
             )
@@ -96,21 +111,7 @@ class ElevenLabsSTT(STTServiceBase):
             self._transcript_queue = asyncio.Queue()
             self._is_listening = True
 
-            # Send session configuration
-            config = {
-                "type": "session_config",
-                "model_id": self.model,
-                "sample_rate": self.sample_rate,
-                "audio_format": "pcm_16000",  # 16-bit PCM at 16kHz
-            }
-
-            # Add language if specified
-            if self.language:
-                config["language_code"] = self.language
-
-            await self._websocket.send(json.dumps(config))
-
-            # Start receive task
+            # Start receive task (will process session_started message)
             self._receive_task = asyncio.create_task(
                 self._receive_loop(),
                 name="elevenlabs_stt_receive"
@@ -143,7 +144,7 @@ class ElevenLabsSTT(STTServiceBase):
         if self._websocket:
             try:
                 # Send end of stream message
-                await self._websocket.send(json.dumps({"type": "end_of_stream"}))
+                await self._websocket.send(json.dumps({"message_type": "end_of_stream"}))
                 await self._websocket.close()
             except Exception as e:
                 logger.debug(f"ElevenLabs STT: Error closing WebSocket: {e}")
@@ -166,10 +167,11 @@ class ElevenLabsSTT(STTServiceBase):
             # Convert μ-law 8kHz to PCM 16kHz
             pcm_audio = self._convert_mulaw_to_pcm16(audio_chunk.data)
 
-            # Send audio chunk
+            # Send audio chunk with message_type field per ElevenLabs API
             message = {
-                "type": "input_audio_chunk",
+                "message_type": "input_audio_chunk",
                 "audio_base_64": base64.b64encode(pcm_audio).decode("utf-8"),
+                "sample_rate": self.sample_rate,
             }
 
             await self._websocket.send(json.dumps(message))
@@ -261,7 +263,7 @@ class ElevenLabsSTT(STTServiceBase):
                     )
 
                     data = json.loads(message)
-                    msg_type = data.get("type", data.get("message_type", ""))
+                    msg_type = data.get("message_type", data.get("type", ""))
 
                     if msg_type in ("partial_transcript", "transcript"):
                         # Partial/interim result
@@ -276,7 +278,7 @@ class ElevenLabsSTT(STTServiceBase):
                             await self._transcript_queue.put(result)
                             logger.debug(f"ElevenLabs STT: Partial: '{text}'")
 
-                    elif msg_type in ("committed_transcript", "final_transcript"):
+                    elif msg_type in ("committed_transcript", "committed_transcript_with_timestamps", "final_transcript"):
                         # Final result
                         text = data.get("text", "")
                         if text:
@@ -290,7 +292,8 @@ class ElevenLabsSTT(STTServiceBase):
                             logger.info(f"ElevenLabs STT: Final: '{text}'")
 
                     elif msg_type == "session_started":
-                        logger.info("ElevenLabs STT: Session started")
+                        session_id = data.get("session_id", "unknown")
+                        logger.info(f"ElevenLabs STT: Session started (id={session_id}, config={json.dumps({k: v for k, v in data.items() if k != 'session_id'}, default=str)})")
 
                     elif msg_type == "error":
                         error_msg = data.get("message", data.get("error", "Unknown error"))
@@ -299,6 +302,9 @@ class ElevenLabsSTT(STTServiceBase):
                     elif msg_type == "session_ended":
                         logger.info("ElevenLabs STT: Session ended")
                         break
+
+                    else:
+                        logger.debug(f"ElevenLabs STT: Unknown message type '{msg_type}': {json.dumps(data, default=str)[:200]}")
 
                 except asyncio.TimeoutError:
                     # Send keepalive
