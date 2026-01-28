@@ -183,6 +183,75 @@ class OpenAILLM(LLMServiceBase):
             logger.error(f"OpenAI: Streaming error: {e}")
             raise
 
+    async def chat_with_tools(self, request: LLMRequest) -> LLMResponse:
+        """
+        Chat completion with function/tool calling support.
+        Non-streaming since we need to see the full response to detect tool calls.
+
+        Args:
+            request: LLM request with tools defined
+
+        Returns:
+            LLMResponse with content and/or tool_calls
+        """
+        client = await self._get_client()
+
+        try:
+            messages = [msg.to_dict() for msg in request.messages]
+
+            # Convert tools to OpenAI format
+            openai_tools = []
+            for tool in request.tools:
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters", {}),
+                    }
+                })
+
+            logger.info(f"OpenAI: Calling {self.model} with {len(messages)} messages and {len(openai_tools)} tools")
+
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": request.temperature,
+                "max_tokens": request.max_tokens,
+                "stream": False,
+            }
+            if openai_tools:
+                kwargs["tools"] = openai_tools
+                kwargs["tool_choice"] = "auto"
+
+            response = await client.chat.completions.create(**kwargs)
+
+            choice = response.choices[0]
+            content = choice.message.content or ""
+
+            # Extract tool calls if present
+            tool_calls = []
+            if choice.message.tool_calls:
+                for tc in choice.message.tool_calls:
+                    tool_calls.append({
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    })
+                logger.info(f"OpenAI: Tool calls: {[t['name'] for t in tool_calls]}")
+
+            return LLMResponse(
+                content=content,
+                role=LLMRole.ASSISTANT,
+                finish_reason=choice.finish_reason,
+                tool_calls=tool_calls,
+                tokens_used=response.usage.total_tokens if hasattr(response, 'usage') else 0,
+            )
+
+        except Exception as e:
+            logger.error(f"OpenAI: chat_with_tools error: {e}")
+            raise
+
     async def count_tokens(self, text: str) -> int:
         """
         Count tokens in text

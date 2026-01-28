@@ -228,9 +228,11 @@ APPOINTMENT BOOKING:
 - Accountants available: {accountant_names_en}
 - In Arabic: {accountant_names_ar}
 - Ask: Individual or corporate client?
-- Ask: Preferred accountant?
+- Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
-- Confirm all details before ending
+- Once you have client type + date/time, use the book_appointment function to ACTUALLY create the booking
+- IMPORTANT: Do NOT tell the caller "I've booked it" unless you have called the book_appointment function
+- If booking fails, apologize and offer to transfer to a human
 
 WHEN TO TRANSFER:
 - Caller asks to speak with a specific person by name
@@ -585,11 +587,162 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # State is set back to LISTENING inside _speak_to_caller finally block
         # Do NOT set it here to avoid race condition
 
+    def _get_booking_tools(self) -> list:
+        """Get tool definitions for OpenAI function calling"""
+        return [
+            {
+                "name": "book_appointment",
+                "description": "Book an appointment with an accountant at iFlex Tax. Call this when the user wants to schedule/book an appointment and has provided enough details (at minimum: client type).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "client_type": {
+                            "type": "string",
+                            "enum": ["individual", "corporate"],
+                            "description": "Type of client - individual or corporate"
+                        },
+                        "accountant_name": {
+                            "type": "string",
+                            "description": "Preferred accountant name (e.g. Hussam Saadaldin, Rami Kahwaji, Abdul ElFarra)"
+                        },
+                        "date_time": {
+                            "type": "string",
+                            "description": "Preferred date and time in natural language (e.g. 'tomorrow at 2 PM', 'next Monday 10 AM')"
+                        },
+                        "customer_name": {
+                            "type": "string",
+                            "description": "Customer name for the booking"
+                        }
+                    },
+                    "required": ["client_type"]
+                }
+            }
+        ]
+
+    async def _execute_booking(self, call_sid: str, arguments: dict) -> str:
+        """
+        Execute a booking via MSGraph Bookings API
+
+        Args:
+            call_sid: Call identifier
+            arguments: Function call arguments from LLM
+
+        Returns:
+            Result message to feed back to LLM
+        """
+        import json
+        from datetime import datetime, timedelta
+        from services.calendar.ms_bookings_service import get_calendar_service
+        from services.config.accountants_service import get_accountants_service
+
+        context = self._conversations.get(call_sid)
+        calendar = get_calendar_service()
+        acc_service = get_accountants_service()
+
+        client_type = arguments.get("client_type", "individual")
+        accountant_name = arguments.get("accountant_name", "")
+        date_time_str = arguments.get("date_time", "")
+        customer_name = arguments.get("customer_name", context.caller_name if context else "")
+
+        logger.info(f"Orchestrator: Executing booking - type={client_type}, accountant={accountant_name}, date={date_time_str}, customer={customer_name}")
+
+        # Check if MSGraph is configured
+        if not await calendar.is_available():
+            logger.error("Orchestrator: MS Bookings not configured (missing tenant_id/client_id/secret/business_id)")
+            return "BOOKING_ERROR: Microsoft Bookings is not configured. Please inform the caller that booking is temporarily unavailable and offer to transfer them to a human."
+
+        try:
+            # Look up accountant
+            staff_id = ""
+            service_id = ""
+            if accountant_name:
+                acc = acc_service.get_accountant_by_name(accountant_name)
+                if acc:
+                    staff_id = acc.get("staff_id", "")
+                    service_id = acc.get("service_id", "")
+                    accountant_name = acc.get("name", accountant_name)
+                    logger.info(f"Orchestrator: Found accountant {accountant_name}, staff_id={staff_id}, service_id={service_id}")
+
+            # If no staff/service IDs configured, try to get from MSGraph
+            if not staff_id or not service_id:
+                # Try to get staff members from MSGraph
+                staff_members = await calendar.get_staff_members()
+                if staff_members:
+                    # Match by name
+                    for staff in staff_members:
+                        if accountant_name and accountant_name.lower() in staff.name.lower():
+                            staff_id = staff.id
+                            logger.info(f"Orchestrator: Matched staff from MSGraph: {staff.name} (id={staff.id})")
+                            break
+                    if not staff_id and staff_members:
+                        # Use first available staff
+                        staff_id = staff_members[0].id
+                        logger.info(f"Orchestrator: Using default staff: {staff_members[0].name}")
+
+                # Get services
+                if not service_id:
+                    services = await calendar.get_services()
+                    if services:
+                        # Match service by client type
+                        for svc in services:
+                            if client_type in svc.name.lower() or client_type in svc.description.lower():
+                                service_id = svc.id
+                                break
+                        if not service_id and services:
+                            service_id = services[0].id
+                            logger.info(f"Orchestrator: Using default service: {services[0].name}")
+
+            if not service_id:
+                return "BOOKING_ERROR: Could not find a matching service. Please ask the caller for more details or offer to transfer them."
+
+            # Parse date/time
+            appointment_time = None
+            if date_time_str:
+                # Try to parse common formats
+                from dateutil import parser as date_parser
+                try:
+                    appointment_time = date_parser.parse(date_time_str, fuzzy=True)
+                    # If no date component, assume tomorrow
+                    if appointment_time.date() == datetime.now().date() and "today" not in date_time_str.lower():
+                        appointment_time = appointment_time.replace(
+                            year=datetime.now().year,
+                            month=datetime.now().month,
+                            day=datetime.now().day
+                        ) + timedelta(days=1)
+                except Exception:
+                    logger.warning(f"Orchestrator: Could not parse date: {date_time_str}")
+
+            if not appointment_time:
+                # Default to tomorrow at 10 AM
+                appointment_time = datetime.now().replace(hour=10, minute=0, second=0) + timedelta(days=1)
+
+            # Create the booking
+            result = await calendar.create_booking(
+                service_id=service_id,
+                staff_id=staff_id,
+                start_time=appointment_time,
+                customer_name=customer_name or "Phone Caller",
+                customer_email="",  # Not collected on phone
+                customer_phone=context.phone_number if context else "",
+                notes=f"Booked via AI phone system. Client type: {client_type}"
+            )
+
+            if result.success:
+                logger.info(f"Orchestrator: BOOKING CREATED - id={result.appointment_id}, time={result.start_time}, staff={result.staff_name}")
+                return f"BOOKING_SUCCESS: Appointment booked successfully. Appointment ID: {result.appointment_id}. Time: {result.start_time}. Staff: {result.staff_name or accountant_name}. Customer: {result.customer_name}."
+            else:
+                logger.error(f"Orchestrator: BOOKING FAILED - {result.error_message}")
+                return f"BOOKING_ERROR: Failed to create booking: {result.error_message}. Apologize and offer to transfer to a human."
+
+        except Exception as e:
+            logger.error(f"Orchestrator: Booking exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return f"BOOKING_ERROR: System error while booking: {str(e)}. Apologize and offer to transfer."
+
     async def _get_ai_response(self, call_sid: str, user_input: str) -> str:
         """
-        Get AI response for user input
-
-        NOW INCLUDES CONVERSATION HISTORY (Phase 1.2 fix)
+        Get AI response for user input, with function calling support for bookings.
 
         Args:
             call_sid: Call identifier
@@ -617,33 +770,81 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         ]
 
         # Add conversation history from context
-        # This gives the LLM context about what was discussed
         history = context.get_history_for_llm()
         for msg in history:
-            # Convert to Message objects
             if msg["role"] == "user":
                 messages.append(Message(role=LLMRole.USER, content=msg["content"]))
             elif msg["role"] == "assistant":
                 messages.append(Message(role=LLMRole.ASSISTANT, content=msg["content"]))
 
         # Note: user_input is already in history (added in process_transcript)
-        # So we don't need to add it again here
 
-        # Get streaming response
+        # =====================================================
+        # USE FUNCTION CALLING FOR BOOKING SUPPORT
+        # =====================================================
         from services.llm.llm_base import LLMRequest, LLMChunk
 
+        tools = self._get_booking_tools()
+
+        # First try with tools (non-streaming to detect function calls)
         request = LLMRequest(
             messages=messages,
             temperature=0.7,
-            max_tokens=300,  # Keep responses short for phone
-            stream=True
+            max_tokens=300,
+            stream=False,
+            tools=tools
         )
 
-        full_response = ""
-        async for chunk in self.llm.chat_stream(request):
-            full_response += chunk.delta
+        try:
+            llm_response = await self.llm.chat_with_tools(request)
 
-        response = full_response.strip()
+            # Check if the LLM wants to call a function
+            if llm_response.tool_calls:
+                for tool_call in llm_response.tool_calls:
+                    if tool_call["name"] == "book_appointment":
+                        import json as _json
+                        arguments = _json.loads(tool_call["arguments"])
+                        logger.info(f"Orchestrator: LLM requested booking: {arguments}")
+
+                        # Execute the booking
+                        booking_result = await self._execute_booking(call_sid, arguments)
+
+                        # Feed result back to LLM for a natural response
+                        messages.append(Message(role=LLMRole.ASSISTANT, content=llm_response.content or ""))
+                        # Add tool result as a user message (simplified approach)
+                        messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Now respond naturally to the caller about the booking result. Keep it brief.]"))
+
+                        # Get final response (streaming, no tools)
+                        follow_up_request = LLMRequest(
+                            messages=messages,
+                            temperature=0.7,
+                            max_tokens=200,
+                            stream=True
+                        )
+                        full_response = ""
+                        async for chunk in self.llm.chat_stream(follow_up_request):
+                            full_response += chunk.delta
+
+                        response = full_response.strip()
+                        context.add_assistant_message(response)
+                        return response
+
+            # No tool calls - use the direct text response
+            response = llm_response.content.strip()
+
+        except Exception as e:
+            logger.error(f"Orchestrator: Function calling failed, falling back to streaming: {e}")
+            # Fallback to streaming without tools
+            request = LLMRequest(
+                messages=messages,
+                temperature=0.7,
+                max_tokens=300,
+                stream=True
+            )
+            full_response = ""
+            async for chunk in self.llm.chat_stream(request):
+                full_response += chunk.delta
+            response = full_response.strip()
 
         # =====================================================
         # ADD ASSISTANT RESPONSE TO HISTORY (Phase 1.2)
@@ -688,7 +889,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             request = TTSRequest(
                 text=text,
                 language=language,
-                voice_id="Rachel"  # Can be customized per language
+                voice_id=None  # Uses default_voice_id from TTS settings (ELEVENLABS_VOICE_ID env)
             )
 
             logger.info(f"Orchestrator: Synthesizing TTS...")
