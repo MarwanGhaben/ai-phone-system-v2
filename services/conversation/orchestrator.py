@@ -785,39 +785,42 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                             break
 
                 if not slot_match:
-                    # Requested time is NOT available - find alternatives on the same day
+                    # Requested time is NOT available - find alternatives
                     same_day_slots = [s for s in available_slots if s.start_time.date() == requested_date]
 
                     staff_display = matched_staff_name or accountant_name or "the accountant"
+                    # Full date+time format: "Friday, January 30 at 2:00 PM"
+                    full_fmt = '%A, %B %d at %I:%M %p'
 
                     if same_day_slots:
-                        # There are other slots on that day
-                        alt_times = ", ".join([s.start_time.strftime('%I:%M %p') for s in same_day_slots[:5]])
+                        # There are other slots on that day — show full date + time for each
+                        alt_times = ", ".join([s.start_time.strftime(full_fmt) for s in same_day_slots[:5]])
                         logger.info(f"Orchestrator: Requested time not available. Alternatives on same day: {alt_times}")
                         return (
-                            f"BOOKING_UNAVAILABLE: The requested time ({appointment_time.strftime('%A, %B %d at %I:%M %p')}) "
+                            f"BOOKING_UNAVAILABLE: The requested time ({appointment_time.strftime(full_fmt)}) "
                             f"is not available for {staff_display}. "
-                            f"Available times on {appointment_time.strftime('%A, %B %d')}: {alt_times}. "
+                            f"Available slots: {alt_times}. "
                             f"Please ask the caller which of these times works for them."
                         )
                     else:
-                        # No slots at all on that day
-                        # Find next available days
-                        next_days = {}
+                        # No slots at all on that day — show next available with full date + time
+                        next_slots = []
+                        seen_days = set()
                         for s in available_slots:
-                            day_key = s.start_time.strftime('%A, %B %d')
-                            if day_key not in next_days:
-                                next_days[day_key] = s.start_time.strftime('%I:%M %p')
-                            if len(next_days) >= 3:
+                            day_key = s.start_time.date()
+                            if day_key not in seen_days:
+                                next_slots.append(s.start_time.strftime(full_fmt))
+                                seen_days.add(day_key)
+                            if len(seen_days) >= 3:
                                 break
 
-                        if next_days:
-                            alt_info = "; ".join([f"{day} at {time}" for day, time in next_days.items()])
+                        if next_slots:
+                            alt_info = ", ".join(next_slots)
                             logger.info(f"Orchestrator: No slots on requested day. Next available: {alt_info}")
                             return (
                                 f"BOOKING_UNAVAILABLE: {staff_display} has no availability on "
                                 f"{appointment_time.strftime('%A, %B %d')}. "
-                                f"Next available times: {alt_info}. "
+                                f"Next available slots: {alt_info}. "
                                 f"Please ask the caller if any of these work."
                             )
                         else:
