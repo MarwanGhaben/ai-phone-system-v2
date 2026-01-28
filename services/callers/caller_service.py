@@ -168,15 +168,15 @@ class CallerRecognitionService:
         if caller_name:
             # Returning caller
             if language == "ar":
-                return f"مرحباً {caller_name}! سعيد بالحديث معك مرة أخرى. كيف يمكنني مساعدتك اليوم؟"
+                return f"هلا {caller_name}! أنا أمل من فليكسبل أكاونتنغ، أهلاً فيك مرة ثانية. كيف أقدر أساعدك اليوم؟"
             else:
-                return f"Hi {caller_name}! Great to talk with you again. How can I help you today?"
+                return f"Hey {caller_name}! It's Amal from Flexible Accounting, great to hear from you again. How can I help you today?"
         else:
             # New caller - ask for name
             if language == "ar":
-                return "أهلاً بك! أنا المساعد الصوتي لشركة iFlex Tax. هل لي باسمك من فضلك؟"
+                return "هلا والله! أنا أمل من فليكسبل أكاونتنغ، كيف أقدر أساعدك اليوم؟ ممكن أعرف اسمك الكريم؟"
             else:
-                return "Hi! I'm the AI assistant for iFlex Tax. May I have your name please?"
+                return "Hi there! I'm Amal from Flexible Accounting. How can I help you today? And may I have your name please?"
 
     def get_all_callers(self) -> Dict:
         """Get all caller data"""

@@ -202,7 +202,13 @@ class ConversationOrchestrator:
         accountant_names_en = acc_service.get_names_formatted("en")
         accountant_names_ar = acc_service.get_names_formatted("ar")
 
-        return f"""You are a professional phone receptionist for iFlex Tax, a Canadian accounting firm.
+        return f"""You are Amal, a friendly and professional phone receptionist for Flexible Accounting (also known as iFlex Tax), a Canadian accounting firm.
+
+YOUR IDENTITY:
+- Your name is Amal
+- You work at Flexible Accounting
+- Be warm, natural, and human - like a real person, not a robot
+- Use casual but professional tone
 
 YOUR ROLE:
 - Be the first point of contact for callers
@@ -231,7 +237,9 @@ APPOINTMENT BOOKING:
 - Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
 - Once you have client type + date/time, use the book_appointment function to ACTUALLY create the booking
-- IMPORTANT: Do NOT tell the caller "I've booked it" unless you have called the book_appointment function
+- The system will CHECK AVAILABILITY automatically before booking
+- If the system returns BOOKING_UNAVAILABLE, tell the caller the requested time is not available and suggest the alternative times provided
+- IMPORTANT: Do NOT tell the caller "I've booked it" unless you have called the book_appointment function and received BOOKING_SUCCESS
 - If booking fails, apologize and offer to transfer to a human
 
 WHEN TO TRANSFER:
@@ -623,6 +631,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         """
         Execute a booking via MSGraph Bookings API
 
+        Checks availability BEFORE creating the appointment.
+
         Args:
             call_sid: Call identifier
             arguments: Function call arguments from LLM
@@ -655,6 +665,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Look up accountant
             staff_id = ""
             service_id = ""
+            matched_staff_name = ""
             if accountant_name:
                 acc = acc_service.get_accountant_by_name(accountant_name)
                 if acc:
@@ -668,15 +679,27 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 # Try to get staff members from MSGraph
                 staff_members = await calendar.get_staff_members()
                 if staff_members:
-                    # Match by name
-                    for staff in staff_members:
-                        if accountant_name and accountant_name.lower() in staff.name.lower():
-                            staff_id = staff.id
-                            logger.info(f"Orchestrator: Matched staff from MSGraph: {staff.name} (id={staff.id})")
-                            break
+                    # Match by name (partial match, case-insensitive)
+                    if accountant_name:
+                        name_lower = accountant_name.lower()
+                        for staff in staff_members:
+                            staff_name_lower = staff.name.lower()
+                            # Check both directions for partial match
+                            if name_lower in staff_name_lower or staff_name_lower in name_lower:
+                                staff_id = staff.id
+                                matched_staff_name = staff.name
+                                logger.info(f"Orchestrator: Matched staff from MSGraph: {staff.name} (id={staff.id})")
+                                break
+                            # Also check first name match
+                            if name_lower.split()[0] in staff_name_lower.split() if name_lower.split() else False:
+                                staff_id = staff.id
+                                matched_staff_name = staff.name
+                                logger.info(f"Orchestrator: Matched staff by first name: {staff.name} (id={staff.id})")
+                                break
                     if not staff_id and staff_members:
                         # Use first available staff
                         staff_id = staff_members[0].id
+                        matched_staff_name = staff_members[0].name
                         logger.info(f"Orchestrator: Using default staff: {staff_members[0].name}")
 
                 # Get services
@@ -715,6 +738,86 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             if not appointment_time:
                 # Default to tomorrow at 10 AM
                 appointment_time = datetime.now().replace(hour=10, minute=0, second=0) + timedelta(days=1)
+
+            # =====================================================
+            # CHECK AVAILABILITY BEFORE BOOKING
+            # =====================================================
+            logger.info(f"Orchestrator: Checking availability for staff={matched_staff_name or accountant_name}, date={appointment_time}")
+            available_slots = await calendar.get_available_slots(
+                service_id=service_id,
+                staff_id=staff_id,
+                days_ahead=7
+            )
+
+            if available_slots:
+                # Check if the requested time falls within any available slot
+                requested_date = appointment_time.date()
+                requested_hour = appointment_time.hour
+                requested_minute = appointment_time.minute
+
+                slot_match = False
+                for slot in available_slots:
+                    slot_date = slot.start_time.date()
+                    slot_start_hour = slot.start_time.hour
+                    slot_start_min = slot.start_time.minute
+                    slot_end_hour = slot.end_time.hour
+                    slot_end_min = slot.end_time.minute
+
+                    if slot_date == requested_date:
+                        # Check if requested time is within this slot
+                        req_minutes = requested_hour * 60 + requested_minute
+                        slot_start_minutes = slot_start_hour * 60 + slot_start_min
+                        slot_end_minutes = slot_end_hour * 60 + slot_end_min
+                        if slot_start_minutes <= req_minutes < slot_end_minutes:
+                            slot_match = True
+                            break
+
+                if not slot_match:
+                    # Requested time is NOT available - find alternatives on the same day
+                    same_day_slots = [s for s in available_slots if s.start_time.date() == requested_date]
+
+                    staff_display = matched_staff_name or accountant_name or "the accountant"
+
+                    if same_day_slots:
+                        # There are other slots on that day
+                        alt_times = ", ".join([s.start_time.strftime('%I:%M %p') for s in same_day_slots[:5]])
+                        logger.info(f"Orchestrator: Requested time not available. Alternatives on same day: {alt_times}")
+                        return (
+                            f"BOOKING_UNAVAILABLE: The requested time ({appointment_time.strftime('%A, %B %d at %I:%M %p')}) "
+                            f"is not available for {staff_display}. "
+                            f"Available times on {appointment_time.strftime('%A, %B %d')}: {alt_times}. "
+                            f"Please ask the caller which of these times works for them."
+                        )
+                    else:
+                        # No slots at all on that day
+                        # Find next available days
+                        next_days = {}
+                        for s in available_slots:
+                            day_key = s.start_time.strftime('%A, %B %d')
+                            if day_key not in next_days:
+                                next_days[day_key] = s.start_time.strftime('%I:%M %p')
+                            if len(next_days) >= 3:
+                                break
+
+                        if next_days:
+                            alt_info = "; ".join([f"{day} at {time}" for day, time in next_days.items()])
+                            logger.info(f"Orchestrator: No slots on requested day. Next available: {alt_info}")
+                            return (
+                                f"BOOKING_UNAVAILABLE: {staff_display} has no availability on "
+                                f"{appointment_time.strftime('%A, %B %d')}. "
+                                f"Next available times: {alt_info}. "
+                                f"Please ask the caller if any of these work."
+                            )
+                        else:
+                            logger.info(f"Orchestrator: No availability found at all for {staff_display}")
+                            return (
+                                f"BOOKING_UNAVAILABLE: {staff_display} has no available slots in the next 7 days. "
+                                f"Please apologize and offer to transfer the caller to speak with someone directly."
+                            )
+            else:
+                logger.warning("Orchestrator: Could not fetch availability slots - proceeding with booking attempt")
+                # If we can't check availability (API issue), still try to book
+                # The booking API itself will reject if the slot is taken
 
             # Create the booking
             result = await calendar.create_booking(
