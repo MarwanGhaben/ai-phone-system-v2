@@ -198,9 +198,14 @@ class ConversationOrchestrator:
         """Get system prompt for LLM"""
         # Get accountant names from service
         from services.config.accountants_service import get_accountants_service
+        from datetime import datetime
         acc_service = get_accountants_service()
         accountant_names_en = acc_service.get_names_formatted("en")
         accountant_names_ar = acc_service.get_names_formatted("ar")
+
+        # Inject today's date so the LLM can calculate correct dates
+        today = datetime.now()
+        today_str = today.strftime('%A, %B %d, %Y')  # e.g. "Friday, January 30, 2026"
 
         return f"""You are Amal, a friendly and professional phone receptionist for Flexible Accounting (also known as iFlex Tax), a Canadian accounting firm.
 
@@ -209,6 +214,12 @@ YOUR IDENTITY:
 - You work at Flexible Accounting
 - Be warm, natural, and human - like a real person, not a robot
 - Use casual but professional tone
+
+TODAY'S DATE: {today_str}
+Use this to calculate correct dates. For example if today is Friday January 30, then:
+- "tomorrow" = Saturday, January 31
+- "Monday" or "next Monday" = Monday, February 02
+- "next week Tuesday" = Tuesday, February 03
 
 YOUR ROLE:
 - Be the first point of contact for callers
@@ -236,9 +247,10 @@ APPOINTMENT BOOKING:
 - Ask: Individual or corporate client?
 - Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
-- Once you have client type + date/time, use the book_appointment function to ACTUALLY create the booking
+- CRITICAL: When calling book_appointment, the date_time parameter MUST be in English format like "2026-02-02 15:00" (YYYY-MM-DD HH:MM). Use today's date ({today_str}) to calculate the correct date. NEVER pass Arabic text as date_time.
+- CRITICAL: When calling book_appointment, the accountant_name parameter MUST be the English name (e.g. "Hussam Saadaldin", "Rami Kahwaji", "Abdul ElFarra"). NEVER pass Arabic names.
 - The system will CHECK AVAILABILITY automatically before booking
-- If the system returns BOOKING_UNAVAILABLE, tell the caller the requested time is not available and suggest the alternative times provided
+- If the system returns BOOKING_UNAVAILABLE, read the suggested dates/times EXACTLY as provided - do NOT change or guess dates. Tell the caller the exact alternatives.
 - IMPORTANT: Do NOT tell the caller "I've booked it" unless you have called the book_appointment function and received BOOKING_SUCCESS
 - If booking fails, apologize and offer to transfer to a human
 
@@ -623,11 +635,11 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         },
                         "accountant_name": {
                             "type": "string",
-                            "description": "Preferred accountant name (e.g. Hussam Saadaldin, Rami Kahwaji, Abdul ElFarra)"
+                            "description": "Preferred accountant name in ENGLISH only. Must be one of: Hussam Saadaldin, Rami Kahwaji, Abdul ElFarra"
                         },
                         "date_time": {
                             "type": "string",
-                            "description": "Preferred date and time in natural language (e.g. 'tomorrow at 2 PM', 'next Monday 10 AM')"
+                            "description": "Preferred date and time in YYYY-MM-DD HH:MM format (24-hour). Example: '2026-02-02 15:00'. Calculate the correct date based on today's date. NEVER pass Arabic text."
                         },
                         "customer_name": {
                             "type": "string",
@@ -733,23 +745,38 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Parse date/time
             appointment_time = None
             if date_time_str:
-                # Try to parse common formats
-                from dateutil import parser as date_parser
-                try:
-                    appointment_time = date_parser.parse(date_time_str, fuzzy=True)
-                    # If no date component, assume tomorrow
-                    if appointment_time.date() == datetime.now().date() and "today" not in date_time_str.lower():
-                        appointment_time = appointment_time.replace(
-                            year=datetime.now().year,
-                            month=datetime.now().month,
-                            day=datetime.now().day
-                        ) + timedelta(days=1)
-                except Exception:
-                    logger.warning(f"Orchestrator: Could not parse date: {date_time_str}")
+                # Try ISO format first (YYYY-MM-DD HH:MM) - this is what we instruct the LLM to use
+                import re
+                iso_match = re.match(r'(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})', date_time_str)
+                if iso_match:
+                    try:
+                        appointment_time = datetime(
+                            int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)),
+                            int(iso_match.group(4)), int(iso_match.group(5))
+                        )
+                        logger.info(f"Orchestrator: Parsed ISO date: {appointment_time}")
+                    except ValueError as e:
+                        logger.warning(f"Orchestrator: Invalid ISO date values: {date_time_str} - {e}")
+
+                # Fallback to dateutil for English natural language
+                if not appointment_time:
+                    from dateutil import parser as date_parser
+                    try:
+                        appointment_time = date_parser.parse(date_time_str, fuzzy=True)
+                        logger.info(f"Orchestrator: Parsed with dateutil: {appointment_time}")
+                        # If parsed date is in the past, it's likely wrong
+                        if appointment_time < datetime.now():
+                            logger.warning(f"Orchestrator: Parsed date {appointment_time} is in the past, adjusting to next week")
+                            appointment_time += timedelta(days=7)
+                    except Exception:
+                        logger.warning(f"Orchestrator: Could not parse date: {date_time_str}")
 
             if not appointment_time:
                 # Default to tomorrow at 10 AM
-                appointment_time = datetime.now().replace(hour=10, minute=0, second=0) + timedelta(days=1)
+                appointment_time = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                logger.warning(f"Orchestrator: Using default appointment time: {appointment_time}")
+
+            logger.info(f"Orchestrator: Final appointment time: {appointment_time} (from input: '{date_time_str}')")
 
             # =====================================================
             # CHECK AVAILABILITY BEFORE BOOKING

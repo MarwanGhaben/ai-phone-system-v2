@@ -50,8 +50,12 @@ class AccountantsService:
             self._accountants_by_name = {}
 
             for acc in self._accountants:
-                # Add main name
+                # Add main name (English)
                 self._accountants_by_name[acc['name'].lower()] = acc
+
+                # Add Arabic name if present
+                if acc.get('name_ar'):
+                    self._accountants_by_name[acc['name_ar']] = acc
 
                 # Add aliases if present (for name variations like "Hossam" vs "Hussam")
                 for alias in acc.get('aliases', []):
