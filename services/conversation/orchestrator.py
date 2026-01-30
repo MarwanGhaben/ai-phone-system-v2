@@ -276,6 +276,15 @@ LANGUAGE DETECTION:
 - Keep Arabic responses brief and natural
 - Use simple, conversational Arabic
 
+CRITICAL - ARABIC NUMBER/TIME PRONUNCIATION:
+- When speaking Arabic, ALWAYS write times and dates using Arabic words, NOT digits
+- NEVER use "02:30 PM" or "10:00 AM" in Arabic responses — the voice system cannot pronounce them
+- Instead say: "الساعة الثانية والنصف بعد الظهر" (2:30 PM) or "الساعة العاشرة صباحاً" (10:00 AM)
+- For days use Arabic: الاثنين، الثلاثاء، الأربعاء، الخميس، الجمعة، السبت، الأحد
+- For months use Arabic: يناير، فبراير، مارس، أبريل، etc.
+- Write all numbers as Arabic words: واحد، اثنين، ثلاثة، etc.
+- Example: instead of "Monday, February 02 at 2:30 PM", say "يوم الاثنين الثاني من فبراير الساعة الثانية والنصف بعد الظهر"
+
 CALLER NAME REGISTRATION:
 - CRITICAL: When the caller tells you their name, you MUST IMMEDIATELY call the register_caller_name tool. Do NOT just acknowledge the name — call the tool FIRST, then respond.
 - Only register real human names (e.g. "مروان", "Marwan", "Ahmed", "أحمد")
@@ -680,6 +689,12 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         response = await self._get_ai_response(call_sid, transcript)
 
+        # Check if transfer was already handled (don't speak the marker)
+        if response == "__TRANSFER_HANDLED__":
+            async with state_lock:
+                context.state = ConversationState.LISTENING
+            return
+
         context.ai_response = response
         context.turn_count += 1
 
@@ -748,6 +763,20 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         }
                     },
                     "required": ["caller_name"]
+                }
+            },
+            {
+                "name": "transfer_to_human",
+                "description": "Transfer the call to a human staff member. Call this when the caller asks to speak with a person, wants to be transferred, or when you cannot help them further. Works for both Arabic and English requests.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "Brief reason for the transfer"
+                        }
+                    },
+                    "required": ["reason"]
                 }
             }
         ]
@@ -1186,6 +1215,16 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         context.add_assistant_message(response)
                         return response
 
+                    # --- Transfer to human ---
+                    if tool_name == "transfer_to_human":
+                        reason = arguments.get("reason", "caller request")
+                        logger.info(f"Orchestrator: LLM triggered transfer - reason: {reason}")
+                        await self._handle_transfer(call_sid)
+                        # _handle_transfer already spoke to the caller
+                        # Return a marker so the outer code skips speaking
+                        context.add_assistant_message("[transferred to human]")
+                        return "__TRANSFER_HANDLED__"
+
                     # --- Booking tools ---
                     if tool_name in ("check_appointment", "confirm_appointment"):
                         # Execute the appropriate booking step
@@ -1267,6 +1306,12 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             return
 
         try:
+            # Pre-process Arabic text: convert numbers/times to Arabic words
+            # so TTS can pronounce them naturally instead of garbled nonsense
+            if language == "ar":
+                from services.audio.arabic_text_processor import process_arabic_text
+                text = process_arabic_text(text)
+
             # Stream TTS
             from services.tts.tts_base import TTSRequest, TTSChunk
 
@@ -1450,10 +1495,72 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         await self.end_call(call_sid)
 
     async def _handle_transfer(self, call_sid: str) -> None:
-        """Handle transfer to human intent"""
-        logger.info(f"Orchestrator: Call {call_sid} transferring to human")
-        # TODO: Implement transfer logic
-        await self.end_call(call_sid)
+        """
+        Handle transfer to human by redirecting the Twilio call
+        to the configured transfer phone number using TwiML <Dial>.
+        """
+        context = self._conversations.get(call_sid)
+        settings = get_settings()
+        transfer_number = settings.transfer_phone_number
+
+        logger.info(f"Orchestrator: Call {call_sid} transferring to human, target={transfer_number}")
+
+        if not transfer_number:
+            logger.warning("Orchestrator: No TRANSFER_PHONE_NUMBER configured — cannot transfer")
+            # Tell caller we can't transfer right now
+            lang = context.language if context else "en"
+            if lang == "ar":
+                msg = "عذراً، لا يمكنني تحويلك حالياً. هل يمكنني مساعدتك بشيء آخر؟"
+            else:
+                msg = "I'm sorry, I'm unable to transfer you right now. Can I help you with something else?"
+            await self._speak_to_caller(call_sid, msg, lang)
+            return
+
+        # Tell the caller we're transferring
+        lang = context.language if context else "en"
+        if lang == "ar":
+            transfer_msg = "بالتأكيد، سأحولك الآن. لحظة من فضلك."
+        else:
+            transfer_msg = "Of course, let me transfer you now. One moment please."
+
+        await self._speak_to_caller(call_sid, transfer_msg, lang)
+
+        # Use Twilio REST API to update the call with <Dial> TwiML
+        try:
+            import httpx
+
+            twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Calls/{call_sid}.json"
+
+            # TwiML that dials the transfer number
+            transfer_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Dial callerId="{settings.twilio_phone_number}" timeout="30">
+        <Number>{transfer_number}</Number>
+    </Dial>
+    <Say>The person you're trying to reach is unavailable. Goodbye.</Say>
+</Response>'''
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    twilio_url,
+                    auth=(settings.twilio_account_sid, settings.twilio_auth_token),
+                    data={"Twiml": transfer_twiml}
+                )
+
+                if response.status_code == 200:
+                    logger.info(f"Orchestrator: Call {call_sid} successfully redirected to {transfer_number}")
+                else:
+                    logger.error(f"Orchestrator: Failed to redirect call: {response.status_code} - {response.text}")
+                    if lang == "ar":
+                        msg = "عذراً، حدث خطأ أثناء التحويل. هل يمكنني مساعدتك بشيء آخر؟"
+                    else:
+                        msg = "I'm sorry, there was an error transferring. Can I help you with something else?"
+                    await self._speak_to_caller(call_sid, msg, lang)
+
+        except Exception as e:
+            logger.error(f"Orchestrator: Transfer exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     async def end_call(self, call_sid: str) -> None:
         """

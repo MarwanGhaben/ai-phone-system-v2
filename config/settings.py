@@ -142,6 +142,11 @@ class Settings(BaseSettings):
     telnyx_phone_number: str = Field(default="", alias="TELNYX_PHONE_NUMBER")
 
     # =====================================================
+    # CALL TRANSFER
+    # =====================================================
+    transfer_phone_number: str = Field(default="", alias="TRANSFER_PHONE_NUMBER")
+
+    # =====================================================
     # FEATURES
     # =====================================================
     enable_analytics: bool = Field(default=True, alias="ENABLE_ANALYTICS")
