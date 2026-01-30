@@ -84,7 +84,9 @@ class CallerRecognitionService:
         return caller.get("language") if caller else None
 
     def get_caller_info(self, phone_number: str) -> Optional[Dict]:
-        """Get full caller info"""
+        """Get full caller info (reloads from disk to handle multi-worker)"""
+        # Reload from disk in case another worker saved new data
+        self._load_callers()
         return self._callers.get(phone_number)
 
     def register_caller(self, phone_number: str, name: str, language: str = "en") -> Dict:

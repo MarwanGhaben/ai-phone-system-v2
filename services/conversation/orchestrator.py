@@ -557,19 +557,21 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # =====================================================
         # LANGUAGE DETECTION (auto-detect from first response)
         # =====================================================
-        if context.language == "auto" and language:
-            context.language = language
-            logger.info(f"Orchestrator: Auto-detected language: {language}")
+        # Arabic characters are a DEFINITIVE signal — always check first,
+        # because STT may return language="en" even for Arabic text
+        import re
+        has_arabic = bool(re.search(r'[\u0600-\u06FF]', transcript))
 
-        # If language is still "auto", try to detect from transcript content
-        if context.language == "auto":
-            import re
-            # Check for Arabic characters
-            if re.search(r'[\u0600-\u06FF]', transcript):
-                context.language = "ar"
+        if has_arabic:
+            context.language = "ar"
+            logger.info(f"Orchestrator: Detected Arabic from text content")
+        elif context.language == "auto":
+            if language and language != "auto":
+                context.language = language
+                logger.info(f"Orchestrator: Auto-detected language from STT: {language}")
             else:
                 context.language = "en"
-            logger.info(f"Orchestrator: Fallback language detection from text: {context.language}")
+                logger.info(f"Orchestrator: Defaulting to English")
 
         # =====================================================
         # ADD USER MESSAGE TO CONVERSATION HISTORY (Phase 1.2)
