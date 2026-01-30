@@ -230,7 +230,11 @@ async def incoming_call(request: Request):
         phone_number=settings.twilio_phone_number
     )
 
-    twiml = await twilio.generate_twiml(ws_url)
+    # Extract caller's phone number from Twilio webhook params
+    caller_number = request.query_params.get("From", request.query_params.get("Caller", ""))
+    logger.info(f"Incoming call from: {caller_number}")
+
+    twiml = await twilio.generate_twiml(ws_url, caller_number=caller_number)
 
     # Log the WebSocket URL being sent to Twilio
     print(f"DEBUG: FINAL WebSocket URL: {ws_url}")

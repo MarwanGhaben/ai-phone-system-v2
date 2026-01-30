@@ -274,17 +274,23 @@ class MSBookingsService(CalendarServiceBase):
 
             endpoint = f"/solutions/bookingBusinesses/{self.business_id}/getStaffAvailability"
 
-            start_date = datetime.now(timezone.utc) + timedelta(hours=1)
+            # Use Eastern Time to match the business calendar timezone
+            # This ensures slot times returned match local business hours
+            windows_timezone = "Eastern Standard Time"
+
+            # Use current time in a reasonable local approximation
+            # We send local date range; MSGraph interprets in the specified timezone
+            start_date = datetime.now() + timedelta(hours=1)
             end_date = start_date + timedelta(days=days_ahead)
 
             payload = {
                 "startDateTime": {
                     "dateTime": start_date.strftime('%Y-%m-%dT%H:%M:%S'),
-                    "timeZone": "UTC"
+                    "timeZone": windows_timezone
                 },
                 "endDateTime": {
                     "dateTime": end_date.strftime('%Y-%m-%dT%H:%M:%S'),
-                    "timeZone": "UTC"
+                    "timeZone": windows_timezone
                 },
                 "staffIds": staff_ids
             }
@@ -309,8 +315,13 @@ class MSBookingsService(CalendarServiceBase):
                             end_time_str = item.get('endDateTime', {}).get('dateTime', '')
 
                             if start_time_str and end_time_str:
+                                # Parse and strip timezone info to get naive datetime
+                                # (times are already in Eastern since we requested Eastern timezone)
                                 start_dt = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
                                 end_dt = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+                                # Make naive for consistent comparison with user-provided times
+                                start_dt = start_dt.replace(tzinfo=None)
+                                end_dt = end_dt.replace(tzinfo=None)
 
                                 # Generate 30-minute slots
                                 current_slot = start_dt

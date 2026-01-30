@@ -446,7 +446,7 @@ class TwilioService:
             )
         return self._client
 
-    async def generate_twiml(self, websocket_url: str) -> str:
+    async def generate_twiml(self, websocket_url: str, caller_number: str = "") -> str:
         """
         Generate TwiML for connecting to Media Stream
 
@@ -455,14 +455,21 @@ class TwilioService:
 
         Args:
             websocket_url: WebSocket URL for Media Stream
+            caller_number: Caller's phone number to pass as custom parameter
 
         Returns:
             TwiML as string
         """
+        # Pass caller number as a custom parameter so the WebSocket handler can access it
+        param_tag = ""
+        if caller_number:
+            param_tag = f'\n            <Parameter name="callerNumber" value="{caller_number}" />'
+
         twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="{websocket_url}" />
+        <Stream url="{websocket_url}">{param_tag}
+        </Stream>
     </Connect>
 </Response>'''
         return twiml

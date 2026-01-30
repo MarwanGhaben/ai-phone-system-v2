@@ -1211,13 +1211,27 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         # Arabic patterns (basic)
         # "أنا أحمد" → "أحمد"
-        if "أنا " in transcript or "انا " in transcript:
+        # Blacklist: common Arabic words that are NOT names
+        arabic_non_names = {
+            "عميل", "عملاء", "فردي", "شركة", "موعد", "حجز",
+            "محاسب", "محاسبة", "مساعدة", "سؤال", "استفسار",
+            "شخص", "زبون", "بحاجة", "أريد", "اريد", "أبغى",
+            "أحتاج", "احتاج", "عندي", "بدي", "أبي", "ابي",
+            "هنا", "كذلك", "أيضا", "جديد", "قديم",
+            "من", "في", "على", "إلى", "مع", "عن",
+            "لا", "نعم", "أي", "هذا", "هذه", "ذلك",
+            "واحد", "اثنين", "يوم", "وقت", "ساعة",
+        }
+
+        if "أنا " in transcript or "انا " in transcript or "اسمي " in transcript:
             parts = transcript.split()
             for i, part in enumerate(parts):
                 if part in ["أنا", "انا", "اسمي"]:
-                    if i + 1 < len(parts):
-                        name = parts[i + 1]
-                        return name
+                    # Look at next words, skip non-name words
+                    for j in range(i + 1, min(i + 3, len(parts))):
+                        candidate = parts[j]
+                        if candidate not in arabic_non_names and len(candidate) > 1:
+                            return candidate
 
         return None
 
