@@ -187,6 +187,10 @@ class ConversationOrchestrator:
         # Barge-in detection
         self._energy_threshold: float = settings.interruption_energy_threshold
 
+        # Echo guard: tracks when audio playback is expected to finish per call
+        # During this window, STT transcripts are ignored (echo from phone speaker)
+        self._echo_guard_until: Dict[str, float] = {}
+
         # System prompt for the AI
         self._system_prompt = self._get_system_prompt()
 
@@ -495,6 +499,14 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 # Skip STT while AI is speaking (prevents echo)
                 return
 
+            # ECHO GUARD: Don't feed audio to STT while our audio is still
+            # playing through the caller's phone speaker (prevents echo loop)
+            import time
+            echo_guard_end = self._echo_guard_until.get(call_sid, 0)
+            if time.time() < echo_guard_end:
+                # Don't feed to STT — this is likely our own audio echoing back
+                return
+
             # Stream to this call's STT instance
             from services.stt.stt_base import AudioChunk
             await call_stt.stream_audio(AudioChunk(data=audio_data))
@@ -578,6 +590,17 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Ignoring transcript while AI speaking: '{transcript}'")
             return
 
+        # ECHO GUARD: Ignore transcripts during audio playback window
+        # Even after state goes to LISTENING, audio is still playing through
+        # the phone speaker. The caller's phone mic picks this up as echo,
+        # which STT transcribes as garbled text (e.g., Ol Chiki script).
+        import time
+        echo_guard_end = self._echo_guard_until.get(call_sid, 0)
+        if time.time() < echo_guard_end:
+            remaining = echo_guard_end - time.time()
+            logger.info(f"Orchestrator: Ignoring transcript during echo guard ({remaining:.1f}s remaining): '{transcript[:50]}'")
+            return
+
         logger.info(f"Orchestrator: User said: {transcript}")
 
         # =====================================================
@@ -596,6 +619,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             r'\u0A00-\u0A7F'    # Gurmukhi (Punjabi)
             r'\u0B80-\u0BFF'    # Tamil
             r'\u0C00-\u0C7F'    # Telugu
+            r'\u1C50-\u1C7F'    # Ol Chiki (Santali) — common STT echo artifact
             r'\u3040-\u309F'    # Hiragana (Japanese)
             r'\u30A0-\u30FF'    # Katakana (Japanese)
             r'\u4E00-\u9FFF]',  # CJK (Chinese)
@@ -1346,6 +1370,13 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             await twilio_handler.send_audio(mulaw_audio)
             logger.info(f"Orchestrator: Audio sent to Twilio successfully")
 
+            # SET ECHO GUARD: Calculate how long audio will play through phone speaker
+            # μ-law 8kHz = 8000 bytes/sec. Add 1.5s buffer for phone echo tail.
+            import time
+            audio_duration = len(mulaw_audio) / 8000.0
+            self._echo_guard_until[call_sid] = time.time() + audio_duration + 1.5
+            logger.info(f"Orchestrator: Echo guard set for {audio_duration + 1.5:.1f}s (audio={audio_duration:.1f}s + 1.5s buffer)")
+
         except Exception as e:
             logger.error(f"Orchestrator: Exception in _speak_to_caller: {e}")
             logger.error(f"Orchestrator: Traceback:\n{traceback.format_exc()}")
@@ -1600,6 +1631,10 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Disconnecting call-specific STT for {call_sid}")
             await self._call_stt_instances[call_sid].disconnect()
             del self._call_stt_instances[call_sid]
+
+        # Clean up echo guard
+        if call_sid in self._echo_guard_until:
+            del self._echo_guard_until[call_sid]
 
         # Clean up state lock
         if call_sid in self._call_state_locks:
