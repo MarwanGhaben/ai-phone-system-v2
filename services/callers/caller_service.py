@@ -172,17 +172,17 @@ class CallerRecognitionService:
             # Returning caller — greet in their preferred language
             lang = caller_language or language
             if lang == "ar":
-                return f"هلا {caller_name}! أنا أمل من فليكسبل أكاونتنغ، أهلاً فيك مرة ثانية. كيف أقدر أساعدك اليوم؟"
+                return f"هلا {caller_name}! أنا سارة من فليكسبل أكاونتنغ، أهلاً فيك مرة ثانية. كيف أقدر أساعدك اليوم؟"
             else:
-                return f"Hey {caller_name}! It's Amal from Flexible Accounting, great to hear from you again. How can I help you today?"
+                return f"Hey {caller_name}! It's Sarah from Flexible Accounting, great to hear from you again. How can I help you today?"
         else:
             # New caller — bilingual greeting, ask for language preference
             return (
                 "Hi, thank you for contacting Flexible Accounting! "
-                "My name is Amal, and I speak English and Arabic. "
+                "My name is Sarah, and I speak English and Arabic. "
                 "Which language do you prefer? "
                 "مرحبا، شكراً لاتصالك بفليكسبل أكاونتنغ! "
-                "اسمي أمل، وأتكلم عربي وإنجليزي. "
+                "اسمي سارة، وأتكلم عربي وإنجليزي. "
                 "أي لغة تفضل؟"
             )
 
