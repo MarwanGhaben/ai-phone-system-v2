@@ -276,6 +276,15 @@ LANGUAGE DETECTION:
 - Keep Arabic responses brief and natural
 - Use simple, conversational Arabic
 
+CALLER NAME REGISTRATION:
+- When the caller tells you their name, call the register_caller_name tool with their ACTUAL personal name
+- Only register real human names (e.g. "مروان", "Marwan", "Ahmed", "أحمد")
+- NEVER register common words, verbs, or phrases as names
+- If the caller says "أنا اسمي مروان" → register "مروان"
+- If the caller says "My name is John" → register "John"
+- If the caller says something like "أنا بحب العربي" (I prefer Arabic) → this is NOT a name, do not register anything
+- Use context to understand what is a name vs what is just conversation
+
 Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
     async def handle_call(self, call_sid: str, phone_number: str, websocket, stream_sid: str = "") -> None:
@@ -581,58 +590,21 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # =====================================================
         # FIRST RESPONSE: Language chosen → ask for name
         # =====================================================
-        if not context.is_known_caller and not context.name_collected and not getattr(context, '_language_set', False):
+        # This block handles ONLY the language preference response.
+        # Do NOT try to extract names here — the caller is choosing a language,
+        # not introducing themselves. Name extraction is handled by the LLM
+        # via the register_caller_name tool in normal conversation flow.
+        if not context.is_known_caller and not getattr(context, '_language_set', False):
             # Mark that we've processed the language choice
             context._language_set = True
 
-            # Check if the first response already contains a name
-            extracted_name = self._extract_caller_name(transcript)
-            if extracted_name:
-                context.caller_name = extracted_name
-                context.name_collected = True
-                self.caller_service.register_caller(
-                    context.phone_number,
-                    extracted_name,
-                    context.language
-                )
-                context.is_known_caller = True
-                logger.info(f"Orchestrator: Extracted and saved caller name: {extracted_name}")
-                if context.language == "ar":
-                    response = f"أهلاً {extracted_name}! كيف أقدر أساعدك اليوم؟"
-                else:
-                    response = f"Nice to meet you, {extracted_name}! How can I help you today?"
-                await self._speak_to_caller(call_sid, response, context.language)
-                return
-
-            # No name found — ask for name in detected language
+            # Ask for name in detected language
             if context.language == "ar":
                 response = "أهلاً فيك! ممكن أعرف اسمك الكريم؟"
             else:
                 response = "Great! May I have your name please?"
             await self._speak_to_caller(call_sid, response, context.language)
             return
-
-        # ===== CALLER NAME EXTRACTION (New Callers - subsequent turns) =====
-        if not context.is_known_caller and not context.name_collected:
-            extracted_name = self._extract_caller_name(transcript)
-            if extracted_name:
-                context.caller_name = extracted_name
-                context.name_collected = True
-                # Save caller info
-                self.caller_service.register_caller(
-                    context.phone_number,
-                    extracted_name,
-                    context.language
-                )
-                context.is_known_caller = True
-                logger.info(f"Orchestrator: Extracted and saved caller name: {extracted_name}")
-                # Acknowledge the name
-                if context.language == "ar":
-                    response = f"أهلاً {extracted_name}! كيف أقدر أساعدك اليوم؟"
-                else:
-                    response = f"Nice to meet you, {extracted_name}! How can I help you today?"
-                await self._speak_to_caller(call_sid, response, context.language)
-                return
 
         # Detect intent
         intent = await self._detect_intent(transcript, context.language)
@@ -717,6 +689,20 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         }
                     },
                     "required": ["confirm"]
+                }
+            },
+            {
+                "name": "register_caller_name",
+                "description": "Register the caller's name when they tell you their name. Call this as soon as you hear the caller's actual personal name. Only pass the person's real name — never pass verbs, adjectives, or common words.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "caller_name": {
+                            "type": "string",
+                            "description": "The caller's personal name (first name or full name). Must be an actual human name. Examples: 'Marwan', 'مروان', 'Ahmed', 'أحمد'. Never pass common words."
+                        }
+                    },
+                    "required": ["caller_name"]
                 }
             }
         ]
@@ -1070,9 +1056,11 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # Build system prompt with caller context
         system_prompt = self._system_prompt
 
-        # Add caller name to prompt if known
+        # Add caller context to prompt
         if context.caller_name:
-            system_prompt += f"\n\nCALLER CONTEXT:\n- The caller's name is {context.caller_name}. Use their name naturally in your response to be warm and personal."
+            system_prompt += f"\n\nCALLER CONTEXT:\n- The caller's name is {context.caller_name}. Use their name naturally in your response to be warm and personal.\n- Name already registered — do NOT call register_caller_name again."
+        else:
+            system_prompt += "\n\nCALLER CONTEXT:\n- The caller's name is NOT yet known. When you hear their name, immediately call the register_caller_name tool with their actual personal name."
 
         # =====================================================
         # BUILD MESSAGES WITH CONVERSATION HISTORY (Phase 1.2)
@@ -1114,11 +1102,44 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             if llm_response.tool_calls:
                 for tool_call in llm_response.tool_calls:
                     tool_name = tool_call["name"]
-                    if tool_name in ("check_appointment", "confirm_appointment"):
-                        import json as _json
-                        arguments = _json.loads(tool_call["arguments"])
-                        logger.info(f"Orchestrator: LLM requested {tool_name}: {arguments}")
+                    import json as _json
+                    arguments = _json.loads(tool_call["arguments"])
+                    logger.info(f"Orchestrator: LLM requested {tool_name}: {arguments}")
 
+                    # --- Register caller name (LLM extracts it naturally) ---
+                    if tool_name == "register_caller_name":
+                        caller_name = arguments.get("caller_name", "").strip()
+                        if caller_name and context:
+                            context.caller_name = caller_name
+                            context.name_collected = True
+                            context.is_known_caller = True
+                            self.caller_service.register_caller(
+                                context.phone_number,
+                                caller_name,
+                                context.language
+                            )
+                            logger.info(f"Orchestrator: LLM registered caller name: {caller_name}")
+
+                        # Let the LLM generate a natural follow-up response
+                        messages.append(Message(role=LLMRole.ASSISTANT, content=llm_response.content or ""))
+                        messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: Caller name '{caller_name}' has been saved. Now greet them warmly by name and ask how you can help. Keep it brief.]"))
+
+                        follow_up_request = LLMRequest(
+                            messages=messages,
+                            temperature=0.7,
+                            max_tokens=150,
+                            stream=True
+                        )
+                        full_response = ""
+                        async for chunk in self.llm.chat_stream(follow_up_request):
+                            full_response += chunk.delta
+
+                        response = full_response.strip()
+                        context.add_assistant_message(response)
+                        return response
+
+                    # --- Booking tools ---
+                    if tool_name in ("check_appointment", "confirm_appointment"):
                         # Execute the appropriate booking step
                         if tool_name == "check_appointment":
                             booking_result = await self._check_booking(call_sid, arguments)
