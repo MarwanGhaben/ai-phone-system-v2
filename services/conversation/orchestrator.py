@@ -1541,10 +1541,13 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # TwiML that dials the transfer number
             # Use a longer timeout (60s) and ringback to give the human time to answer
             if lang == "ar":
-                fallback_say = "عذراً، الشخص الذي تحاول الوصول إليه غير متاح حالياً. مع السلامة."
+                fallback_say = "عذراً، الشخص الذي تحاول الوصول إليه غير متاح حالياً. يرجى المحاولة لاحقاً. مع السلامة."
+                # Use Amazon Polly Zeina voice for natural Arabic TTS (much better than default Twilio)
+                say_voice = "Polly.Zeina"
                 say_lang = "ar-SA"
             else:
-                fallback_say = "The person you are trying to reach is unavailable at the moment. Goodbye."
+                fallback_say = "The person you are trying to reach is unavailable at the moment. Please try again later. Goodbye."
+                say_voice = "Polly.Joanna"
                 say_lang = "en-US"
 
             transfer_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -1552,7 +1555,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
     <Dial callerId="{settings.twilio_phone_number}" timeout="60">
         <Number>{transfer_number}</Number>
     </Dial>
-    <Say language="{say_lang}">{fallback_say}</Say>
+    <Say voice="{say_voice}" language="{say_lang}">{fallback_say}</Say>
 </Response>'''
 
             async with httpx.AsyncClient() as client:
