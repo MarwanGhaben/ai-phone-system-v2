@@ -277,13 +277,21 @@ LANGUAGE DETECTION:
 - Use simple, conversational Arabic
 
 CALLER NAME REGISTRATION:
-- When the caller tells you their name, call the register_caller_name tool with their ACTUAL personal name
+- CRITICAL: When the caller tells you their name, you MUST IMMEDIATELY call the register_caller_name tool. Do NOT just acknowledge the name — call the tool FIRST, then respond.
 - Only register real human names (e.g. "مروان", "Marwan", "Ahmed", "أحمد")
 - NEVER register common words, verbs, or phrases as names
-- If the caller says "أنا اسمي مروان" → register "مروان"
-- If the caller says "My name is John" → register "John"
+- If the caller says "أنا اسمي مروان" → call register_caller_name with "مروان"
+- If the caller says "My name is John" → call register_caller_name with "John"
 - If the caller says something like "أنا بحب العربي" (I prefer Arabic) → this is NOT a name, do not register anything
 - Use context to understand what is a name vs what is just conversation
+- If you already asked for their name and they respond, that response is almost certainly their name — register it!
+
+HANDLING UNCLEAR/GARBLED SPEECH:
+- Phone calls often have audio quality issues — speech may be unclear or garbled
+- If you receive garbled or unclear text, DO NOT try to interpret it as a name or meaningful input
+- Simply say: "Sorry, I didn't catch that. Could you repeat?" / "عذراً، ما سمعتك منيح. ممكن تعيد؟"
+- NEVER guess what the caller meant from garbled text
+- If the text contains characters from unexpected scripts (Bengali, Hindi, etc.) while the conversation is in Arabic or English, treat it as garbled audio and ask to repeat
 
 Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
@@ -571,6 +579,27 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         import re
         has_arabic = bool(re.search(r'[\u0600-\u06FF]', transcript))
 
+        # Detect garbled text from unexpected scripts (Bengali, Devanagari, etc.)
+        # This happens when STT misinterprets Arabic as another language
+        has_unexpected_script = bool(re.search(
+            r'[\u0980-\u09FF'   # Bengali
+            r'\u0900-\u097F'    # Devanagari (Hindi)
+            r'\u0A00-\u0A7F'    # Gurmukhi (Punjabi)
+            r'\u0B80-\u0BFF'    # Tamil
+            r'\u0C00-\u0C7F'    # Telugu
+            r'\u3040-\u309F'    # Hiragana (Japanese)
+            r'\u30A0-\u30FF'    # Katakana (Japanese)
+            r'\u4E00-\u9FFF]',  # CJK (Chinese)
+            transcript
+        ))
+
+        if has_unexpected_script and not has_arabic:
+            # STT garbled the audio into an unexpected script
+            # Replace transcript with a marker so the LLM asks to repeat
+            logger.warning(f"Orchestrator: Detected garbled text from unexpected script: '{transcript}' — treating as unclear audio")
+            transcript = "[unclear audio - caller's speech was not recognized clearly]"
+            # Keep the existing language context (don't change it)
+
         if has_arabic:
             context.language = "ar"
             logger.info(f"Orchestrator: Detected Arabic from text content")
@@ -595,6 +624,22 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # not introducing themselves. Name extraction is handled by the LLM
         # via the register_caller_name tool in normal conversation flow.
         if not context.is_known_caller and not getattr(context, '_language_set', False):
+            # NOISE FILTER: Ignore very short/meaningless utterances like "Eee", "Uh", etc.
+            # These are hesitation sounds, not a language choice. Wait for real speech.
+            cleaned = transcript.strip().strip('.,!?؟').strip()
+            is_noise = (
+                len(cleaned) <= 3
+                or cleaned.lower() in [
+                    "eee", "ee", "uh", "um", "ah", "eh", "hmm", "hm",
+                    "uhh", "umm", "ahh", "ehh", "mmm", "mm",
+                    "اه", "هم", "ام", "آه",
+                ]
+            )
+
+            if is_noise:
+                logger.info(f"Orchestrator: Ignoring noise/hesitation before language set: '{transcript}'")
+                return
+
             # Mark that we've processed the language choice
             context._language_set = True
 
@@ -941,12 +986,15 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         pending = context.pending_booking
         calendar = get_calendar_service()
 
+        # Use the latest caller name from context (may have been registered after check_appointment)
+        customer_name = context.caller_name or pending.get("customer_name") or "Phone Caller"
+
         try:
             result = await calendar.create_booking(
                 service_id=pending["service_id"],
                 staff_id=pending["staff_id"],
                 start_time=pending["appointment_time"],
-                customer_name=pending["customer_name"] or "Phone Caller",
+                customer_name=customer_name,
                 customer_email="",
                 customer_phone=context.phone_number or "",
                 notes=f"Booked via AI phone system. Client type: {pending['client_type']}"
@@ -958,7 +1006,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 # Send SMS confirmation + schedule 24hr reminder
                 display_staff = result.staff_name or pending["staff_name"] or "your accountant"
                 display_time = pending["appointment_time"].strftime('%A, %B %d at %I:%M %p')
-                display_customer = pending["customer_name"] or "there"
+                display_customer = customer_name if customer_name != "Phone Caller" else "there"
                 caller_lang = context.language if context else "en"
 
                 asyncio.create_task(self._send_booking_sms(
@@ -1060,7 +1108,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         if context.caller_name:
             system_prompt += f"\n\nCALLER CONTEXT:\n- The caller's name is {context.caller_name}. Use their name naturally in your response to be warm and personal.\n- Name already registered — do NOT call register_caller_name again."
         else:
-            system_prompt += "\n\nCALLER CONTEXT:\n- The caller's name is NOT yet known. When you hear their name, immediately call the register_caller_name tool with their actual personal name."
+            system_prompt += "\n\nCALLER CONTEXT:\n- The caller's name is NOT yet known.\n- CRITICAL: As soon as the caller says their name, you MUST call the register_caller_name tool IMMEDIATELY. This is required before any booking can use their name.\n- If you already asked for their name and they reply with something that sounds like a name, call register_caller_name right away.\n- Also use their name in the booking (customer_name parameter) when they book an appointment."
 
         # =====================================================
         # BUILD MESSAGES WITH CONVERSATION HISTORY (Phase 1.2)
