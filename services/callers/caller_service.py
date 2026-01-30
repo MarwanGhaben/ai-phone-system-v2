@@ -152,31 +152,37 @@ class CallerRecognitionService:
             return True
         return phone_number.lower().strip() in private_indicators
 
-    def get_greeting_for_caller(self, phone_number: str, language: str = "en") -> str:
+    def get_greeting_for_caller(self, phone_number: str, language: str = "auto") -> str:
         """
         Get personalized greeting for caller
 
         Args:
             phone_number: Caller's phone number
-            language: Current language ('en' or 'ar')
+            language: Current language ('en', 'ar', or 'auto')
 
         Returns:
             Greeting message
         """
         caller_name = self.get_caller_name(phone_number)
+        caller_language = self.get_caller_language(phone_number)
 
         if caller_name:
-            # Returning caller
-            if language == "ar":
+            # Returning caller — greet in their preferred language
+            lang = caller_language or language
+            if lang == "ar":
                 return f"هلا {caller_name}! أنا أمل من فليكسبل أكاونتنغ، أهلاً فيك مرة ثانية. كيف أقدر أساعدك اليوم؟"
             else:
                 return f"Hey {caller_name}! It's Amal from Flexible Accounting, great to hear from you again. How can I help you today?"
         else:
-            # New caller - ask for name
-            if language == "ar":
-                return "هلا والله! أنا أمل من فليكسبل أكاونتنغ، كيف أقدر أساعدك اليوم؟ ممكن أعرف اسمك الكريم؟"
-            else:
-                return "Hi there! I'm Amal from Flexible Accounting. How can I help you today? And may I have your name please?"
+            # New caller — bilingual greeting, ask for language preference
+            return (
+                "Hi, thank you for contacting Flexible Accounting! "
+                "My name is Amal, and I speak English and Arabic. "
+                "Which language do you prefer? "
+                "مرحبا، شكراً لاتصالك بفليكسبل أكاونتنغ! "
+                "اسمي أمل، وأتكلم عربي وإنجليزي. "
+                "أي لغة تفضل؟"
+            )
 
     def get_all_callers(self) -> Dict:
         """Get all caller data"""

@@ -70,6 +70,9 @@ class ConversationContext:
     is_known_caller: bool = False
     name_collected: bool = False  # True if we already got their name
 
+    # Pending booking (set by check_appointment, used by confirm_appointment)
+    pending_booking: Optional[Dict[str, Any]] = None
+
     # =====================================================
     # CONVERSATION HISTORY (Phase 1.2 fix)
     # =====================================================
@@ -241,17 +244,19 @@ CRITICAL - RESPONSE STYLE:
 - Don't list multiple options at once
 - Ask ONE question at a time
 
-APPOINTMENT BOOKING:
+APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - Accountants available: {accountant_names_en}
 - In Arabic: {accountant_names_ar}
 - Ask: Individual or corporate client?
 - Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
-- CRITICAL: When calling book_appointment, the date_time parameter MUST be in English format like "2026-02-02 15:00" (YYYY-MM-DD HH:MM). Use today's date ({today_str}) to calculate the correct date. NEVER pass Arabic text as date_time.
-- CRITICAL: When calling book_appointment, the accountant_name parameter MUST be the English name (e.g. "Hussam Saadaldin", "Rami Kahwaji", "Abdul ElFarra"). NEVER pass Arabic names.
-- The system will CHECK AVAILABILITY automatically before booking
+- STEP 1: Call check_appointment to check availability. NEVER call confirm_appointment without checking first.
+- STEP 2: If SLOT_AVAILABLE, tell the caller the time is available and ASK them to confirm before booking. Example: "The appointment with Rami on Monday, February 02 at 2:00 PM is available. Would you like me to go ahead and book it?"
+- STEP 3: ONLY after the caller says YES/confirms, call confirm_appointment with confirm=true. If they say no, call confirm_appointment with confirm=false.
+- CRITICAL: date_time parameter MUST be in "YYYY-MM-DD HH:MM" format (24-hour). Use today's date ({today_str}) to calculate. NEVER pass Arabic text as date_time.
+- CRITICAL: accountant_name parameter MUST be the English name (e.g. "Hussam Saadaldin", "Rami Kahwaji", "Abdul ElFarra"). NEVER pass Arabic names.
 - If the system returns BOOKING_UNAVAILABLE, read the suggested dates/times EXACTLY as provided - do NOT change or guess dates. Tell the caller the exact alternatives.
-- IMPORTANT: Do NOT tell the caller "I've booked it" unless you have called the book_appointment function and received BOOKING_SUCCESS
+- IMPORTANT: Do NOT tell the caller "I've booked it" unless you received BOOKING_SUCCESS from confirm_appointment.
 - If booking fails, apologize and offer to transfer to a human
 
 WHEN TO TRANSFER:
@@ -536,8 +541,6 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         # Update context
         context.user_transcript = transcript
-        if context.language == "auto" and language:
-            context.language = language
 
         # Only process final transcripts
         if not is_final:
@@ -552,11 +555,62 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         logger.info(f"Orchestrator: User said: {transcript}")
 
         # =====================================================
+        # LANGUAGE DETECTION (auto-detect from first response)
+        # =====================================================
+        if context.language == "auto" and language:
+            context.language = language
+            logger.info(f"Orchestrator: Auto-detected language: {language}")
+
+        # If language is still "auto", try to detect from transcript content
+        if context.language == "auto":
+            import re
+            # Check for Arabic characters
+            if re.search(r'[\u0600-\u06FF]', transcript):
+                context.language = "ar"
+            else:
+                context.language = "en"
+            logger.info(f"Orchestrator: Fallback language detection from text: {context.language}")
+
+        # =====================================================
         # ADD USER MESSAGE TO CONVERSATION HISTORY (Phase 1.2)
         # =====================================================
         context.add_user_message(transcript)
 
-        # ===== CALLER NAME EXTRACTION (New Callers) =====
+        # =====================================================
+        # FIRST RESPONSE: Language chosen → ask for name
+        # =====================================================
+        if not context.is_known_caller and not context.name_collected and not getattr(context, '_language_set', False):
+            # Mark that we've processed the language choice
+            context._language_set = True
+
+            # Check if the first response already contains a name
+            extracted_name = self._extract_caller_name(transcript)
+            if extracted_name:
+                context.caller_name = extracted_name
+                context.name_collected = True
+                self.caller_service.register_caller(
+                    context.phone_number,
+                    extracted_name,
+                    context.language
+                )
+                context.is_known_caller = True
+                logger.info(f"Orchestrator: Extracted and saved caller name: {extracted_name}")
+                if context.language == "ar":
+                    response = f"أهلاً {extracted_name}! كيف أقدر أساعدك اليوم؟"
+                else:
+                    response = f"Nice to meet you, {extracted_name}! How can I help you today?"
+                await self._speak_to_caller(call_sid, response, context.language)
+                return
+
+            # No name found — ask for name in detected language
+            if context.language == "ar":
+                response = "أهلاً فيك! ممكن أعرف اسمك الكريم؟"
+            else:
+                response = "Great! May I have your name please?"
+            await self._speak_to_caller(call_sid, response, context.language)
+            return
+
+        # ===== CALLER NAME EXTRACTION (New Callers - subsequent turns) =====
         if not context.is_known_caller and not context.name_collected:
             extracted_name = self._extract_caller_name(transcript)
             if extracted_name:
@@ -572,7 +626,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 logger.info(f"Orchestrator: Extracted and saved caller name: {extracted_name}")
                 # Acknowledge the name
                 if context.language == "ar":
-                    response = f"أهلاً {extracted_name}! كيف يمكنني مساعدتك اليوم؟"
+                    response = f"أهلاً {extracted_name}! كيف أقدر أساعدك اليوم؟"
                 else:
                     response = f"Nice to meet you, {extracted_name}! How can I help you today?"
                 await self._speak_to_caller(call_sid, response, context.language)
@@ -623,8 +677,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         """Get tool definitions for OpenAI function calling"""
         return [
             {
-                "name": "book_appointment",
-                "description": "Book an appointment with an accountant at iFlex Tax. Call this when the user wants to schedule/book an appointment and has provided enough details (at minimum: client type).",
+                "name": "check_appointment",
+                "description": "Check if a requested appointment slot is available. Call this FIRST when the user wants to book. Do NOT call confirm_appointment until the caller explicitly confirms.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -648,14 +702,27 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     },
                     "required": ["client_type"]
                 }
+            },
+            {
+                "name": "confirm_appointment",
+                "description": "Confirm and finalize a booking AFTER the caller has explicitly said yes to the proposed time slot. Only call this after check_appointment returned SLOT_AVAILABLE and the caller confirmed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "Must be true to confirm the booking"
+                        }
+                    },
+                    "required": ["confirm"]
+                }
             }
         ]
 
-    async def _execute_booking(self, call_sid: str, arguments: dict) -> str:
+    async def _check_booking(self, call_sid: str, arguments: dict) -> str:
         """
-        Execute a booking via MSGraph Bookings API
-
-        Checks availability BEFORE creating the appointment.
+        Check availability for a requested appointment slot.
+        If available, stores pending booking data on the context for later confirmation.
 
         Args:
             call_sid: Call identifier
@@ -678,11 +745,11 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         date_time_str = arguments.get("date_time", "")
         customer_name = arguments.get("customer_name", context.caller_name if context else "")
 
-        logger.info(f"Orchestrator: Executing booking - type={client_type}, accountant={accountant_name}, date={date_time_str}, customer={customer_name}")
+        logger.info(f"Orchestrator: Checking booking - type={client_type}, accountant={accountant_name}, date={date_time_str}, customer={customer_name}")
 
         # Check if MSGraph is configured
         if not await calendar.is_available():
-            logger.error("Orchestrator: MS Bookings not configured (missing tenant_id/client_id/secret/business_id)")
+            logger.error("Orchestrator: MS Bookings not configured")
             return "BOOKING_ERROR: Microsoft Bookings is not configured. Please inform the caller that booking is temporarily unavailable and offer to transfer them to a human."
 
         try:
@@ -700,37 +767,30 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
             # If no staff/service IDs configured, try to get from MSGraph
             if not staff_id or not service_id:
-                # Try to get staff members from MSGraph
                 staff_members = await calendar.get_staff_members()
                 if staff_members:
-                    # Match by name (partial match, case-insensitive)
                     if accountant_name:
                         name_lower = accountant_name.lower()
                         for staff in staff_members:
                             staff_name_lower = staff.name.lower()
-                            # Check both directions for partial match
                             if name_lower in staff_name_lower or staff_name_lower in name_lower:
                                 staff_id = staff.id
                                 matched_staff_name = staff.name
                                 logger.info(f"Orchestrator: Matched staff from MSGraph: {staff.name} (id={staff.id})")
                                 break
-                            # Also check first name match
                             if name_lower.split()[0] in staff_name_lower.split() if name_lower.split() else False:
                                 staff_id = staff.id
                                 matched_staff_name = staff.name
                                 logger.info(f"Orchestrator: Matched staff by first name: {staff.name} (id={staff.id})")
                                 break
                     if not staff_id and staff_members:
-                        # Use first available staff
                         staff_id = staff_members[0].id
                         matched_staff_name = staff_members[0].name
                         logger.info(f"Orchestrator: Using default staff: {staff_members[0].name}")
 
-                # Get services
                 if not service_id:
                     services = await calendar.get_services()
                     if services:
-                        # Match service by client type
                         for svc in services:
                             if client_type in svc.name.lower() or client_type in svc.description.lower():
                                 service_id = svc.id
@@ -745,7 +805,6 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Parse date/time
             appointment_time = None
             if date_time_str:
-                # Try ISO format first (YYYY-MM-DD HH:MM) - this is what we instruct the LLM to use
                 import re
                 iso_match = re.match(r'(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})', date_time_str)
                 if iso_match:
@@ -758,13 +817,11 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     except ValueError as e:
                         logger.warning(f"Orchestrator: Invalid ISO date values: {date_time_str} - {e}")
 
-                # Fallback to dateutil for English natural language
                 if not appointment_time:
                     from dateutil import parser as date_parser
                     try:
                         appointment_time = date_parser.parse(date_time_str, fuzzy=True)
                         logger.info(f"Orchestrator: Parsed with dateutil: {appointment_time}")
-                        # If parsed date is in the past, it's likely wrong
                         if appointment_time < datetime.now():
                             logger.warning(f"Orchestrator: Parsed date {appointment_time} is in the past, adjusting to next week")
                             appointment_time += timedelta(days=7)
@@ -772,16 +829,18 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         logger.warning(f"Orchestrator: Could not parse date: {date_time_str}")
 
             if not appointment_time:
-                # Default to tomorrow at 10 AM
                 appointment_time = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=1)
                 logger.warning(f"Orchestrator: Using default appointment time: {appointment_time}")
 
             logger.info(f"Orchestrator: Final appointment time: {appointment_time} (from input: '{date_time_str}')")
 
             # =====================================================
-            # CHECK AVAILABILITY BEFORE BOOKING
+            # CHECK AVAILABILITY
             # =====================================================
-            logger.info(f"Orchestrator: Checking availability for staff={matched_staff_name or accountant_name}, date={appointment_time}")
+            staff_display = matched_staff_name or accountant_name or "the accountant"
+            full_fmt = '%A, %B %d at %I:%M %p'
+
+            logger.info(f"Orchestrator: Checking availability for staff={staff_display}, date={appointment_time}")
             available_slots = await calendar.get_available_slots(
                 service_id=service_id,
                 staff_id=staff_id,
@@ -789,7 +848,6 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             )
 
             if available_slots:
-                # Check if the requested time falls within any available slot
                 requested_date = appointment_time.date()
                 requested_hour = appointment_time.hour
                 requested_minute = appointment_time.minute
@@ -797,32 +855,21 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 slot_match = False
                 for slot in available_slots:
                     slot_date = slot.start_time.date()
-                    slot_start_hour = slot.start_time.hour
-                    slot_start_min = slot.start_time.minute
-                    slot_end_hour = slot.end_time.hour
-                    slot_end_min = slot.end_time.minute
-
                     if slot_date == requested_date:
-                        # Check if requested time is within this slot
                         req_minutes = requested_hour * 60 + requested_minute
-                        slot_start_minutes = slot_start_hour * 60 + slot_start_min
-                        slot_end_minutes = slot_end_hour * 60 + slot_end_min
+                        slot_start_minutes = slot.start_time.hour * 60 + slot.start_time.minute
+                        slot_end_minutes = slot.end_time.hour * 60 + slot.end_time.minute
                         if slot_start_minutes <= req_minutes < slot_end_minutes:
                             slot_match = True
                             break
 
                 if not slot_match:
-                    # Requested time is NOT available - find alternatives
+                    # Not available — offer alternatives
                     same_day_slots = [s for s in available_slots if s.start_time.date() == requested_date]
 
-                    staff_display = matched_staff_name or accountant_name or "the accountant"
-                    # Full date+time format: "Friday, January 30 at 2:00 PM"
-                    full_fmt = '%A, %B %d at %I:%M %p'
-
                     if same_day_slots:
-                        # There are other slots on that day — show full date + time for each
                         alt_times = ", ".join([s.start_time.strftime(full_fmt) for s in same_day_slots[:5]])
-                        logger.info(f"Orchestrator: Requested time not available. Alternatives on same day: {alt_times}")
+                        logger.info(f"Orchestrator: Requested time not available. Alternatives: {alt_times}")
                         return (
                             f"BOOKING_UNAVAILABLE: The requested time ({appointment_time.strftime(full_fmt)}) "
                             f"is not available for {staff_display}. "
@@ -830,7 +877,6 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                             f"Please ask the caller which of these times works for them."
                         )
                     else:
-                        # No slots at all on that day — show next available with full date + time
                         next_slots = []
                         seen_days = set()
                         for s in available_slots:
@@ -851,55 +897,105 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                                 f"Please ask the caller if any of these work."
                             )
                         else:
-                            logger.info(f"Orchestrator: No availability found at all for {staff_display}")
                             return (
                                 f"BOOKING_UNAVAILABLE: {staff_display} has no available slots in the next 7 days. "
                                 f"Please apologize and offer to transfer the caller to speak with someone directly."
                             )
-            else:
-                logger.warning("Orchestrator: Could not fetch availability slots - proceeding with booking attempt")
-                # If we can't check availability (API issue), still try to book
-                # The booking API itself will reject if the slot is taken
 
-            # Create the booking
+            # =====================================================
+            # SLOT IS AVAILABLE — store pending booking, ask for confirmation
+            # =====================================================
+            context.pending_booking = {
+                "service_id": service_id,
+                "staff_id": staff_id,
+                "staff_name": matched_staff_name or accountant_name,
+                "appointment_time": appointment_time,
+                "customer_name": customer_name,
+                "client_type": client_type,
+            }
+            display_time = appointment_time.strftime(full_fmt)
+            logger.info(f"Orchestrator: Slot available - pending confirmation for {display_time} with {staff_display}")
+
+            return (
+                f"SLOT_AVAILABLE: The appointment with {staff_display} on {display_time} is available. "
+                f"Ask the caller to confirm: do they want to go ahead and book this appointment? "
+                f"Do NOT book yet — wait for the caller to say yes."
+            )
+
+        except Exception as e:
+            logger.error(f"Orchestrator: Check booking exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return f"BOOKING_ERROR: System error while checking availability: {str(e)}. Apologize and offer to transfer."
+
+    async def _confirm_booking(self, call_sid: str, arguments: dict) -> str:
+        """
+        Confirm and create a previously checked appointment.
+
+        Args:
+            call_sid: Call identifier
+            arguments: Function call arguments (must have confirm=True)
+
+        Returns:
+            Result message to feed back to LLM
+        """
+        from services.calendar.ms_bookings_service import get_calendar_service
+
+        context = self._conversations.get(call_sid)
+        if not context or not context.pending_booking:
+            return "BOOKING_ERROR: No pending appointment to confirm. Please use check_appointment first."
+
+        if not arguments.get("confirm", False):
+            # Caller said no — clear pending booking
+            context.pending_booking = None
+            return "BOOKING_CANCELLED: The caller chose not to book. Ask if they would like a different time or anything else."
+
+        pending = context.pending_booking
+        calendar = get_calendar_service()
+
+        try:
             result = await calendar.create_booking(
-                service_id=service_id,
-                staff_id=staff_id,
-                start_time=appointment_time,
-                customer_name=customer_name or "Phone Caller",
-                customer_email="",  # Not collected on phone
-                customer_phone=context.phone_number if context else "",
-                notes=f"Booked via AI phone system. Client type: {client_type}"
+                service_id=pending["service_id"],
+                staff_id=pending["staff_id"],
+                start_time=pending["appointment_time"],
+                customer_name=pending["customer_name"] or "Phone Caller",
+                customer_email="",
+                customer_phone=context.phone_number or "",
+                notes=f"Booked via AI phone system. Client type: {pending['client_type']}"
             )
 
             if result.success:
                 logger.info(f"Orchestrator: BOOKING CREATED - id={result.appointment_id}, time={result.start_time}, staff={result.staff_name}")
 
                 # Send SMS confirmation + schedule 24hr reminder
-                display_staff = result.staff_name or accountant_name or "your accountant"
-                display_time = appointment_time.strftime('%A, %B %d at %I:%M %p')
-                display_customer = customer_name or "there"
-                caller_phone = context.phone_number if context else ""
+                display_staff = result.staff_name or pending["staff_name"] or "your accountant"
+                display_time = pending["appointment_time"].strftime('%A, %B %d at %I:%M %p')
+                display_customer = pending["customer_name"] or "there"
                 caller_lang = context.language if context else "en"
 
                 asyncio.create_task(self._send_booking_sms(
-                    phone_number=caller_phone,
+                    phone_number=context.phone_number,
                     customer_name=display_customer,
                     staff_name=display_staff,
                     appointment_time_str=display_time,
-                    appointment_dt=appointment_time,
+                    appointment_dt=pending["appointment_time"],
                     language=caller_lang,
                 ))
 
-                return f"BOOKING_SUCCESS: Appointment booked successfully. Appointment ID: {result.appointment_id}. Time: {result.start_time}. Staff: {result.staff_name or accountant_name}. Customer: {result.customer_name}."
+                # Clear pending booking
+                context.pending_booking = None
+
+                return f"BOOKING_SUCCESS: Appointment booked successfully. Appointment ID: {result.appointment_id}. Time: {result.start_time}. Staff: {result.staff_name or pending['staff_name']}. Customer: {result.customer_name}."
             else:
                 logger.error(f"Orchestrator: BOOKING FAILED - {result.error_message}")
+                context.pending_booking = None
                 return f"BOOKING_ERROR: Failed to create booking: {result.error_message}. Apologize and offer to transfer to a human."
 
         except Exception as e:
-            logger.error(f"Orchestrator: Booking exception: {e}")
+            logger.error(f"Orchestrator: Confirm booking exception: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            context.pending_booking = None
             return f"BOOKING_ERROR: System error while booking: {str(e)}. Apologize and offer to transfer."
 
     async def _send_booking_sms(
@@ -1015,17 +1111,20 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Check if the LLM wants to call a function
             if llm_response.tool_calls:
                 for tool_call in llm_response.tool_calls:
-                    if tool_call["name"] == "book_appointment":
+                    tool_name = tool_call["name"]
+                    if tool_name in ("check_appointment", "confirm_appointment"):
                         import json as _json
                         arguments = _json.loads(tool_call["arguments"])
-                        logger.info(f"Orchestrator: LLM requested booking: {arguments}")
+                        logger.info(f"Orchestrator: LLM requested {tool_name}: {arguments}")
 
-                        # Execute the booking
-                        booking_result = await self._execute_booking(call_sid, arguments)
+                        # Execute the appropriate booking step
+                        if tool_name == "check_appointment":
+                            booking_result = await self._check_booking(call_sid, arguments)
+                        else:
+                            booking_result = await self._confirm_booking(call_sid, arguments)
 
                         # Feed result back to LLM for a natural response
                         messages.append(Message(role=LLMRole.ASSISTANT, content=llm_response.content or ""))
-                        # Add tool result as a user message (simplified approach)
                         messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Now respond naturally to the caller about the booking result. Keep it brief.]"))
 
                         # Get final response (streaming, no tools)
