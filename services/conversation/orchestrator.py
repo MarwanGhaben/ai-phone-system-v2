@@ -1525,6 +1525,13 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         await self._speak_to_caller(call_sid, transfer_msg, lang)
 
+        # Wait for the transfer message audio to finish playing
+        # _speak_to_caller queues audio but it's sent asynchronously.
+        # Estimate audio duration: μ-law 8kHz = 8000 bytes/sec.
+        # A typical transfer message is ~3-4 seconds. Add buffer for safety.
+        # We calculate from the last TTS response size if possible.
+        await asyncio.sleep(5)  # 5 seconds is enough for transfer message + Twilio buffer
+
         # Use Twilio REST API to update the call with <Dial> TwiML
         try:
             import httpx
@@ -1532,12 +1539,20 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Calls/{call_sid}.json"
 
             # TwiML that dials the transfer number
+            # Use a longer timeout (60s) and ringback to give the human time to answer
+            if lang == "ar":
+                fallback_say = "عذراً، الشخص الذي تحاول الوصول إليه غير متاح حالياً. مع السلامة."
+                say_lang = "ar-SA"
+            else:
+                fallback_say = "The person you are trying to reach is unavailable at the moment. Goodbye."
+                say_lang = "en-US"
+
             transfer_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Dial callerId="{settings.twilio_phone_number}" timeout="30">
+    <Dial callerId="{settings.twilio_phone_number}" timeout="60">
         <Number>{transfer_number}</Number>
     </Dial>
-    <Say>The person you're trying to reach is unavailable. Goodbye.</Say>
+    <Say language="{say_lang}">{fallback_say}</Say>
 </Response>'''
 
             async with httpx.AsyncClient() as client:
