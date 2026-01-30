@@ -499,13 +499,10 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 # Skip STT while AI is speaking (prevents echo)
                 return
 
-            # ECHO GUARD: Don't feed audio to STT while our audio is still
-            # playing through the caller's phone speaker (prevents echo loop)
-            import time
-            echo_guard_end = self._echo_guard_until.get(call_sid, 0)
-            if time.time() < echo_guard_end:
-                # Don't feed to STT — this is likely our own audio echoing back
-                return
+            # Always feed audio to STT to keep the WebSocket connection alive.
+            # Echo filtering is done at the transcript level in process_transcript,
+            # NOT here — blocking audio here causes ElevenLabs STT to disconnect
+            # after its inactivity timeout (~15s).
 
             # Stream to this call's STT instance
             from services.stt.stt_base import AudioChunk
