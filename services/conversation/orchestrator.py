@@ -246,12 +246,13 @@ SERVICES OFFERED:
 - Corporate tax planning
 
 CRITICAL - RESPONSE STYLE:
-- Keep responses EXTREMELY BRIEF (1-2 sentences, max 50 words)
-- This is a VOICE call - long responses frustrate callers
-- Get straight to the point
-- Don't repeat the question back
-- Don't list multiple options at once
+- Keep responses EXTREMELY BRIEF — maximum 1-2 short sentences (under 30 words)
+- This is a VOICE call — every extra word wastes the caller's time
+- NEVER give long explanations or list multiple items
+- If asked about services, give a ONE-SENTENCE summary and ask if they want details on anything specific
+- Get straight to the point. Don't repeat the question back.
 - Ask ONE question at a time
+- In Arabic, be even shorter — Arabic speech takes longer to say
 
 APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - Accountants available: {accountant_names_en}
@@ -304,10 +305,12 @@ CRITICAL - ARABIC NUMBER/TIME PRONUNCIATION:
 CALLER NAME REGISTRATION:
 - CRITICAL: When the caller tells you their name, you MUST call the register_caller_name tool BEFORE responding. This is your #1 priority — never skip this tool call.
 - After you asked "what's your name?", the VERY NEXT thing the caller says is their name. You MUST call register_caller_name with it.
-- Only register real human names (e.g. "مروان", "Marwan", "Ahmed", "أحمد")
+- NAME CORRECTIONS: If a caller says their name is wrong and corrects it (e.g. "اسمي غادة مش غايد" / "My name is Ghada not Gaid"), you MUST call register_caller_name with the corrected name. The caller knows their own name — always trust them.
+- Only register real human names (e.g. "مروان", "Marwan", "Ahmed", "أحمد", "غادة", "Ghada")
 - NEVER register garbled/unclear speech as a name. If the text looks nonsensical or garbled (random sounds, filler words like "همم", "اه"), ask the caller to repeat their name clearly.
 - If the caller says "أنا اسمي مروان" → call register_caller_name with "مروان"
 - If the caller says "My name is John" → call register_caller_name with "John"
+- If the caller says "اسمي غادة مش غايد" → call register_caller_name with "غادة"
 - If the caller says something like "أنا بحب العربي" (I prefer Arabic) → this is NOT a name, do not register anything
 - A real name is typically 1-3 words and is a recognizable personal name. If it doesn't look like a name, ask again.
 
@@ -867,7 +870,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             },
             {
                 "name": "register_caller_name",
-                "description": "Register the caller's name when they tell you their name. Call this as soon as you hear the caller's actual personal name. Only pass the person's real name — never pass verbs, adjectives, or common words.",
+                "description": "Register or update the caller's name. Call this when a caller tells you their name for the first time OR corrects their name. Always trust the caller's own statement of their name over what's on file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1278,7 +1281,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         # Add caller context to prompt
         if context.caller_name:
-            system_prompt += f"\n\nCALLER CONTEXT:\n- The caller's name is {context.caller_name}. Use their name naturally in your response to be warm and personal.\n- Name already registered — do NOT call register_caller_name again."
+            system_prompt += f"\n\nCALLER CONTEXT:\n- The caller's name on file is: {context.caller_name}. Use their name naturally.\n- IMPORTANT: If the caller corrects their name or says their name is different (e.g. 'اسمي غادة مش غايد' / 'My name is Ghada not Gaid'), you MUST call register_caller_name with the CORRECT name immediately. The old name may be wrong or garbled from a previous call.\n- Treat the caller's own statement of their name as authoritative — always believe them over what's on file."
         else:
             system_prompt += "\n\nCALLER CONTEXT:\n- The caller's name is NOT yet known.\n- CRITICAL: As soon as the caller says their name, you MUST call the register_caller_name tool IMMEDIATELY. This is required before any booking can use their name.\n- If you already asked for their name and they reply with something that sounds like a name, call register_caller_name right away.\n- Also use their name in the booking (customer_name parameter) when they book an appointment."
 
