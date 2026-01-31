@@ -55,7 +55,7 @@ class ElevenLabsTTS(TTSServiceBase):
         model: str = "eleven_multilingual_v2",
         stability: float = 0.5,
         similarity_boost: float = 0.75,
-        output_format: str = "mp3_44100_128"
+        output_format: str = "ulaw_8000"
     ):
         """
         Initialize ElevenLabs TTS service
@@ -66,7 +66,7 @@ class ElevenLabsTTS(TTSServiceBase):
             model: Model to use (eleven_multilingual_v2 recommended)
             stability: Voice stability (0-1, lower = more expressive)
             similarity_boost: Voice similarity (0-1, higher = more similar to original)
-            output_format: Audio output format
+            output_format: Audio output format (ulaw_8000 for direct Twilio compatibility)
         """
         if not ELEVENLABS_AVAILABLE:
             raise ImportError("elevenlabs is not installed. Install with: pip install elevenlabs")
@@ -139,15 +139,24 @@ class ElevenLabsTTS(TTSServiceBase):
             if not self._stop_event.is_set():
                 self._status = TTSStatus.IDLE
 
-            # Calculate approximate duration
+            # Calculate approximate duration based on output format
             total_bytes = len(audio_data)
-            # MP3 at 128 kbps = 16 KB/sec
-            duration_ms = int((total_bytes / 16000) * 1000)
+            is_mulaw = "ulaw" in self.output_format or "mulaw" in self.output_format
+            if is_mulaw:
+                # μ-law 8kHz = 8000 bytes/sec (1 byte per sample)
+                duration_ms = int((total_bytes / 8000) * 1000)
+                sample_rate = 8000
+                fmt = "mulaw"
+            else:
+                # MP3 at 128 kbps = 16 KB/sec
+                duration_ms = int((total_bytes / 16000) * 1000)
+                sample_rate = 44100
+                fmt = "mp3"
 
             return TTSResponse(
                 audio_data=audio_data,
-                sample_rate=44100,
-                format="mp3",
+                sample_rate=sample_rate,
+                format=fmt,
                 duration_ms=duration_ms,
                 text=request.text,
                 is_final=True,
@@ -282,7 +291,7 @@ def create_elevenlabs_tts(config: dict) -> ElevenLabsTTS | None:
             model=config.get('elevenlabs_model', 'eleven_multilingual_v2'),
             stability=config.get('elevenlabs_stability', 0.5),
             similarity_boost=config.get('elevenlabs_similarity_boost', 0.75),
-            output_format=config.get('elevenlabs_output_format', 'mp3_44100_128')
+            output_format=config.get('elevenlabs_output_format', 'ulaw_8000')
         )
     except Exception as e:
         logger.error(f"Failed to initialize ElevenLabs TTS: {e}")

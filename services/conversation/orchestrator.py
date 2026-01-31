@@ -1462,20 +1462,25 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             response = await self.tts.synthesize(request)
             logger.info(f"Orchestrator: TTS response - format={response.format}, sample_rate={response.sample_rate}, bytes={len(response.audio_data)}")
 
-            # Convert MP3 audio to μ-law 8kHz for Twilio
-            logger.info(f"Orchestrator: Converting audio to μ-law 8kHz...")
-            from services.audio.audio_converter import convert_twilio_audio
-            mulaw_audio = convert_twilio_audio(
-                response.audio_data,
-                input_format=response.format,
-                input_rate=response.sample_rate
-            )
+            if response.format == "mulaw":
+                # TTS already returns μ-law 8kHz — send directly to Twilio (no conversion needed)
+                mulaw_audio = response.audio_data
+                logger.info(f"Orchestrator: Using native μ-law audio - {len(mulaw_audio)} bytes (no conversion)")
+            else:
+                # Legacy path: convert MP3/other formats to μ-law 8kHz for Twilio
+                logger.info(f"Orchestrator: Converting {response.format} audio to μ-law 8kHz...")
+                from services.audio.audio_converter import convert_twilio_audio
+                mulaw_audio = convert_twilio_audio(
+                    response.audio_data,
+                    input_format=response.format,
+                    input_rate=response.sample_rate
+                )
 
             if not mulaw_audio:
                 logger.error("Orchestrator: Audio conversion returned empty bytes")
                 return
 
-            logger.info(f"Orchestrator: Audio converted - {len(mulaw_audio)} bytes μ-law")
+            logger.info(f"Orchestrator: Audio ready - {len(mulaw_audio)} bytes μ-law")
 
             # Send to Twilio in correct format
             logger.info(f"Orchestrator: Sending audio to Twilio (stream_sid={twilio_handler.stream_sid})...")
