@@ -107,7 +107,7 @@ class Settings(BaseSettings):
     elevenlabs_model: str = "eleven_multilingual_v2"
     elevenlabs_stability: float = 0.5  # 0-1, lower = more expressive
     elevenlabs_similarity_boost: float = 0.75  # 0-1, higher = more similar to original
-    elevenlabs_output_format: str = "mp3_44100_128"
+    elevenlabs_output_format: str = "ulaw_8000"
 
     # =====================================================
     # ELEVENLABS STT (Scribe v2 Realtime)
