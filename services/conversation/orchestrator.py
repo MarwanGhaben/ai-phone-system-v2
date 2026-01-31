@@ -327,16 +327,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # =====================================================
             # CRITICAL: Each call gets its own STT instance to avoid
             # queue/buffer sharing between concurrent calls
-            logger.info(f"Orchestrator: Creating per-call STT instance (provider={self._stt_provider})")
-            call_stt = create_stt_service(self._stt_provider, self._stt_config)
-            self._call_stt_instances[call_sid] = call_stt
-
-            # Create per-call state lock for thread-safe state changes
-            state_lock = asyncio.Lock()
-            self._call_state_locks[call_sid] = state_lock
-
             # =====================================================
-            # STEP 2: Get caller info
+            # STEP 1a: Get caller info FIRST (need language for STT)
             # =====================================================
             logger.info(f"Orchestrator: Getting caller info for {phone_number}")
             caller_info = self.caller_service.get_caller_info(phone_number)
@@ -344,6 +336,24 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             caller_language = caller_info.get("language", "auto") if caller_info else "auto"
 
             logger.info(f"Orchestrator: Caller info - name={caller_name}, language={caller_language}")
+
+            # =====================================================
+            # STEP 1b: Create per-call STT with language hint
+            # =====================================================
+            # For known callers, set STT language explicitly.
+            # This DRAMATICALLY improves accuracy vs auto-detect on phone audio.
+            stt_config = self._stt_config.copy()
+            if caller_language and caller_language != "auto":
+                stt_config['elevenlabs_stt_language'] = caller_language
+                logger.info(f"Orchestrator: Setting STT language to '{caller_language}' for known caller")
+
+            logger.info(f"Orchestrator: Creating per-call STT instance (provider={self._stt_provider})")
+            call_stt = create_stt_service(self._stt_provider, stt_config)
+            self._call_stt_instances[call_sid] = call_stt
+
+            # Create per-call state lock for thread-safe state changes
+            state_lock = asyncio.Lock()
+            self._call_state_locks[call_sid] = state_lock
 
             # =====================================================
             # STEP 3: Create conversation context
@@ -616,6 +626,11 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             r'\u0A00-\u0A7F'    # Gurmukhi (Punjabi)
             r'\u0B80-\u0BFF'    # Tamil
             r'\u0C00-\u0C7F'    # Telugu
+            r'\u0400-\u04FF'    # Cyrillic (Russian, Bulgarian, etc.)
+            r'\u10A0-\u10FF'    # Georgian
+            r'\u0530-\u058F'    # Armenian
+            r'\u0E00-\u0E7F'    # Thai
+            r'\u1000-\u109F'    # Myanmar
             r'\u1C50-\u1C7F'    # Ol Chiki (Santali) — common STT echo artifact
             r'\u3040-\u309F'    # Hiragana (Japanese)
             r'\u30A0-\u30FF'    # Katakana (Japanese)
@@ -624,22 +639,31 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         ))
 
         if has_unexpected_script and not has_arabic:
-            # STT garbled the audio into an unexpected script
-            # Replace transcript with a marker so the LLM asks to repeat
-            logger.warning(f"Orchestrator: Detected garbled text from unexpected script: '{transcript}' — treating as unclear audio")
-            transcript = "[unclear audio - caller's speech was not recognized clearly]"
-            # Keep the existing language context (don't change it)
+            # STT garbled the audio into an unexpected script.
+            # This is usually echo or misrecognized Arabic on phone-quality audio.
+            logger.warning(f"Orchestrator: Detected garbled text from unexpected script: '{transcript}' — ignoring")
+            # Don't even send to LLM — just drop it entirely.
+            # Sending "[unclear audio]" causes the LLM to respond with
+            # "I can't understand" which frustrates the caller.
+            return
 
         if has_arabic:
+            prev_language = context.language
             context.language = "ar"
             logger.info(f"Orchestrator: Detected Arabic from text content")
+            # Reconnect STT with explicit Arabic if it was in auto-detect
+            if prev_language == "auto":
+                await self._reconnect_stt_with_language(call_sid, "ar")
         elif context.language == "auto":
             if language and language != "auto":
                 context.language = language
                 logger.info(f"Orchestrator: Auto-detected language from STT: {language}")
+                # Reconnect STT with explicit language
+                await self._reconnect_stt_with_language(call_sid, language)
             else:
                 context.language = "en"
                 logger.info(f"Orchestrator: Defaulting to English")
+                await self._reconnect_stt_with_language(call_sid, "en")
 
         # =====================================================
         # ADD USER MESSAGE TO CONVERSATION HISTORY (Phase 1.2)
@@ -1521,6 +1545,38 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         """Handle goodbye intent"""
         logger.info(f"Orchestrator: Call {call_sid} ended (goodbye)")
         await self.end_call(call_sid)
+
+    async def _reconnect_stt_with_language(self, call_sid: str, language: str) -> None:
+        """
+        Reconnect the per-call STT instance with an explicit language code.
+        This dramatically improves accuracy vs auto-detect on phone audio.
+        Only reconnects if the STT is currently in auto-detect mode.
+        """
+        call_stt = self._call_stt_instances.get(call_sid)
+        if not call_stt:
+            return
+
+        # Only reconnect if currently in auto-detect mode
+        if call_stt.language and call_stt.language == language:
+            logger.info(f"Orchestrator: STT already set to '{language}', skipping reconnect")
+            return
+
+        if call_stt.language and call_stt.language != "":
+            logger.info(f"Orchestrator: STT already set to '{call_stt.language}', skipping reconnect")
+            return
+
+        try:
+            logger.info(f"Orchestrator: Reconnecting STT with language='{language}' for call {call_sid}")
+            if hasattr(call_stt, 'reconnect_with_language'):
+                success = await call_stt.reconnect_with_language(language)
+                if success:
+                    logger.info(f"Orchestrator: STT reconnected with language='{language}'")
+                else:
+                    logger.error(f"Orchestrator: Failed to reconnect STT with language='{language}'")
+            else:
+                logger.warning(f"Orchestrator: STT provider does not support language reconnection")
+        except Exception as e:
+            logger.error(f"Orchestrator: Error reconnecting STT: {e}")
 
     async def _handle_transfer(self, call_sid: str) -> None:
         """

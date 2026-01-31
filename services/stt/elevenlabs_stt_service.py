@@ -131,6 +131,44 @@ class ElevenLabsSTT(STTServiceBase):
             logger.error(f"ElevenLabs STT: Connection error: {e}")
             return False
 
+    async def reconnect_with_language(self, language_code: str) -> bool:
+        """
+        Disconnect and reconnect with a specific language code.
+        This dramatically improves accuracy vs auto-detect for phone audio.
+
+        Args:
+            language_code: Language code (e.g., 'ar', 'en')
+
+        Returns:
+            True if reconnected successfully
+        """
+        logger.info(f"ElevenLabs STT: Reconnecting with language={language_code}")
+
+        # Save queue contents to avoid losing pending transcripts
+        pending_results = []
+        if self._transcript_queue:
+            while not self._transcript_queue.empty():
+                try:
+                    pending_results.append(self._transcript_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+        # Disconnect current session
+        await self.disconnect()
+
+        # Update language
+        self.language = language_code
+
+        # Reconnect
+        success = await self.connect()
+
+        # Restore pending results
+        if success and pending_results:
+            for result in pending_results:
+                await self._transcript_queue.put(result)
+
+        return success
+
     async def disconnect(self) -> None:
         """Close WebSocket connection"""
         self._is_listening = False
