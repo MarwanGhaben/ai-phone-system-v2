@@ -618,33 +618,34 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         import re
         has_arabic = bool(re.search(r'[\u0600-\u06FF]', transcript))
 
-        # Detect garbled text from unexpected scripts (Bengali, Devanagari, etc.)
-        # This happens when STT misinterprets Arabic as another language
-        has_unexpected_script = bool(re.search(
-            r'[\u0980-\u09FF'   # Bengali
-            r'\u0900-\u097F'    # Devanagari (Hindi)
-            r'\u0A00-\u0A7F'    # Gurmukhi (Punjabi)
-            r'\u0B80-\u0BFF'    # Tamil
-            r'\u0C00-\u0C7F'    # Telugu
-            r'\u0400-\u04FF'    # Cyrillic (Russian, Bulgarian, etc.)
-            r'\u10A0-\u10FF'    # Georgian
-            r'\u0530-\u058F'    # Armenian
-            r'\u0E00-\u0E7F'    # Thai
-            r'\u1000-\u109F'    # Myanmar
-            r'\u1C50-\u1C7F'    # Ol Chiki (Santali) — common STT echo artifact
-            r'\u3040-\u309F'    # Hiragana (Japanese)
-            r'\u30A0-\u30FF'    # Katakana (Japanese)
-            r'\u4E00-\u9FFF]',  # CJK (Chinese)
+        # Detect garbled text: WHITELIST approach.
+        # This system only handles English (Latin) and Arabic.
+        # If the transcript contains characters outside these scripts
+        # (plus common punctuation/digits), it's garbled STT output.
+        # Strip allowed characters and check if anything remains.
+        import re
+        allowed_chars = re.sub(
+            r'[\u0000-\u007F'    # Basic Latin (ASCII — letters, digits, punctuation)
+            r'\u00A0-\u00FF'     # Latin-1 Supplement (accented chars)
+            r'\u0100-\u024F'     # Latin Extended
+            r'\u0600-\u06FF'     # Arabic
+            r'\u0750-\u077F'     # Arabic Supplement
+            r'\u08A0-\u08FF'     # Arabic Extended-A
+            r'\uFB50-\uFDFF'     # Arabic Presentation Forms-A
+            r'\uFE70-\uFEFF'     # Arabic Presentation Forms-B
+            r'\u200B-\u200F'     # Zero-width and directional marks
+            r'\u2000-\u206F'     # General punctuation
+            r'\s]+',             # Whitespace
+            '',
             transcript
-        ))
+        )
+        has_unexpected_script = len(allowed_chars) > 0
 
         if has_unexpected_script and not has_arabic:
             # STT garbled the audio into an unexpected script.
             # This is usually echo or misrecognized Arabic on phone-quality audio.
-            logger.warning(f"Orchestrator: Detected garbled text from unexpected script: '{transcript}' — ignoring")
+            logger.warning(f"Orchestrator: Detected non-Latin/Arabic script in transcript: '{transcript}' (foreign chars: '{allowed_chars[:30]}') — ignoring")
             # Don't even send to LLM — just drop it entirely.
-            # Sending "[unclear audio]" causes the LLM to respond with
-            # "I can't understand" which frustrates the caller.
             return
 
         if has_arabic:
