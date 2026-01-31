@@ -309,9 +309,13 @@ CRITICAL - ARABIC NUMBER/TIME PRONUNCIATION:
 - Write all numbers as Arabic words: واحد، اثنين، ثلاثة، etc.
 - Example: instead of "Monday, February 02 at 2:30 PM", say "يوم الاثنين الثاني من فبراير الساعة الثانية والنصف بعد الظهر"
 
+FIRST INTERACTION WITH NEW CALLERS:
+- After greeting, the caller will respond (choose a language, say hello, or ask a question directly).
+- If their name is unknown, ask for it naturally early in the conversation — but DON'T force it. If the caller jumps straight to asking a question, help them first and ask for the name when it fits naturally.
+- If the caller says their name unprompted, register it immediately.
+
 CALLER NAME REGISTRATION:
 - CRITICAL: When the caller tells you their name, you MUST call the register_caller_name tool BEFORE responding. This is your #1 priority — never skip this tool call.
-- After you asked "what's your name?", the VERY NEXT thing the caller says is their name. You MUST call register_caller_name with it.
 - NAME CORRECTIONS: If a caller says their name is wrong and corrects it (e.g. "اسمي غادة مش غايد" / "My name is Ghada not Gaid"), you MUST call register_caller_name with the corrected name. The caller knows their own name — always trust them.
 - Only register real human names (e.g. "مروان", "Marwan", "Ahmed", "أحمد", "غادة", "Ghada")
 - NEVER register garbled/unclear speech as a name. If the text looks nonsensical or garbled (random sounds, filler words like "همم", "اه"), ask the caller to repeat their name clearly.
@@ -329,6 +333,70 @@ HANDLING UNCLEAR/GARBLED SPEECH:
 - If the text contains characters from unexpected scripts (Bengali, Hindi, etc.) while the conversation is in Arabic or English, treat it as garbled audio and ask to repeat
 
 Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
+
+    async def _generate_greeting(self, context: ConversationContext) -> str:
+        """
+        Generate greeting via LLM based on caller context.
+        GPT-4o decides what to say based on whether caller is known/new, their language, etc.
+        Falls back to a simple template if LLM fails.
+        """
+        from services.llm.llm_base import LLMRequest
+
+        try:
+            if context.caller_name and context.language and context.language != "auto":
+                # Known caller with language preference
+                greeting_prompt = (
+                    f"You are Sarah, phone receptionist at Flexible Accounting. "
+                    f"A returning caller just picked up the phone. Their name is {context.caller_name} "
+                    f"and they prefer {'Arabic' if context.language == 'ar' else 'English'}. "
+                    f"Generate a warm, brief greeting (1 sentence max). Use their name. "
+                    f"Speak in their preferred language. Ask how you can help today. "
+                    f"Be natural and human — like greeting someone you know."
+                )
+            elif context.caller_name:
+                # Known caller, unknown language
+                greeting_prompt = (
+                    f"You are Sarah, phone receptionist at Flexible Accounting. "
+                    f"A returning caller just picked up the phone. Their name is {context.caller_name}. "
+                    f"Generate a warm, brief greeting (1 sentence max) in English. "
+                    f"Use their name. Ask how you can help today."
+                )
+            else:
+                # New caller — need to introduce yourself and ask language preference
+                greeting_prompt = (
+                    "You are Sarah, phone receptionist at Flexible Accounting. "
+                    "A new caller just picked up the phone. You don't know their name yet. "
+                    "Generate a brief, friendly greeting (1-2 sentences max) in English. "
+                    "Introduce yourself as Sarah from Flexible Accounting. "
+                    "Mention you speak English and Arabic, and ask which language they prefer. "
+                    "Keep it short and natural."
+                )
+
+            request = LLMRequest(
+                messages=[Message(role=LLMRole.USER, content=greeting_prompt)],
+                temperature=0.8,
+                max_tokens=80,
+                stream=False
+            )
+
+            response = await self.llm.chat(request)
+            greeting = response.strip().strip('"')  # Remove any quotes LLM might add
+
+            if greeting and len(greeting) > 5:
+                logger.info(f"Orchestrator: LLM generated greeting: '{greeting[:60]}...'")
+                return greeting
+
+        except Exception as e:
+            logger.warning(f"Orchestrator: LLM greeting failed, using fallback: {e}")
+
+        # Fallback — simple templates if LLM fails
+        if context.caller_name:
+            if context.language == "ar":
+                return f"هلا {context.caller_name}! أنا سارة من فليكسبل أكاونتنغ. كيف أقدر أساعدك؟"
+            else:
+                return f"Hey {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?"
+        else:
+            return "Hi, thank you for calling Flexible Accounting! I'm Sarah, and I speak English and Arabic. Which language do you prefer?"
 
     async def handle_call(self, call_sid: str, phone_number: str, websocket, stream_sid: str = "") -> None:
         """
@@ -415,20 +483,26 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Media handler registered")
 
             # =====================================================
-            # STEP 6: Get greeting and send it
+            # STEP 6: Generate greeting via LLM and send it
             # =====================================================
-            logger.info(f"Orchestrator: Getting greeting...")
-            greeting = self.caller_service.get_greeting_for_caller(phone_number, caller_language)
-            logger.info(f"Orchestrator: Greeting: '{greeting[:50]}...'")
+            # GPT-4o generates the greeting based on caller context
+            # (returning vs new caller, language preference, etc.)
+            # Fallback to simple template if LLM fails.
+            logger.info(f"Orchestrator: Generating LLM greeting...")
+            greeting = await self._generate_greeting(context)
+            greeting_lang = caller_language if caller_language != "auto" else "en"
+            logger.info(f"Orchestrator: Greeting: '{greeting[:80]}...'")
 
-            # Send greeting immediately (no delay - this was causing race conditions)
-            # We wait for STT to be ready first
+            # Add greeting to conversation history so LLM knows what it already said
+            context.add_assistant_message(greeting)
+
+            # Send greeting immediately
             await asyncio.sleep(0.5)  # Brief pause for audio queue to stabilize
             logger.info(f"Orchestrator: Sending greeting...")
             async with state_lock:
                 context.state = ConversationState.SPEAKING
             try:
-                await self._speak_to_caller(call_sid, greeting, caller_language)
+                await self._speak_to_caller(call_sid, greeting, greeting_lang)
                 logger.info(f"Orchestrator: Greeting sent successfully")
             except Exception as e:
                 logger.error(f"Orchestrator: Failed to send greeting: {e}")
@@ -748,43 +822,23 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # =====================================================
         context.add_user_message(transcript)
 
-        # =====================================================
-        # FIRST RESPONSE: Language chosen → ask for name
-        # =====================================================
-        # This block handles ONLY the language preference response.
-        # Do NOT try to extract names here — the caller is choosing a language,
-        # not introducing themselves. Name extraction is handled by the LLM
-        # via the register_caller_name tool in normal conversation flow.
-        if not context.is_known_caller and not getattr(context, '_language_set', False):
-            # NOISE FILTER: Ignore very short/meaningless utterances like "Eee", "Uh", etc.
-            # These are hesitation sounds, not a language choice. Wait for real speech.
-            cleaned = transcript.strip().strip('.,!?؟').strip()
-            is_noise = (
-                len(cleaned) <= 3
-                or cleaned.lower() in [
-                    "eee", "ee", "uh", "um", "ah", "eh", "hmm", "hm",
-                    "uhh", "umm", "ahh", "ehh", "mmm", "mm",
-                    "اه", "هم", "ام", "آه",
-                ]
-            )
-
-            if is_noise:
-                logger.info(f"Orchestrator: Ignoring noise/hesitation before language set: '{transcript}'")
-                return
-
-            # Mark that we've processed the language choice
-            context._language_set = True
-            # LLM will handle name registration via register_caller_name tool
-
-            # Ask for name in detected language
-            if context.language == "ar":
-                response = "أهلاً فيك! ممكن أعرف اسمك الكريم؟"
-            else:
-                response = "Great! May I have your name please?"
-            await self._speak_to_caller(call_sid, response, context.language)
+        # NOISE FILTER: Ignore very short/meaningless utterances like "Eee", "Uh", etc.
+        # These are hesitation sounds on phone audio, not real speech.
+        cleaned = transcript.strip().strip('.,!?؟').strip()
+        is_noise = (
+            len(cleaned) <= 3
+            or cleaned.lower() in [
+                "eee", "ee", "uh", "um", "ah", "eh", "hmm", "hm",
+                "uhh", "umm", "ahh", "ehh", "mmm", "mm",
+                "اه", "هم", "ام", "آه",
+            ]
+        )
+        if is_noise:
+            logger.info(f"Orchestrator: Ignoring noise/hesitation: '{transcript}'")
             return
 
-        # All transcripts go to GPT-4o — the LLM decides intent (goodbye, transfer, booking, etc.)
+        # All transcripts go to GPT-4o — the LLM decides everything (greeting follow-up,
+        # name collection, booking, transfer, goodbye, etc.). No hardcoded responses.
         # via function calling tools. No hardcoded keyword matching.
 
         # Get state lock for this call
