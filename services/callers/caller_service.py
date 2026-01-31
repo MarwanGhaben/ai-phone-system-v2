@@ -84,7 +84,9 @@ class CallerRecognitionService:
         return caller.get("language") if caller else None
 
     def get_caller_info(self, phone_number: str) -> Optional[Dict]:
-        """Get full caller info"""
+        """Get full caller info (reloads from disk to handle multi-worker)"""
+        # Reload from disk in case another worker saved new data
+        self._load_callers()
         return self._callers.get(phone_number)
 
     def register_caller(self, phone_number: str, name: str, language: str = "en") -> Dict:
@@ -152,31 +154,34 @@ class CallerRecognitionService:
             return True
         return phone_number.lower().strip() in private_indicators
 
-    def get_greeting_for_caller(self, phone_number: str, language: str = "en") -> str:
+    def get_greeting_for_caller(self, phone_number: str, language: str = "auto") -> str:
         """
         Get personalized greeting for caller
 
         Args:
             phone_number: Caller's phone number
-            language: Current language ('en' or 'ar')
+            language: Current language ('en', 'ar', or 'auto')
 
         Returns:
             Greeting message
         """
         caller_name = self.get_caller_name(phone_number)
+        caller_language = self.get_caller_language(phone_number)
 
         if caller_name:
-            # Returning caller
-            if language == "ar":
-                return f"مرحباً {caller_name}! سعيد بالحديث معك مرة أخرى. كيف يمكنني مساعدتك اليوم؟"
+            # Returning caller — greet in their preferred language
+            lang = caller_language or language
+            if lang == "ar":
+                return f"هلا {caller_name}! أنا سارة من فليكسبل أكاونتنغ، أهلاً فيك مرة ثانية. كيف أقدر أساعدك اليوم؟"
             else:
-                return f"Hi {caller_name}! Great to talk with you again. How can I help you today?"
+                return f"Hey {caller_name}! It's Sarah from Flexible Accounting, great to hear from you again. How can I help you today?"
         else:
-            # New caller - ask for name
-            if language == "ar":
-                return "أهلاً بك! أنا المساعد الصوتي لشركة iFlex Tax. هل لي باسمك من فضلك؟"
-            else:
-                return "Hi! I'm the AI assistant for iFlex Tax. May I have your name please?"
+            # New caller — English-only greeting, caller can request Arabic
+            return (
+                "Hi, thank you for contacting Flexible Accounting! "
+                "My name is Sarah, and I speak English and Arabic. "
+                "Which language do you prefer?"
+            )
 
     def get_all_callers(self) -> Dict:
         """Get all caller data"""

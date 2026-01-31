@@ -74,6 +74,14 @@ services:
       MS_BOOKINGS_TENANT_ID: ${MS_BOOKINGS_TENANT_ID}
       MS_BOOKINGS_CLIENT_ID: ${MS_BOOKINGS_CLIENT_ID}
       MS_BOOKINGS_CLIENT_SECRET: ${MS_BOOKINGS_CLIENT_SECRET}
+      MS_BOOKINGS_BUSINESS_ID: ${MS_BOOKINGS_BUSINESS_ID:-}
+
+      # SMS (Telnyx)
+      TELNYX_API_KEY: ${TELNYX_API_KEY:-}
+      TELNYX_PHONE_NUMBER: ${TELNYX_PHONE_NUMBER:-}
+
+      # Call Transfer
+      TRANSFER_PHONE_NUMBER: ${TRANSFER_PHONE_NUMBER:-}
 
       # Security
       SECRET_KEY: ${SECRET_KEY:-change-this-in-production}
@@ -89,6 +97,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./config:/app/config:ro
+      - ./data:/app/data
     depends_on:
       postgres:
         condition: service_healthy

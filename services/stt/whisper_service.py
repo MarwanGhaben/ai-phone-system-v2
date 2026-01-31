@@ -51,7 +51,7 @@ class WhisperSTT(STTServiceBase):
         api_key: str,
         language: str = "en",  # Whisper uses ISO 639-1 codes (en, ar, not en-US)
         model: str = "whisper-1",
-        silence_threshold: float = 0.3,  # Energy threshold for silence detection
+        silence_threshold: float = 0.02,  # Energy threshold for silence detection (μ-law silence ~0.004)
         silence_duration: float = 1.0,  # Seconds of silence to trigger transcription
         min_audio_length: float = 0.5,  # Minimum audio length before transcribing
     ):
@@ -158,7 +158,7 @@ class WhisperSTT(STTServiceBase):
         try:
             # Store chunk for later transcription
             self._audio_buffer.append(audio_chunk.data)
-            self._total_samples += len(audio_chunk.data) // 2  # 16-bit = 2 bytes per sample
+            self._total_samples += len(audio_chunk.data)  # μ-law = 8-bit = 1 byte per sample
 
             # Track timing
             import time
@@ -176,9 +176,9 @@ class WhisperSTT(STTServiceBase):
             if not hasattr(self, '_chunk_count'):
                 self._chunk_count = 0
             self._chunk_count += 1
-            if self._chunk_count == 1 or self._chunk_count % 50 == 0:
+            if self._chunk_count == 1 or self._chunk_count % 100 == 0:
                 duration = self._total_samples / 8000  # 8kHz sample rate
-                logger.debug(f"Whisper: Buffered {self._chunk_count} chunks, {duration:.2f}s audio")
+                logger.info(f"Whisper: Buffered {self._chunk_count} chunks, {duration:.2f}s audio")
 
         except Exception as e:
             logger.error(f"Whisper: Error buffering audio: {e}")
@@ -229,11 +229,11 @@ class WhisperSTT(STTServiceBase):
 
     def _has_speech_energy(self, audio_data: bytes, threshold: float = None) -> bool:
         """
-        Simple speech energy detection
+        Speech energy detection using proper μ-law decoding
 
         Args:
             audio_data: μ-law encoded audio
-            threshold: Energy threshold (0-1)
+            threshold: Energy threshold (0-1, relative to max amplitude)
 
         Returns:
             True if speech energy detected
@@ -242,18 +242,32 @@ class WhisperSTT(STTServiceBase):
             threshold = self.silence_threshold
 
         try:
-            # Convert μ-law to 16-bit PCM for energy calculation
-            # Simple approach: count samples above threshold
+            # Decode μ-law to get actual sample values
+            # Use a simpler decode table for performance
             energy = 0
             sample_count = len(audio_data)
 
-            # μ-law decode approximation
-            for byte in audio_data[:sample_count]:
-                # Convert unsigned byte to signed value
-                sample = (byte - 128) / 128.0  # Normalize to -1 to 1
-                energy += abs(sample)
+            for byte in audio_data:
+                # Proper μ-law decode (simplified)
+                mu = 255 - byte
+                magnitude = ((mu & 0x0F) << 3) + 0x84
+                exponent = (mu & 0x70) >> 4
+                if exponent > 0:
+                    magnitude = magnitude << (exponent - 1)
+                if mu & 0x80:
+                    magnitude = -magnitude
+                # Normalize to 0-1 range (max is ~32000)
+                energy += abs(magnitude) / 32000.0
 
             avg_energy = energy / sample_count if sample_count > 0 else 0
+
+            # Log periodically for debugging
+            if not hasattr(self, '_energy_log_count'):
+                self._energy_log_count = 0
+            self._energy_log_count += 1
+            if self._energy_log_count == 1 or self._energy_log_count % 200 == 0:
+                logger.info(f"Whisper: Energy={avg_energy:.4f}, threshold={threshold}, has_speech={avg_energy > threshold}")
+
             return avg_energy > threshold
 
         except Exception:
@@ -289,7 +303,7 @@ class WhisperSTT(STTServiceBase):
                 if (silence_duration >= self.silence_duration and
                     buffer_duration >= self.min_audio_length):
 
-                    logger.debug(f"Whisper: Silence detected ({silence_duration:.1f}s), transcribing...")
+                    logger.info(f"Whisper: Silence detected ({silence_duration:.1f}s), buffer={buffer_duration:.1f}s, transcribing...")
                     await self._transcribe_buffer()
 
             except asyncio.CancelledError:

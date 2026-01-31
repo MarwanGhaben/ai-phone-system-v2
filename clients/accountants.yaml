@@ -7,7 +7,7 @@
 accountants:
   - name: "Hussam Saadaldin"
     name_ar: "حسام سعد الدين"
-    aliases: ["Hossam", "Hussam", "Hossam Saadaldin", "Hussein"]  # Common variations
+    aliases: ["Hossam", "Hussam", "Hossam Saadaldin", "Hussein", "Husain", "Husein", "Hosam", "Housam", "حسام"]  # Common variations
     email: "hussam@iflextax.ca"
     staff_id: ""  # MS Bookings staff ID (optional)
     service_id: "" # MS Bookings service ID (optional)

@@ -70,6 +70,9 @@ class ConversationContext:
     is_known_caller: bool = False
     name_collected: bool = False  # True if we already got their name
 
+    # Pending booking (set by check_appointment, used by confirm_appointment)
+    pending_booking: Optional[Dict[str, Any]] = None
+
     # =====================================================
     # CONVERSATION HISTORY (Phase 1.2 fix)
     # =====================================================
@@ -165,7 +168,12 @@ class ConversationOrchestrator:
         self._stt_config = settings.model_dump()
 
         # Log service availability
-        logger.info(f"STT provider: {self._stt_provider} (Whisper supports Arabic, Deepgram is English-only)")
+        stt_info = {
+            'whisper': 'Whisper - batch mode, supports Arabic',
+            'deepgram': 'Deepgram - real-time, English-only',
+            'elevenlabs': 'ElevenLabs Scribe v2 - real-time 150ms latency, supports Arabic'
+        }
+        logger.info(f"STT provider: {self._stt_provider} ({stt_info.get(self._stt_provider, 'unknown')})")
         if not self.tts:
             logger.warning("TTS service not available - audio responses will be limited")
 
@@ -176,8 +184,18 @@ class ConversationOrchestrator:
         self._call_stt_instances: Dict[str, Any] = {}  # Per-call STT instances
         self._call_state_locks: Dict[str, asyncio.Lock] = {}  # Per-call state locks
 
-        # Barge-in detection
-        self._energy_threshold: float = settings.interruption_energy_threshold
+        # Barge-in detection (per-call)
+        self._barge_in_consecutive: Dict[str, int] = {}  # Per-call consecutive high-energy frame count
+        self._barge_in_speech_start: Dict[str, float] = {}  # Per-call timestamp when SPEAKING started
+
+        # Echo guard: tracks when audio playback is expected to finish per call
+        # During this window, STT transcripts are ignored (echo from phone speaker)
+        self._echo_guard_until: Dict[str, float] = {}
+
+        # Garbled transcript counter: tracks consecutive garbled drops per call
+        # After N garbled drops, auto-reconnect STT with Arabic (the most common cause)
+        self._garbled_drop_count: Dict[str, int] = {}
+        self._GARBLED_AUTO_SWITCH_THRESHOLD = 3  # After 3 garbled drops, try Arabic
 
         # System prompt for the AI
         self._system_prompt = self._get_system_prompt()
@@ -193,11 +211,28 @@ class ConversationOrchestrator:
         """Get system prompt for LLM"""
         # Get accountant names from service
         from services.config.accountants_service import get_accountants_service
+        from datetime import datetime
         acc_service = get_accountants_service()
         accountant_names_en = acc_service.get_names_formatted("en")
         accountant_names_ar = acc_service.get_names_formatted("ar")
 
-        return f"""You are a professional phone receptionist for iFlex Tax, a Canadian accounting firm.
+        # Inject today's date so the LLM can calculate correct dates
+        today = datetime.now()
+        today_str = today.strftime('%A, %B %d, %Y')  # e.g. "Friday, January 30, 2026"
+
+        return f"""You are Sarah, a friendly and professional phone receptionist for Flexible Accounting (also known as iFlex Tax), a Canadian accounting firm.
+
+YOUR IDENTITY:
+- Your name is Sarah
+- You work at Flexible Accounting
+- Be warm, natural, and human - like a real person, not a robot
+- Use casual but professional tone
+
+TODAY'S DATE: {today_str}
+Use this to calculate correct dates. For example if today is Friday January 30, then:
+- "tomorrow" = Saturday, January 31
+- "Monday" or "next Monday" = Monday, February 02
+- "next week Tuesday" = Tuesday, February 03
 
 YOUR ROLE:
 - Be the first point of contact for callers
@@ -212,31 +247,53 @@ SERVICES OFFERED:
 - Corporate tax planning
 
 CRITICAL - RESPONSE STYLE:
-- Keep responses EXTREMELY BRIEF (1-2 sentences, max 50 words)
-- This is a VOICE call - long responses frustrate callers
-- Get straight to the point
-- Don't repeat the question back
-- Don't list multiple options at once
+- Keep responses EXTREMELY BRIEF — maximum 1-2 short sentences (under 30 words)
+- This is a VOICE call — every extra word wastes the caller's time
+- NEVER give long explanations or list multiple items
+- If asked about services, give a ONE-SENTENCE summary and ask if they want details on anything specific
+- Get straight to the point. Don't repeat the question back.
 - Ask ONE question at a time
+- In Arabic, be even shorter — Arabic speech takes longer to say
 
-APPOINTMENT BOOKING:
+APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - Accountants available: {accountant_names_en}
 - In Arabic: {accountant_names_ar}
+- BUSINESS HOURS: Monday to Friday only. The office is CLOSED on Saturday and Sunday.
+  If a caller requests a weekend date, politely let them know and suggest the next available weekday.
 - Ask: Individual or corporate client?
-- Ask: Preferred accountant?
+- Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
-- Confirm all details before ending
+- STEP 1: Call check_appointment to check availability. NEVER call confirm_appointment without checking first.
+- STEP 2: If SLOT_AVAILABLE, tell the caller the time is available and ASK them to confirm before booking. Example: "The appointment with Rami on Monday, February 02 at 2:00 PM is available. Would you like me to go ahead and book it?"
+- STEP 3: ONLY after the caller says YES/confirms, call confirm_appointment with confirm=true. If they say no, call confirm_appointment with confirm=false.
+- CRITICAL: date_time parameter MUST be in "YYYY-MM-DD HH:MM" format (24-hour). Use today's date ({today_str}) to calculate. NEVER pass Arabic text as date_time.
+- CRITICAL: accountant_name parameter MUST be the English name (e.g. "Hussam Saadaldin", "Rami Kahwaji", "Abdul ElFarra"). NEVER pass Arabic names.
+- IMPORTANT: Callers may mispronounce or approximate accountant names. Match to the closest name: "Husain"/"Hussein"/"Hosam" → "Hussam Saadaldin", "Rami"/"رامي" → "Rami Kahwaji", "Abdul"/"عبدول" → "Abdul ElFarra". NEVER say "we don't have that accountant" if the name is close to one on the list.
+- If the system returns BOOKING_UNAVAILABLE, read the suggested dates/times EXACTLY as provided - do NOT change or guess dates. Tell the caller the exact alternatives.
+- CRITICAL: After BOOKING_UNAVAILABLE, when the caller picks a new time, you MUST call check_appointment AGAIN with the new date_time. NEVER call confirm_appointment directly after UNAVAILABLE — always re-check the new time first.
+- IMPORTANT: Do NOT tell the caller "I've booked it" unless you received BOOKING_SUCCESS from confirm_appointment.
+- If booking fails, apologize and offer to transfer to a human
 
 WHEN TO TRANSFER:
-- Caller asks to speak with a specific person by name
-- Complex tax planning questions
+- Caller EXPLICITLY asks to speak with a specific person by name (e.g. "أبي أكلم حسام" / "I want to speak to Hussam")
+- Caller EXPLICITLY asks to be transferred (e.g. "حولني" / "transfer me")
+- Complex tax planning questions that require an accountant's expertise
 - Client-specific questions (their tax situation, past returns)
-- If you don't know the answer
-- If caller seems frustrated or confused
+- IMPORTANT: Do NOT transfer just because you don't fully understand what the caller said.
+  Instead, ask a clarifying question like "عذراً، ممكن توضح أكثر؟" / "Sorry, could you clarify?"
+- IMPORTANT: Do NOT transfer if the caller's request is unclear or vague. Always ask for clarification first.
+- Only transfer after you've tried at least once to understand and help the caller.
 
 TRANSFER SCRIPT:
 "Of course, let me transfer you now." (English)
 "بالتأكيد، سأحولك الآن." (Arabic)
+
+ENDING THE CALL:
+- When the caller says goodbye, thanks you and is done, or clearly wants to hang up — say a brief goodbye and call the end_call tool.
+- Examples: "bye" / "goodbye" / "thanks, that's all" / "مع السلامة" / "شكراً، خلص" / "يلا باي"
+- IMPORTANT: Do NOT end the call just because the caller says "thank you" in the middle of a conversation. "Thanks" mid-conversation is NOT a goodbye — the caller may have more questions.
+- Only end when the conversation is truly finished and the caller has no more requests.
+- Always say a natural goodbye BEFORE calling end_call — never hang up silently.
 
 LANGUAGE DETECTION:
 - If caller speaks Arabic, respond in Arabic
@@ -244,7 +301,103 @@ LANGUAGE DETECTION:
 - Keep Arabic responses brief and natural
 - Use simple, conversational Arabic
 
+CRITICAL - ARABIC NUMBER/TIME PRONUNCIATION:
+- When speaking Arabic, ALWAYS write times and dates using Arabic words, NOT digits
+- NEVER use "02:30 PM" or "10:00 AM" in Arabic responses — the voice system cannot pronounce them
+- Instead say: "الساعة الثانية والنصف بعد الظهر" (2:30 PM) or "الساعة العاشرة صباحاً" (10:00 AM)
+- For days use Arabic: الاثنين، الثلاثاء، الأربعاء، الخميس، الجمعة، السبت، الأحد
+- For months use Arabic: يناير، فبراير، مارس، أبريل، etc.
+- Write all numbers as Arabic words: واحد، اثنين، ثلاثة، etc.
+- Example: instead of "Monday, February 02 at 2:30 PM", say "يوم الاثنين الثاني من فبراير الساعة الثانية والنصف بعد الظهر"
+
+FIRST INTERACTION WITH NEW CALLERS:
+- After greeting, the caller will respond (choose a language, say hello, or ask a question directly).
+- If their name is unknown, ask for it naturally early in the conversation — but DON'T force it. If the caller jumps straight to asking a question, help them first and ask for the name when it fits naturally.
+- If the caller says their name unprompted, register it immediately.
+
+CALLER NAME REGISTRATION:
+- CRITICAL: When the caller tells you their name, you MUST call the register_caller_name tool BEFORE responding. This is your #1 priority — never skip this tool call.
+- NAME CORRECTIONS: If a caller says their name is wrong and corrects it (e.g. "اسمي غادة مش غايد" / "My name is Ghada not Gaid"), you MUST call register_caller_name with the corrected name. The caller knows their own name — always trust them.
+- Only register real human names (e.g. "مروان", "Marwan", "Ahmed", "أحمد", "غادة", "Ghada")
+- NEVER register garbled/unclear speech as a name. If the text looks nonsensical or garbled (random sounds, filler words like "همم", "اه"), ask the caller to repeat their name clearly.
+- If the caller says "أنا اسمي مروان" → call register_caller_name with "مروان"
+- If the caller says "My name is John" → call register_caller_name with "John"
+- If the caller says "اسمي غادة مش غايد" → call register_caller_name with "غادة"
+- If the caller says something like "أنا بحب العربي" (I prefer Arabic) → this is NOT a name, do not register anything
+- A real name is typically 1-3 words and is a recognizable personal name. If it doesn't look like a name, ask again.
+
+HANDLING UNCLEAR/GARBLED SPEECH:
+- Phone calls often have audio quality issues — speech may be unclear or garbled
+- If you receive garbled or unclear text, DO NOT try to interpret it as a name or meaningful input
+- Simply say: "Sorry, I didn't catch that. Could you repeat?" / "عذراً، ما سمعتك منيح. ممكن تعيد؟"
+- NEVER guess what the caller meant from garbled text
+- If the text contains characters from unexpected scripts (Bengali, Hindi, etc.) while the conversation is in Arabic or English, treat it as garbled audio and ask to repeat
+
 Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
+
+    async def _generate_greeting(self, context: ConversationContext) -> str:
+        """
+        Generate greeting via LLM based on caller context.
+        GPT-4o decides what to say based on whether caller is known/new, their language, etc.
+        Falls back to a simple template if LLM fails.
+        """
+        from services.llm.llm_base import LLMRequest
+
+        try:
+            if context.caller_name and context.language and context.language != "auto":
+                # Known caller with language preference
+                greeting_prompt = (
+                    f"You are Sarah, phone receptionist at Flexible Accounting. "
+                    f"A returning caller just picked up the phone. Their name is {context.caller_name} "
+                    f"and they prefer {'Arabic' if context.language == 'ar' else 'English'}. "
+                    f"Generate a warm, brief greeting (1 sentence max). Use their name. "
+                    f"Speak in their preferred language. Ask how you can help today. "
+                    f"Be natural and human — like greeting someone you know."
+                )
+            elif context.caller_name:
+                # Known caller, unknown language
+                greeting_prompt = (
+                    f"You are Sarah, phone receptionist at Flexible Accounting. "
+                    f"A returning caller just picked up the phone. Their name is {context.caller_name}. "
+                    f"Generate a warm, brief greeting (1 sentence max) in English. "
+                    f"Use their name. Ask how you can help today."
+                )
+            else:
+                # New caller — need to introduce yourself and ask language preference
+                greeting_prompt = (
+                    "You are Sarah, phone receptionist at Flexible Accounting. "
+                    "A new caller just picked up the phone. You don't know their name yet. "
+                    "Generate a brief, friendly greeting (1-2 sentences max) in English. "
+                    "Introduce yourself as Sarah from Flexible Accounting. "
+                    "Mention you speak English and Arabic, and ask which language they prefer. "
+                    "Keep it short and natural."
+                )
+
+            request = LLMRequest(
+                messages=[Message(role=LLMRole.USER, content=greeting_prompt)],
+                temperature=0.8,
+                max_tokens=80,
+                stream=False
+            )
+
+            response = await self.llm.chat(request)
+            greeting = response.content.strip().strip('"')  # Remove any quotes LLM might add
+
+            if greeting and len(greeting) > 5:
+                logger.info(f"Orchestrator: LLM generated greeting: '{greeting[:60]}...'")
+                return greeting
+
+        except Exception as e:
+            logger.warning(f"Orchestrator: LLM greeting failed, using fallback: {e}")
+
+        # Fallback — simple templates if LLM fails
+        if context.caller_name:
+            if context.language == "ar":
+                return f"هلا {context.caller_name}! أنا سارة من فليكسبل أكاونتنغ. كيف أقدر أساعدك؟"
+            else:
+                return f"Hey {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?"
+        else:
+            return "Hi, thank you for calling Flexible Accounting! I'm Sarah, and I speak English and Arabic. Which language do you prefer?"
 
     async def handle_call(self, call_sid: str, phone_number: str, websocket, stream_sid: str = "") -> None:
         """
@@ -265,16 +418,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # =====================================================
             # CRITICAL: Each call gets its own STT instance to avoid
             # queue/buffer sharing between concurrent calls
-            logger.info(f"Orchestrator: Creating per-call STT instance (provider={self._stt_provider})")
-            call_stt = create_stt_service(self._stt_provider, self._stt_config)
-            self._call_stt_instances[call_sid] = call_stt
-
-            # Create per-call state lock for thread-safe state changes
-            state_lock = asyncio.Lock()
-            self._call_state_locks[call_sid] = state_lock
-
             # =====================================================
-            # STEP 2: Get caller info
+            # STEP 1a: Get caller info FIRST (need language for STT)
             # =====================================================
             logger.info(f"Orchestrator: Getting caller info for {phone_number}")
             caller_info = self.caller_service.get_caller_info(phone_number)
@@ -282,6 +427,24 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             caller_language = caller_info.get("language", "auto") if caller_info else "auto"
 
             logger.info(f"Orchestrator: Caller info - name={caller_name}, language={caller_language}")
+
+            # =====================================================
+            # STEP 1b: Create per-call STT with language hint
+            # =====================================================
+            # For known callers, set STT language explicitly.
+            # This DRAMATICALLY improves accuracy vs auto-detect on phone audio.
+            stt_config = self._stt_config.copy()
+            if caller_language and caller_language != "auto":
+                stt_config['elevenlabs_stt_language'] = caller_language
+                logger.info(f"Orchestrator: Setting STT language to '{caller_language}' for known caller")
+
+            logger.info(f"Orchestrator: Creating per-call STT instance (provider={self._stt_provider})")
+            call_stt = create_stt_service(self._stt_provider, stt_config)
+            self._call_stt_instances[call_sid] = call_stt
+
+            # Create per-call state lock for thread-safe state changes
+            state_lock = asyncio.Lock()
+            self._call_state_locks[call_sid] = state_lock
 
             # =====================================================
             # STEP 3: Create conversation context
@@ -321,43 +484,60 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Media handler registered")
 
             # =====================================================
-            # STEP 6: Get greeting and send it
+            # STEP 6: Start connection handler + transcript consumer
             # =====================================================
-            logger.info(f"Orchestrator: Getting greeting...")
-            greeting = self.caller_service.get_greeting_for_caller(phone_number, caller_language)
-            logger.info(f"Orchestrator: Greeting: '{greeting[:50]}...'")
-
-            # Send greeting immediately (no delay - this was causing race conditions)
-            # We wait for STT to be ready first
-            await asyncio.sleep(0.5)  # Brief pause for audio queue to stabilize
-            logger.info(f"Orchestrator: Sending greeting...")
-            async with state_lock:
-                context.state = ConversationState.SPEAKING
-            try:
-                await self._speak_to_caller(call_sid, greeting, caller_language)
-                logger.info(f"Orchestrator: Greeting sent successfully")
-            except Exception as e:
-                logger.error(f"Orchestrator: Failed to send greeting: {e}")
-            finally:
-                async with state_lock:
-                    context.state = ConversationState.LISTENING
-
-            # =====================================================
-            # STEP 7: Start transcript consumer for this call's STT
-            # =====================================================
+            # IMPORTANT: Start these BEFORE the greeting so that:
+            # 1. The audio queue consumer is active (sends queued audio to Twilio)
+            # 2. Barge-in detection works during greeting playback
+            # 3. Transcript consumer is ready for caller's first response
+            logger.info(f"Orchestrator: Starting connection handler...")
+            connection_task = asyncio.create_task(
+                twilio_handler.handle_connection(),
+                name=f"connection_{call_sid}"
+            )
             logger.info(f"Orchestrator: Starting transcript consumer...")
             transcript_task = asyncio.create_task(
                 self._consume_stt_transcripts(call_sid),
                 name=f"transcript_consumer_{call_sid}"
             )
+            # Brief pause for connection handler to initialize
+            await asyncio.sleep(0.2)
 
             # =====================================================
-            # STEP 8: Handle WebSocket connection (incoming audio)
+            # STEP 7: Generate greeting via LLM and send it
             # =====================================================
-            # This runs concurrently with transcript consumer
-            logger.info(f"Orchestrator: Starting connection handler...")
+            # GPT-4o generates the greeting based on caller context
+            # (returning vs new caller, language preference, etc.)
+            # Fallback to simple template if LLM fails.
+            logger.info(f"Orchestrator: Generating LLM greeting...")
+            greeting = await self._generate_greeting(context)
+            greeting_lang = caller_language if caller_language != "auto" else "en"
+            logger.info(f"Orchestrator: Greeting: '{greeting[:80]}...'")
+
+            # Add greeting to conversation history so LLM knows what it already said
+            context.add_assistant_message(greeting)
+
+            # Send greeting (blocks until playback completes — barge-in active)
+            logger.info(f"Orchestrator: Sending greeting...")
+            import time
+            async with state_lock:
+                context.state = ConversationState.SPEAKING
+            self._barge_in_speech_start[call_sid] = time.time()
             try:
-                await twilio_handler.handle_connection()
+                await self._speak_to_caller(call_sid, greeting, greeting_lang)
+                logger.info(f"Orchestrator: Greeting playback complete")
+            except Exception as e:
+                logger.error(f"Orchestrator: Failed to send greeting: {e}")
+                # Ensure we're in LISTENING state on error
+                async with state_lock:
+                    context.state = ConversationState.LISTENING
+
+            # =====================================================
+            # STEP 8: Wait for connection to end (call hangup)
+            # =====================================================
+            logger.info(f"Orchestrator: Waiting for call to end...")
+            try:
+                await connection_task
             finally:
                 # Cancel transcript task when connection ends
                 if not transcript_task.done():
@@ -388,8 +568,16 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         """
         async def process_audio(audio_data: bytes):
             """Process audio chunk"""
+            # Debug: Track audio chunks
+            if not hasattr(process_audio, '_chunk_count'):
+                process_audio._chunk_count = 0
+            process_audio._chunk_count += 1
+            if process_audio._chunk_count == 1 or process_audio._chunk_count % 100 == 0:
+                logger.info(f"Orchestrator: process_audio called - chunk #{process_audio._chunk_count}, {len(audio_data)} bytes")
+
             context = self._conversations.get(call_sid)
             if not context or context.state == ConversationState.ENDED:
+                logger.debug(f"Orchestrator: process_audio skipping - no context or call ended")
                 return
 
             # Get this call's STT instance
@@ -407,19 +595,41 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
             if current_state == ConversationState.SPEAKING:
                 # Check for barge-in (user speech during AI speech)
-                if await self._detect_barge_in(audio_data):
-                    logger.info("Orchestrator: User interrupted!")
+                if await self._detect_barge_in(audio_data, call_sid):
+                    logger.info("Orchestrator: === BARGE-IN DETECTED === User interrupted!")
                     async with state_lock:
-                        context.state = ConversationState.LISTENING  # Don't use INTERRUPTED state
+                        context.state = ConversationState.LISTENING
+
+                    # Clear echo guard so the caller's speech isn't blocked
+                    self._echo_guard_until[call_sid] = 0
+
+                    # Stop TTS generation
                     if self.tts:
-                        await self.tts.stop()  # Stop TTS
-                # ALWAYS skip STT while speaking (whether interrupted or not)
-                # This prevents AI's own voice from being transcribed
+                        await self.tts.stop()
+
+                    # Stop audio playback on Twilio immediately
+                    twilio_handler = self._twilio_handlers.get(call_sid)
+                    if twilio_handler:
+                        await twilio_handler.clear_audio()
+
+                    # Feed this audio chunk to STT so the user's words aren't lost
+                    from services.stt.stt_base import AudioChunk
+                    await call_stt.stream_audio(AudioChunk(data=audio_data))
+                    return
+
+                # Skip STT while AI is speaking (prevents echo)
                 return
+
+            # Always feed audio to STT to keep the WebSocket connection alive.
+            # Echo filtering is done at the transcript level in process_transcript,
+            # NOT here — blocking audio here causes ElevenLabs STT to disconnect
+            # after its inactivity timeout (~15s).
 
             # Stream to this call's STT instance
             from services.stt.stt_base import AudioChunk
             await call_stt.stream_audio(AudioChunk(data=audio_data))
+            if process_audio._chunk_count == 1:
+                logger.info(f"Orchestrator: First audio chunk sent to STT")
 
         return process_audio
 
@@ -487,8 +697,6 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         # Update context
         context.user_transcript = transcript
-        if context.language == "auto" and language:
-            context.language = language
 
         # Only process final transcripts
         if not is_final:
@@ -500,48 +708,153 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Ignoring transcript while AI speaking: '{transcript}'")
             return
 
+        # ECHO GUARD: Ignore transcripts during audio playback window
+        # Even after state goes to LISTENING, audio is still playing through
+        # the phone speaker. The caller's phone mic picks this up as echo,
+        # which STT transcribes as garbled text (e.g., Ol Chiki script).
+        import time
+        echo_guard_end = self._echo_guard_until.get(call_sid, 0)
+        if time.time() < echo_guard_end:
+            remaining = echo_guard_end - time.time()
+            logger.info(f"Orchestrator: Ignoring transcript during echo guard ({remaining:.1f}s remaining): '{transcript[:50]}'")
+            return
+
         logger.info(f"Orchestrator: User said: {transcript}")
+
+        # =====================================================
+        # LANGUAGE DETECTION (auto-detect from first response)
+        # =====================================================
+        # Arabic characters are a DEFINITIVE signal — always check first,
+        # because STT may return language="en" even for Arabic text
+        import re
+        has_arabic = bool(re.search(r'[\u0600-\u06FF]', transcript))
+
+        # Detect garbled text: WHITELIST approach.
+        # This system only handles English (Latin) and Arabic.
+        # If the transcript contains characters outside these scripts
+        # (plus common punctuation/digits), it's garbled STT output.
+        # Strip allowed characters and check if anything remains.
+        import re
+        allowed_chars = re.sub(
+            r'[\u0000-\u007F'    # Basic Latin (ASCII — letters, digits, punctuation)
+            r'\u00A0-\u00FF'     # Latin-1 Supplement (accented chars)
+            r'\u0100-\u024F'     # Latin Extended
+            r'\u0600-\u06FF'     # Arabic
+            r'\u0750-\u077F'     # Arabic Supplement
+            r'\u08A0-\u08FF'     # Arabic Extended-A
+            r'\uFB50-\uFDFF'     # Arabic Presentation Forms-A
+            r'\uFE70-\uFEFF'     # Arabic Presentation Forms-B
+            r'\u200B-\u200F'     # Zero-width and directional marks
+            r'\u2000-\u206F'     # General punctuation
+            r'\s]+',             # Whitespace
+            '',
+            transcript
+        )
+        has_unexpected_script = len(allowed_chars) > 0
+
+        if has_unexpected_script and not has_arabic:
+            # STT garbled the audio into an unexpected script.
+            # This is usually echo or misrecognized Arabic on phone-quality audio.
+            logger.warning(f"Orchestrator: Detected non-Latin/Arabic script in transcript: '{transcript}' (foreign chars: '{allowed_chars[:30]}') — ignoring")
+
+            # Track consecutive garbled drops for this call
+            self._garbled_drop_count[call_sid] = self._garbled_drop_count.get(call_sid, 0) + 1
+            garbled_count = self._garbled_drop_count[call_sid]
+            logger.info(f"Orchestrator: Garbled drop count for {call_sid}: {garbled_count}")
+
+            # After N garbled drops, the caller is almost certainly speaking Arabic
+            # but STT auto-detect is failing. Auto-switch to Arabic and re-prompt.
+            if garbled_count == self._GARBLED_AUTO_SWITCH_THRESHOLD and context.language == "auto":
+                logger.warning(f"Orchestrator: {garbled_count} consecutive garbled transcripts — auto-switching to Arabic")
+                context.language = "ar"
+                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
+                # Re-prompt the caller so they know the system is still listening
+                await self._speak_to_caller(call_sid, "عذراً، ممكن تعيد من فضلك؟", "ar")
+
+            return
+
+        # LANGUAGE KEYWORD DETECTION: If the caller says "Arabic" / "arabi" etc.
+        # in English, they're requesting Arabic — NOT speaking English.
+        # This must be checked BEFORE other language detection logic.
+        # IMPORTANT: Only treat as a language switch if the transcript is SHORT
+        # (a deliberate language request like "English please" or "عربي").
+        # Long sentences containing "english" or "arabic" as part of normal
+        # conversation (e.g. "I'm a living English speaker") should NOT trigger
+        # a language switch — the caller is already speaking that language.
+        transcript_lower = transcript.strip().lower().rstrip('.,!?؟')
+        word_count = len(transcript_lower.split())
+        arabic_keywords = ["arabic", "arabi", "arabik", "3arabi", "عربي"]
+        english_keywords = ["english", "inglish", "inglizi", "انجليزي", "انكليزي", "انجليش", "انجلش"]
+        is_arabic_request = any(kw in transcript_lower for kw in arabic_keywords)
+        is_english_request = any(kw in transcript_lower for kw in english_keywords)
+        # Only treat as language switch if: short phrase (<=5 words) OR language not yet set
+        is_language_switch = (word_count <= 5 or context.language == "auto")
+
+        if is_arabic_request and not is_english_request and is_language_switch:
+            # Caller is requesting Arabic language (short phrase like "Arabic" or "عربي")
+            prev_language = context.language
+            context.language = "ar"
+            logger.info(f"Orchestrator: Detected Arabic language REQUEST from keyword: '{transcript}'")
+            # Reset garbled counter since we got a valid signal
+            self._garbled_drop_count[call_sid] = 0
+            if prev_language != "ar":
+                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
+        elif is_english_request and is_language_switch:
+            # Caller explicitly requested English (short phrase like "English please")
+            # Check BEFORE has_arabic because "انجليش" contains Arabic chars but means "English"
+            prev_language = context.language
+            context.language = "en"
+            logger.info(f"Orchestrator: Detected English language REQUEST from keyword: '{transcript}'")
+            self._garbled_drop_count[call_sid] = 0
+            if prev_language != "en":
+                await self._reconnect_stt_with_language(call_sid, "en", force=True)
+        elif has_arabic:
+            prev_language = context.language
+            context.language = "ar"
+            logger.info(f"Orchestrator: Detected Arabic from text content")
+            # Reset garbled counter since we got a valid Arabic transcript
+            self._garbled_drop_count[call_sid] = 0
+            # Reconnect STT with Arabic if switching from a different language
+            if prev_language != "ar":
+                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
+        elif context.language == "auto":
+            if language and language != "auto":
+                context.language = language
+                logger.info(f"Orchestrator: Auto-detected language from STT: {language}")
+                # Reconnect STT with explicit language
+                await self._reconnect_stt_with_language(call_sid, language)
+            else:
+                context.language = "en"
+                logger.info(f"Orchestrator: Defaulting to English")
+                await self._reconnect_stt_with_language(call_sid, "en")
+
+        # Reset garbled counter on any successful transcript
+        if call_sid in self._garbled_drop_count and not has_unexpected_script:
+            self._garbled_drop_count[call_sid] = 0
 
         # =====================================================
         # ADD USER MESSAGE TO CONVERSATION HISTORY (Phase 1.2)
         # =====================================================
         context.add_user_message(transcript)
 
-        # ===== CALLER NAME EXTRACTION (New Callers) =====
-        if not context.is_known_caller and not context.name_collected:
-            extracted_name = self._extract_caller_name(transcript)
-            if extracted_name:
-                context.caller_name = extracted_name
-                context.name_collected = True
-                # Save caller info
-                self.caller_service.register_caller(
-                    context.phone_number,
-                    extracted_name,
-                    context.language
-                )
-                context.is_known_caller = True
-                logger.info(f"Orchestrator: Extracted and saved caller name: {extracted_name}")
-                # Acknowledge the name
-                if context.language == "ar":
-                    response = f"أهلاً {extracted_name}! كيف يمكنني مساعدتك اليوم؟"
-                else:
-                    response = f"Nice to meet you, {extracted_name}! How can I help you today?"
-                await self._speak_to_caller(call_sid, response, context.language)
-                return
-
-        # Detect intent
-        intent = await self._detect_intent(transcript, context.language)
-        context.detected_intent = intent
-        context.intent_history.append(intent.value)
-
-        # Handle based on intent
-        if intent == Intent.GOODBYE:
-            await self._handle_goodbye(call_sid)
+        # NOISE FILTER: Ignore very short/meaningless utterances like "Eee", "Uh", etc.
+        # These are hesitation sounds on phone audio, not real speech.
+        cleaned = transcript.strip().strip('.,!?؟').strip()
+        is_noise = (
+            len(cleaned) <= 3
+            or cleaned.lower() in [
+                "eee", "ee", "uh", "um", "ah", "eh", "hmm", "hm",
+                "uhh", "umm", "ahh", "ehh", "mmm", "mm",
+                "اه", "هم", "ام", "آه",
+            ]
+        )
+        if is_noise:
+            logger.info(f"Orchestrator: Ignoring noise/hesitation: '{transcript}'")
             return
 
-        if intent == Intent.TRANSFER_TO_HUMAN:
-            await self._handle_transfer(call_sid)
-            return
+        # All transcripts go to GPT-4o — the LLM decides everything (greeting follow-up,
+        # name collection, booking, transfer, goodbye, etc.). No hardcoded responses.
+        # via function calling tools. No hardcoded keyword matching.
 
         # Get state lock for this call
         state_lock = self._call_state_locks.get(call_sid)
@@ -558,11 +871,19 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         response = await self._get_ai_response(call_sid, transcript)
 
+        # Check if transfer was already handled (don't speak the marker)
+        if response == "__TRANSFER_HANDLED__":
+            async with state_lock:
+                context.state = ConversationState.LISTENING
+            return
+
         context.ai_response = response
         context.turn_count += 1
 
+        import time
         async with state_lock:
             context.state = ConversationState.SPEAKING
+        self._barge_in_speech_start[call_sid] = time.time()
 
         # Stream response to caller (this waits for audio to complete)
         await self._speak_to_caller(call_sid, response, context.language)
@@ -570,11 +891,460 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # State is set back to LISTENING inside _speak_to_caller finally block
         # Do NOT set it here to avoid race condition
 
+    def _get_booking_tools(self) -> list:
+        """Get tool definitions for OpenAI function calling"""
+        return [
+            {
+                "name": "check_appointment",
+                "description": "Check if a requested appointment slot is available. Call this FIRST when the user wants to book. Do NOT call confirm_appointment until the caller explicitly confirms.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "client_type": {
+                            "type": "string",
+                            "enum": ["individual", "corporate"],
+                            "description": "Type of client - individual or corporate"
+                        },
+                        "accountant_name": {
+                            "type": "string",
+                            "description": "Preferred accountant name in ENGLISH only. Must be one of: Hussam Saadaldin, Rami Kahwaji, Abdul ElFarra"
+                        },
+                        "date_time": {
+                            "type": "string",
+                            "description": "Preferred date and time in YYYY-MM-DD HH:MM format (24-hour). Example: '2026-02-02 15:00'. Calculate the correct date based on today's date. NEVER pass Arabic text."
+                        },
+                        "customer_name": {
+                            "type": "string",
+                            "description": "Customer name for the booking"
+                        }
+                    },
+                    "required": ["client_type"]
+                }
+            },
+            {
+                "name": "confirm_appointment",
+                "description": "Confirm and finalize a booking AFTER the caller has explicitly said yes to the proposed time slot. Only call this after check_appointment returned SLOT_AVAILABLE and the caller confirmed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "Must be true to confirm the booking"
+                        }
+                    },
+                    "required": ["confirm"]
+                }
+            },
+            {
+                "name": "register_caller_name",
+                "description": "Register or update the caller's name. Call this when a caller tells you their name for the first time OR corrects their name. Always trust the caller's own statement of their name over what's on file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "caller_name": {
+                            "type": "string",
+                            "description": "The caller's personal name (first name or full name). Must be an actual human name. Examples: 'Marwan', 'مروان', 'Ahmed', 'أحمد'. Never pass common words."
+                        }
+                    },
+                    "required": ["caller_name"]
+                }
+            },
+            {
+                "name": "transfer_to_human",
+                "description": "Transfer the call to a human staff member. ONLY call this when the caller EXPLICITLY asks to speak with a person by name or explicitly requests a transfer. Do NOT call this for vague or unclear requests — ask a clarifying question instead.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "Brief reason for the transfer"
+                        }
+                    },
+                    "required": ["reason"]
+                }
+            },
+            {
+                "name": "end_call",
+                "description": "End the phone call. Call this AFTER you've said goodbye to the caller. Use when: the caller says goodbye/bye/thanks and is done, OR the caller explicitly asks to hang up. Do NOT end the call just because the caller said 'thank you' mid-conversation — only when the conversation is truly finished.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "Brief reason for ending (e.g. 'caller said goodbye', 'conversation complete')"
+                        }
+                    },
+                    "required": ["reason"]
+                }
+            }
+        ]
+
+    async def _check_booking(self, call_sid: str, arguments: dict) -> str:
+        """
+        Check availability for a requested appointment slot.
+        If available, stores pending booking data on the context for later confirmation.
+
+        Args:
+            call_sid: Call identifier
+            arguments: Function call arguments from LLM
+
+        Returns:
+            Result message to feed back to LLM
+        """
+        import json
+        from datetime import datetime, timedelta
+        from services.calendar.ms_bookings_service import get_calendar_service
+        from services.config.accountants_service import get_accountants_service
+
+        context = self._conversations.get(call_sid)
+        calendar = get_calendar_service()
+        acc_service = get_accountants_service()
+
+        client_type = arguments.get("client_type", "individual")
+        accountant_name = arguments.get("accountant_name", "")
+        date_time_str = arguments.get("date_time", "")
+        customer_name = arguments.get("customer_name", context.caller_name if context else "")
+
+        logger.info(f"Orchestrator: Checking booking - type={client_type}, accountant={accountant_name}, date={date_time_str}, customer={customer_name}")
+
+        # Check if MSGraph is configured
+        if not await calendar.is_available():
+            logger.error("Orchestrator: MS Bookings not configured")
+            return "BOOKING_ERROR: Microsoft Bookings is not configured. Please inform the caller that booking is temporarily unavailable and offer to transfer them to a human."
+
+        try:
+            # Look up accountant
+            staff_id = ""
+            service_id = ""
+            matched_staff_name = ""
+            if accountant_name:
+                acc = acc_service.get_accountant_by_name(accountant_name)
+                if acc:
+                    staff_id = acc.get("staff_id", "")
+                    service_id = acc.get("service_id", "")
+                    accountant_name = acc.get("name", accountant_name)
+                    logger.info(f"Orchestrator: Found accountant {accountant_name}, staff_id={staff_id}, service_id={service_id}")
+
+            # If no staff/service IDs configured, try to get from MSGraph
+            if not staff_id or not service_id:
+                staff_members = await calendar.get_staff_members()
+                if staff_members:
+                    if accountant_name:
+                        name_lower = accountant_name.lower()
+                        for staff in staff_members:
+                            staff_name_lower = staff.name.lower()
+                            if name_lower in staff_name_lower or staff_name_lower in name_lower:
+                                staff_id = staff.id
+                                matched_staff_name = staff.name
+                                logger.info(f"Orchestrator: Matched staff from MSGraph: {staff.name} (id={staff.id})")
+                                break
+                            if name_lower.split()[0] in staff_name_lower.split() if name_lower.split() else False:
+                                staff_id = staff.id
+                                matched_staff_name = staff.name
+                                logger.info(f"Orchestrator: Matched staff by first name: {staff.name} (id={staff.id})")
+                                break
+                    if not staff_id and staff_members:
+                        staff_id = staff_members[0].id
+                        matched_staff_name = staff_members[0].name
+                        logger.info(f"Orchestrator: Using default staff: {staff_members[0].name}")
+
+                if not service_id:
+                    services = await calendar.get_services()
+                    if services:
+                        for svc in services:
+                            if client_type in svc.name.lower() or client_type in svc.description.lower():
+                                service_id = svc.id
+                                break
+                        if not service_id and services:
+                            service_id = services[0].id
+                            logger.info(f"Orchestrator: Using default service: {services[0].name}")
+
+            if not service_id:
+                return "BOOKING_ERROR: Could not find a matching service. Please ask the caller for more details or offer to transfer them."
+
+            # Parse date/time
+            appointment_time = None
+            if date_time_str:
+                import re
+                iso_match = re.match(r'(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})', date_time_str)
+                if iso_match:
+                    try:
+                        appointment_time = datetime(
+                            int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)),
+                            int(iso_match.group(4)), int(iso_match.group(5))
+                        )
+                        logger.info(f"Orchestrator: Parsed ISO date: {appointment_time}")
+                    except ValueError as e:
+                        logger.warning(f"Orchestrator: Invalid ISO date values: {date_time_str} - {e}")
+
+                if not appointment_time:
+                    from dateutil import parser as date_parser
+                    try:
+                        appointment_time = date_parser.parse(date_time_str, fuzzy=True)
+                        logger.info(f"Orchestrator: Parsed with dateutil: {appointment_time}")
+                        if appointment_time < datetime.now():
+                            logger.warning(f"Orchestrator: Parsed date {appointment_time} is in the past, adjusting to next week")
+                            appointment_time += timedelta(days=7)
+                    except Exception:
+                        logger.warning(f"Orchestrator: Could not parse date: {date_time_str}")
+
+            if not appointment_time:
+                appointment_time = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                logger.warning(f"Orchestrator: Using default appointment time: {appointment_time}")
+
+            logger.info(f"Orchestrator: Final appointment time: {appointment_time} (from input: '{date_time_str}')")
+
+            # =====================================================
+            # CHECK AVAILABILITY
+            # =====================================================
+            staff_display = matched_staff_name or accountant_name or "the accountant"
+            full_fmt = '%A, %B %d at %I:%M %p'
+
+            logger.info(f"Orchestrator: Checking availability for staff={staff_display}, date={appointment_time}")
+            available_slots = await calendar.get_available_slots(
+                service_id=service_id,
+                staff_id=staff_id,
+                days_ahead=7
+            )
+
+            if available_slots:
+                requested_date = appointment_time.date()
+                requested_hour = appointment_time.hour
+                requested_minute = appointment_time.minute
+
+                slot_match = False
+                for slot in available_slots:
+                    slot_date = slot.start_time.date()
+                    if slot_date == requested_date:
+                        req_minutes = requested_hour * 60 + requested_minute
+                        slot_start_minutes = slot.start_time.hour * 60 + slot.start_time.minute
+                        slot_end_minutes = slot.end_time.hour * 60 + slot.end_time.minute
+                        if slot_start_minutes <= req_minutes < slot_end_minutes:
+                            slot_match = True
+                            break
+
+                if not slot_match:
+                    # Not available — store partial booking so confirm_appointment
+                    # can still work if LLM skips re-checking
+                    context.pending_booking = {
+                        "service_id": service_id,
+                        "staff_id": staff_id,
+                        "staff_name": matched_staff_name or accountant_name,
+                        "appointment_time": None,  # No confirmed time yet
+                        "customer_name": customer_name,
+                        "client_type": client_type,
+                        "awaiting_recheck": True,
+                    }
+
+                    same_day_slots = [s for s in available_slots if s.start_time.date() == requested_date]
+
+                    if same_day_slots:
+                        alt_times = ", ".join([s.start_time.strftime(full_fmt) for s in same_day_slots[:5]])
+                        logger.info(f"Orchestrator: Requested time not available. Alternatives: {alt_times}")
+                        return (
+                            f"BOOKING_UNAVAILABLE: The requested time ({appointment_time.strftime(full_fmt)}) "
+                            f"is not available for {staff_display}. "
+                            f"Available slots: {alt_times}. "
+                            f"Please ask the caller which of these times works for them. "
+                            f"IMPORTANT: When the caller picks a time, call check_appointment AGAIN with the new date_time."
+                        )
+                    else:
+                        next_slots = []
+                        seen_days = set()
+                        for s in available_slots:
+                            day_key = s.start_time.date()
+                            if day_key not in seen_days:
+                                next_slots.append(s.start_time.strftime(full_fmt))
+                                seen_days.add(day_key)
+                            if len(seen_days) >= 3:
+                                break
+
+                        if next_slots:
+                            alt_info = ", ".join(next_slots)
+                            logger.info(f"Orchestrator: No slots on requested day. Next available: {alt_info}")
+                            return (
+                                f"BOOKING_UNAVAILABLE: {staff_display} has no availability on "
+                                f"{appointment_time.strftime('%A, %B %d')}. "
+                                f"Next available slots: {alt_info}. "
+                                f"Please ask the caller if any of these work. "
+                                f"IMPORTANT: When the caller picks a time, call check_appointment AGAIN with the new date_time."
+                            )
+                        else:
+                            return (
+                                f"BOOKING_UNAVAILABLE: {staff_display} has no available slots in the next 7 days. "
+                                f"Please apologize and offer to transfer the caller to speak with someone directly."
+                            )
+
+            # =====================================================
+            # SLOT IS AVAILABLE — store pending booking, ask for confirmation
+            # =====================================================
+            context.pending_booking = {
+                "service_id": service_id,
+                "staff_id": staff_id,
+                "staff_name": matched_staff_name or accountant_name,
+                "appointment_time": appointment_time,
+                "customer_name": customer_name,
+                "client_type": client_type,
+            }
+            display_time = appointment_time.strftime(full_fmt)
+            logger.info(f"Orchestrator: Slot available - pending confirmation for {display_time} with {staff_display}")
+
+            return (
+                f"SLOT_AVAILABLE: The appointment with {staff_display} on {display_time} is available. "
+                f"Ask the caller to confirm: do they want to go ahead and book this appointment? "
+                f"Do NOT book yet — wait for the caller to say yes."
+            )
+
+        except Exception as e:
+            logger.error(f"Orchestrator: Check booking exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return f"BOOKING_ERROR: System error while checking availability: {str(e)}. Apologize and offer to transfer."
+
+    async def _confirm_booking(self, call_sid: str, arguments: dict) -> str:
+        """
+        Confirm and create a previously checked appointment.
+
+        Args:
+            call_sid: Call identifier
+            arguments: Function call arguments (must have confirm=True)
+
+        Returns:
+            Result message to feed back to LLM
+        """
+        from services.calendar.ms_bookings_service import get_calendar_service
+
+        context = self._conversations.get(call_sid)
+        if not context or not context.pending_booking:
+            logger.warning("Orchestrator: confirm_appointment called but no pending booking")
+            return (
+                "BOOKING_NEEDS_RECHECK: No confirmed time slot to book. "
+                "You must call check_appointment with the caller's chosen date_time first, "
+                "then call confirm_appointment after SLOT_AVAILABLE."
+            )
+
+        if not arguments.get("confirm", False):
+            # Caller said no — clear pending booking
+            context.pending_booking = None
+            return "BOOKING_CANCELLED: The caller chose not to book. Ask if they would like a different time or anything else."
+
+        pending = context.pending_booking
+
+        # If pending booking is from an UNAVAILABLE check (no confirmed time),
+        # the LLM skipped re-checking — tell it to call check_appointment first
+        if pending.get("awaiting_recheck") or pending.get("appointment_time") is None:
+            logger.warning("Orchestrator: confirm_appointment called but pending booking has no confirmed time (awaiting recheck)")
+            return (
+                "BOOKING_NEEDS_RECHECK: The previous time was unavailable and no new time was checked. "
+                "You must call check_appointment with the caller's chosen date_time first, "
+                "then call confirm_appointment after SLOT_AVAILABLE."
+            )
+
+        calendar = get_calendar_service()
+
+        # Use the latest caller name from context (may have been registered after check_appointment)
+        customer_name = context.caller_name or pending.get("customer_name") or "Phone Caller"
+
+        try:
+            result = await calendar.create_booking(
+                service_id=pending["service_id"],
+                staff_id=pending["staff_id"],
+                start_time=pending["appointment_time"],
+                customer_name=customer_name,
+                customer_email="",
+                customer_phone=context.phone_number or "",
+                notes=f"Booked via AI phone system. Client type: {pending['client_type']}"
+            )
+
+            if result.success:
+                logger.info(f"Orchestrator: BOOKING CREATED - id={result.appointment_id}, time={result.start_time}, staff={result.staff_name}")
+
+                # Send SMS confirmation + schedule 24hr reminder
+                display_staff = result.staff_name or pending["staff_name"] or "your accountant"
+                display_time = pending["appointment_time"].strftime('%A, %B %d at %I:%M %p')
+                display_customer = customer_name if customer_name != "Phone Caller" else "there"
+                caller_lang = context.language if context else "en"
+
+                asyncio.create_task(self._send_booking_sms(
+                    phone_number=context.phone_number,
+                    customer_name=display_customer,
+                    staff_name=display_staff,
+                    appointment_time_str=display_time,
+                    appointment_dt=pending["appointment_time"],
+                    language=caller_lang,
+                ))
+
+                # Clear pending booking
+                context.pending_booking = None
+
+                return f"BOOKING_SUCCESS: Appointment booked successfully. Appointment ID: {result.appointment_id}. Time: {result.start_time}. Staff: {result.staff_name or pending['staff_name']}. Customer: {result.customer_name}."
+            else:
+                logger.error(f"Orchestrator: BOOKING FAILED - {result.error_message}")
+                context.pending_booking = None
+                return f"BOOKING_ERROR: Failed to create booking: {result.error_message}. Apologize and offer to transfer to a human."
+
+        except Exception as e:
+            logger.error(f"Orchestrator: Confirm booking exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            context.pending_booking = None
+            return f"BOOKING_ERROR: System error while booking: {str(e)}. Apologize and offer to transfer."
+
+    async def _send_booking_sms(
+        self,
+        phone_number: str,
+        customer_name: str,
+        staff_name: str,
+        appointment_time_str: str,
+        appointment_dt,
+        language: str,
+    ) -> None:
+        """
+        Send booking confirmation SMS and schedule a 24hr reminder.
+        Runs as a fire-and-forget background task so it doesn't block the call.
+        """
+        from services.sms.telnyx_sms_service import get_sms_service
+        from services.sms.reminder_scheduler import get_reminder_scheduler
+
+        sms = get_sms_service()
+        if not sms.is_available():
+            logger.warning("Orchestrator: SMS not configured - skipping confirmation")
+            return
+
+        # 1. Send immediate confirmation
+        try:
+            sent = await sms.send_booking_confirmation(
+                to_number=phone_number,
+                customer_name=customer_name,
+                staff_name=staff_name,
+                appointment_time=appointment_time_str,
+                language=language,
+            )
+            if sent:
+                logger.info(f"Orchestrator: Booking confirmation SMS sent to {phone_number}")
+            else:
+                logger.warning(f"Orchestrator: Failed to send confirmation SMS to {phone_number}")
+        except Exception as e:
+            logger.error(f"Orchestrator: SMS confirmation error: {e}")
+
+        # 2. Schedule 24hr reminder
+        try:
+            scheduler = get_reminder_scheduler()
+            scheduler.schedule_reminder(
+                phone_number=phone_number,
+                customer_name=customer_name,
+                staff_name=staff_name,
+                appointment_time_str=appointment_time_str,
+                appointment_dt=appointment_dt,
+                language=language,
+            )
+            logger.info(f"Orchestrator: 24hr reminder scheduled for {phone_number}")
+        except Exception as e:
+            logger.error(f"Orchestrator: Reminder scheduling error: {e}")
+
     async def _get_ai_response(self, call_sid: str, user_input: str) -> str:
         """
-        Get AI response for user input
-
-        NOW INCLUDES CONVERSATION HISTORY (Phase 1.2 fix)
+        Get AI response for user input, with function calling support for bookings.
 
         Args:
             call_sid: Call identifier
@@ -590,9 +1360,11 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # Build system prompt with caller context
         system_prompt = self._system_prompt
 
-        # Add caller name to prompt if known
+        # Add caller context to prompt
         if context.caller_name:
-            system_prompt += f"\n\nCALLER CONTEXT:\n- The caller's name is {context.caller_name}. Use their name naturally in your response to be warm and personal."
+            system_prompt += f"\n\nCALLER CONTEXT:\n- The caller's name on file is: {context.caller_name}. Use their name naturally.\n- IMPORTANT: If the caller corrects their name or says their name is different (e.g. 'اسمي غادة مش غايد' / 'My name is Ghada not Gaid'), you MUST call register_caller_name with the CORRECT name immediately. The old name may be wrong or garbled from a previous call.\n- Treat the caller's own statement of their name as authoritative — always believe them over what's on file."
+        else:
+            system_prompt += "\n\nCALLER CONTEXT:\n- The caller's name is NOT yet known.\n- CRITICAL: As soon as the caller says their name, you MUST call the register_caller_name tool IMMEDIATELY. This is required before any booking can use their name.\n- If you already asked for their name and they reply with something that sounds like a name, call register_caller_name right away.\n- Also use their name in the booking (customer_name parameter) when they book an appointment."
 
         # =====================================================
         # BUILD MESSAGES WITH CONVERSATION HISTORY (Phase 1.2)
@@ -602,33 +1374,151 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         ]
 
         # Add conversation history from context
-        # This gives the LLM context about what was discussed
         history = context.get_history_for_llm()
         for msg in history:
-            # Convert to Message objects
             if msg["role"] == "user":
                 messages.append(Message(role=LLMRole.USER, content=msg["content"]))
             elif msg["role"] == "assistant":
                 messages.append(Message(role=LLMRole.ASSISTANT, content=msg["content"]))
 
         # Note: user_input is already in history (added in process_transcript)
-        # So we don't need to add it again here
 
-        # Get streaming response
+        # =====================================================
+        # USE FUNCTION CALLING FOR BOOKING SUPPORT
+        # =====================================================
         from services.llm.llm_base import LLMRequest, LLMChunk
 
+        tools = self._get_booking_tools()
+
+        # First try with tools (non-streaming to detect function calls)
         request = LLMRequest(
             messages=messages,
             temperature=0.7,
-            max_tokens=300,  # Keep responses short for phone
-            stream=True
+            max_tokens=300,
+            stream=False,
+            tools=tools
         )
 
-        full_response = ""
-        async for chunk in self.llm.chat_stream(request):
-            full_response += chunk.delta
+        try:
+            llm_response = await self.llm.chat_with_tools(request)
 
-        response = full_response.strip()
+            # Check if the LLM wants to call a function
+            if llm_response.tool_calls:
+                for tool_call in llm_response.tool_calls:
+                    tool_name = tool_call["name"]
+                    import json as _json
+                    arguments = _json.loads(tool_call["arguments"])
+                    logger.info(f"Orchestrator: LLM requested {tool_name}: {arguments}")
+
+                    # --- Register caller name (LLM extracts it naturally) ---
+                    if tool_name == "register_caller_name":
+                        caller_name = arguments.get("caller_name", "").strip()
+                        if caller_name and context:
+                            context.caller_name = caller_name
+                            context.name_collected = True
+                            context.is_known_caller = True
+                            self.caller_service.register_caller(
+                                context.phone_number,
+                                caller_name,
+                                context.language
+                            )
+                            logger.info(f"Orchestrator: LLM registered caller name: {caller_name}")
+
+                        # Let the LLM generate a natural follow-up response
+                        messages.append(Message(role=LLMRole.ASSISTANT, content=llm_response.content or ""))
+                        messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: Caller name '{caller_name}' has been saved. Now greet them warmly by name and ask how you can help. Keep it brief.]"))
+
+                        follow_up_request = LLMRequest(
+                            messages=messages,
+                            temperature=0.7,
+                            max_tokens=150,
+                            stream=True
+                        )
+                        full_response = ""
+                        async for chunk in self.llm.chat_stream(follow_up_request):
+                            full_response += chunk.delta
+
+                        response = full_response.strip()
+                        context.add_assistant_message(response)
+                        return response
+
+                    # --- Transfer to human ---
+                    if tool_name == "transfer_to_human":
+                        reason = arguments.get("reason", "caller request")
+                        logger.info(f"Orchestrator: LLM triggered transfer - reason: {reason}")
+                        await self._handle_transfer(call_sid)
+                        # _handle_transfer already spoke to the caller
+                        # Return a marker so the outer code skips speaking
+                        context.add_assistant_message("[transferred to human]")
+                        return "__TRANSFER_HANDLED__"
+
+                    # --- End call (LLM decided conversation is over) ---
+                    if tool_name == "end_call":
+                        reason = arguments.get("reason", "conversation complete")
+                        logger.info(f"Orchestrator: LLM triggered end_call - reason: {reason}")
+
+                        # If LLM also provided a goodbye message, speak it first
+                        goodbye_text = (llm_response.content or "").strip()
+                        if goodbye_text:
+                            context.add_assistant_message(goodbye_text)
+                            await self._speak_to_caller(call_sid, goodbye_text, context.language)
+
+                        # End the call after goodbye is spoken
+                        await self.end_call(call_sid)
+                        return "__TRANSFER_HANDLED__"  # Reuse marker to skip outer speaking
+
+                    # --- Booking tools ---
+                    if tool_name in ("check_appointment", "confirm_appointment"):
+                        # Execute the appropriate booking step
+                        if tool_name == "check_appointment":
+                            booking_result = await self._check_booking(call_sid, arguments)
+                        else:
+                            booking_result = await self._confirm_booking(call_sid, arguments)
+
+                        # Feed result back to LLM for a natural response
+                        messages.append(Message(role=LLMRole.ASSISTANT, content=llm_response.content or ""))
+
+                        if "BOOKING_NEEDS_RECHECK" in booking_result:
+                            # LLM skipped re-checking after unavailable — tell caller we need to verify
+                            messages.append(Message(role=LLMRole.USER, content=(
+                                f"[SYSTEM: {booking_result}. "
+                                f"Tell the caller: 'Let me check that time for you' or similar. "
+                                f"Do NOT say there was an error. Keep it brief.]"
+                            )))
+                        else:
+                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Now respond naturally to the caller about the booking result. Keep it brief.]"))
+
+                        # Get final response (streaming, no tools)
+                        follow_up_request = LLMRequest(
+                            messages=messages,
+                            temperature=0.7,
+                            max_tokens=200,
+                            stream=True
+                        )
+                        full_response = ""
+                        async for chunk in self.llm.chat_stream(follow_up_request):
+                            full_response += chunk.delta
+
+                        response = full_response.strip()
+                        context.add_assistant_message(response)
+                        return response
+
+            # No tool calls - use the direct text response
+            response = llm_response.content.strip()
+
+        except Exception as e:
+            logger.error(f"Orchestrator: Function calling failed, falling back to streaming: {e}")
+            # Fallback to streaming without tools
+            request = LLMRequest(
+                messages=messages,
+                temperature=0.7,
+                max_tokens=300,
+                stream=True
+            )
+            full_response = ""
+            async for chunk in self.llm.chat_stream(request):
+                full_response += chunk.delta
+            response = full_response.strip()
 
         # =====================================================
         # ADD ASSISTANT RESPONSE TO HISTORY (Phase 1.2)
@@ -667,13 +1557,19 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             return
 
         try:
+            # Pre-process Arabic text: convert numbers/times to Arabic words
+            # so TTS can pronounce them naturally instead of garbled nonsense
+            if language == "ar":
+                from services.audio.arabic_text_processor import process_arabic_text
+                text = process_arabic_text(text)
+
             # Stream TTS
             from services.tts.tts_base import TTSRequest, TTSChunk
 
             request = TTSRequest(
                 text=text,
                 language=language,
-                voice_id="Rachel"  # Can be customized per language
+                voice_id=None  # Uses default_voice_id from TTS settings (ELEVENLABS_VOICE_ID env)
             )
 
             logger.info(f"Orchestrator: Synthesizing TTS...")
@@ -681,25 +1577,59 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             response = await self.tts.synthesize(request)
             logger.info(f"Orchestrator: TTS response - format={response.format}, sample_rate={response.sample_rate}, bytes={len(response.audio_data)}")
 
-            # Convert MP3 audio to μ-law 8kHz for Twilio
-            logger.info(f"Orchestrator: Converting audio to μ-law 8kHz...")
-            from services.audio.audio_converter import convert_twilio_audio
-            mulaw_audio = convert_twilio_audio(
-                response.audio_data,
-                input_format=response.format,
-                input_rate=response.sample_rate
-            )
+            if response.format == "mulaw":
+                # TTS already returns μ-law 8kHz — send directly to Twilio (no conversion needed)
+                mulaw_audio = response.audio_data
+                logger.info(f"Orchestrator: Using native μ-law audio - {len(mulaw_audio)} bytes (no conversion)")
+            else:
+                # Legacy path: convert MP3/other formats to μ-law 8kHz for Twilio
+                logger.info(f"Orchestrator: Converting {response.format} audio to μ-law 8kHz...")
+                from services.audio.audio_converter import convert_twilio_audio
+                mulaw_audio = convert_twilio_audio(
+                    response.audio_data,
+                    input_format=response.format,
+                    input_rate=response.sample_rate
+                )
 
             if not mulaw_audio:
                 logger.error("Orchestrator: Audio conversion returned empty bytes")
                 return
 
-            logger.info(f"Orchestrator: Audio converted - {len(mulaw_audio)} bytes μ-law")
+            logger.info(f"Orchestrator: Audio ready - {len(mulaw_audio)} bytes μ-law")
 
             # Send to Twilio in correct format
             logger.info(f"Orchestrator: Sending audio to Twilio (stream_sid={twilio_handler.stream_sid})...")
             await twilio_handler.send_audio(mulaw_audio)
             logger.info(f"Orchestrator: Audio sent to Twilio successfully")
+
+            # =====================================================
+            # BARGE-IN WAIT: Keep SPEAKING state during audio playback
+            # =====================================================
+            # State stays SPEAKING so the energy-based barge-in detector
+            # in process_audio can detect caller speech and interrupt.
+            # We wait in small steps, checking if barge-in set state to LISTENING.
+            import time
+            audio_duration = len(mulaw_audio) / 8000.0
+            playback_buffer = 1.0  # Buffer for Twilio network + phone speaker delay
+            total_wait = audio_duration + playback_buffer
+            step = 0.1  # Check every 100ms
+            elapsed = 0.0
+
+            logger.info(f"Orchestrator: Waiting {total_wait:.1f}s for playback (audio={audio_duration:.1f}s + {playback_buffer}s buffer) — barge-in active")
+
+            while elapsed < total_wait:
+                await asyncio.sleep(step)
+                elapsed += step
+                # Check if barge-in interrupted us (barge-in sets state to LISTENING)
+                if context.state != ConversationState.SPEAKING:
+                    logger.info(f"Orchestrator: Playback interrupted by barge-in at {elapsed:.1f}s/{total_wait:.1f}s")
+                    break
+
+            # Set a short echo guard for residual echo from phone speaker
+            # (only if playback completed naturally, not on barge-in)
+            if context.state == ConversationState.SPEAKING:
+                self._echo_guard_until[call_sid] = time.time() + 0.5
+                logger.info(f"Orchestrator: Playback complete, short echo guard 0.5s")
 
         except Exception as e:
             logger.error(f"Orchestrator: Exception in _speak_to_caller: {e}")
@@ -709,117 +1639,201 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # =====================================================
             # STATE TRANSITION: SPEAKING -> LISTENING
             # Using lock to prevent race conditions
+            # Only transition if still SPEAKING (barge-in may have already set LISTENING)
             # =====================================================
             async with state_lock:
-                context.state = ConversationState.LISTENING
-            logger.info(f"Orchestrator: _speak_to_caller END")
+                if context.state == ConversationState.SPEAKING:
+                    context.state = ConversationState.LISTENING
+            logger.info(f"Orchestrator: _speak_to_caller END (state={context.state.value})")
 
-    async def _detect_intent(self, text: str, language: str) -> Intent:
-        """
-        Detect user intent from transcript
 
-        Args:
-            text: User's transcript
-            language: Language code
-
-        Returns:
-            Detected intent
-        """
-        text_lower = text.lower()
-
-        # Simple keyword matching (can be enhanced with LLM)
-        if any(word in text_lower for word in ["goodbye", "bye", "thanks", "thank", "finish"]):
-            return Intent.GOODBYE
-
-        if any(word in text_lower for word in ["transfer", "speak to", "talk to", "human", "person"]):
-            return Intent.TRANSFER_TO_HUMAN
-
-        if any(word in text_lower for word in ["book", "appointment", "schedule", "reserve"]):
-            return Intent.BOOK_APPOINTMENT
-
-        if any(word in text_lower for word in ["payroll", "pay", "salary", "employees"]):
-            return Intent.PAYROLL_INQUIRY
-
-        return Intent.GENERAL_INQUIRY
-
-    def _extract_caller_name(self, transcript: str) -> Optional[str]:
-        """
-        Extract caller name from transcript
-
-        Handles various formats:
-        - "My name is John" → "John"
-        - "This is Ahmed" → "Ahmed"
-        - "أنا محمد" → "محمد"
-        - "I'm Sarah" → "Sarah"
-
-        Args:
-            transcript: User's transcript
-
-        Returns:
-            Extracted name or None
-        """
-        import re
-
-        transcript = transcript.strip()
-        if not transcript:
-            return None
-
-        # English patterns
-        en_patterns = [
-            r"(?:my name is|i'm|i am|this is|call me|it's) (\w+)",
-            r"^(\w+) here",  # "John here"
-            r"speaking (\w+)",  # "This is John speaking"
-        ]
-
-        for pattern in en_patterns:
-            match = re.search(pattern, transcript, re.IGNORECASE)
-            if match:
-                name = match.group(1).strip()
-                # Filter out non-name words
-                if len(name) > 1 and name.lower() not in ["yes", "no", "not", "is", "it"]:
-                    return name.capitalize()
-
-        # Arabic patterns (basic)
-        # "أنا أحمد" → "أحمد"
-        if "أنا " in transcript or "انا " in transcript:
-            parts = transcript.split()
-            for i, part in enumerate(parts):
-                if part in ["أنا", "انا", "اسمي"]:
-                    if i + 1 < len(parts):
-                        name = parts[i + 1]
-                        return name
-
-        return None
-
-    async def _detect_barge_in(self, audio_data: bytes) -> bool:
+    async def _detect_barge_in(self, audio_data: bytes, call_sid: str = None) -> bool:
         """
         Detect if user is speaking during AI speech (barge-in)
 
+        Uses energy-based detection with consecutive frame requirement
+        to avoid false triggers from noise bursts.
+
+        IMPORTANT: μ-law encoding maps silence to byte values 0xFF (255)
+        and 0x7F (127). We must decode to linear PCM first to get real energy.
+
         Args:
-            audio_data: Audio chunk to analyze
+            audio_data: Audio chunk to analyze (μ-law encoded)
+            call_sid: Call identifier for per-call state
 
         Returns:
             True if user is speaking (barge-in detected)
         """
-        # Simple energy-based detection
-        # Calculate audio energy
-        energy = sum(abs(byte - 128) for byte in audio_data[:1000]) / 1000
+        import time
 
-        if energy > self._energy_threshold * 100:
-            return True
+        sample_count = min(len(audio_data), 1000)
+        if sample_count == 0:
+            return False
+
+        # Check grace period: skip barge-in detection for first 1.5s after speech starts
+        # This prevents Twilio line noise from immediately killing playback
+        sid = call_sid or "_default"
+        now = time.time()
+        grace_start = self._barge_in_speech_start.get(sid, 0)
+        if grace_start > 0 and (now - grace_start) < 1.5:
+            return False
+
+        # Decode μ-law to linear PCM to get real energy values
+        # μ-law lookup table for absolute linear value (simplified)
+        # silence in μ-law = 0xFF/0x7F -> linear ~0
+        # speech in μ-law deviates significantly
+        import audioop
+        try:
+            linear_data = audioop.ulaw2lin(audio_data[:sample_count], 2)
+            # Calculate RMS energy from 16-bit linear PCM
+            rms = audioop.rms(linear_data, 2)
+        except Exception:
+            return False
+
+        # Initialize per-call consecutive counter
+        if sid not in self._barge_in_consecutive:
+            self._barge_in_consecutive[sid] = 0
+
+        # RMS threshold for actual speech over phone line (μ-law decoded)
+        # Typical phone line noise: RMS ~14
+        # Medium speech: RMS ~200
+        # Loud speech: RMS ~900+
+        # Use 200 as threshold to catch speech but ignore line noise
+        threshold = 200
+
+        if rms > threshold:
+            self._barge_in_consecutive[sid] += 1
+            # Require 5 consecutive high-energy frames (~100ms of speech) to trigger
+            if self._barge_in_consecutive[sid] >= 5:
+                logger.info(f"Orchestrator: Barge-in triggered - rms={rms}, threshold={threshold}, consecutive={self._barge_in_consecutive[sid]}")
+                self._barge_in_consecutive[sid] = 0
+                return True
+        else:
+            self._barge_in_consecutive[sid] = 0
 
         return False
 
-    async def _handle_goodbye(self, call_sid: str) -> None:
-        """Handle goodbye intent"""
-        logger.info(f"Orchestrator: Call {call_sid} ended (goodbye)")
-        await self.end_call(call_sid)
+    async def _reconnect_stt_with_language(self, call_sid: str, language: str, force: bool = False) -> None:
+        """
+        Reconnect the per-call STT instance with an explicit language code.
+        This dramatically improves accuracy vs auto-detect on phone audio.
+
+        Args:
+            force: If True, reconnect even if STT already has a language set.
+                   Used when we need to correct a wrong language choice.
+        """
+        call_stt = self._call_stt_instances.get(call_sid)
+        if not call_stt:
+            return
+
+        # Skip if already set to the requested language
+        if call_stt.language and call_stt.language == language:
+            logger.info(f"Orchestrator: STT already set to '{language}', skipping reconnect")
+            return
+
+        # If not forcing, only reconnect from auto-detect mode
+        if not force and call_stt.language and call_stt.language != "":
+            logger.info(f"Orchestrator: STT already set to '{call_stt.language}', skipping reconnect (use force=True to override)")
+            return
+
+        try:
+            logger.info(f"Orchestrator: Reconnecting STT with language='{language}' for call {call_sid}")
+            if hasattr(call_stt, 'reconnect_with_language'):
+                success = await call_stt.reconnect_with_language(language)
+                if success:
+                    logger.info(f"Orchestrator: STT reconnected with language='{language}'")
+                else:
+                    logger.error(f"Orchestrator: Failed to reconnect STT with language='{language}'")
+            else:
+                logger.warning(f"Orchestrator: STT provider does not support language reconnection")
+        except Exception as e:
+            logger.error(f"Orchestrator: Error reconnecting STT: {e}")
 
     async def _handle_transfer(self, call_sid: str) -> None:
-        """Handle transfer to human intent"""
-        logger.info(f"Orchestrator: Call {call_sid} transferring to human")
-        # TODO: Implement transfer logic
-        await self.end_call(call_sid)
+        """
+        Handle transfer to human by redirecting the Twilio call
+        to the configured transfer phone number using TwiML <Dial>.
+        """
+        context = self._conversations.get(call_sid)
+        settings = get_settings()
+        transfer_number = settings.transfer_phone_number
+
+        logger.info(f"Orchestrator: Call {call_sid} transferring to human, target={transfer_number}")
+
+        if not transfer_number:
+            logger.warning("Orchestrator: No TRANSFER_PHONE_NUMBER configured — cannot transfer")
+            # Tell caller we can't transfer right now
+            lang = context.language if context else "en"
+            if lang == "ar":
+                msg = "عذراً، لا يمكنني تحويلك حالياً. هل يمكنني مساعدتك بشيء آخر؟"
+            else:
+                msg = "I'm sorry, I'm unable to transfer you right now. Can I help you with something else?"
+            await self._speak_to_caller(call_sid, msg, lang)
+            return
+
+        # Tell the caller we're transferring
+        lang = context.language if context else "en"
+        if lang == "ar":
+            transfer_msg = "بالتأكيد، سأحولك الآن. لحظة من فضلك."
+        else:
+            transfer_msg = "Of course, let me transfer you now. One moment please."
+
+        await self._speak_to_caller(call_sid, transfer_msg, lang)
+
+        # Wait for the transfer message audio to finish playing
+        # _speak_to_caller queues audio but it's sent asynchronously.
+        # Estimate audio duration: μ-law 8kHz = 8000 bytes/sec.
+        # A typical transfer message is ~3-4 seconds. Add buffer for safety.
+        # We calculate from the last TTS response size if possible.
+        await asyncio.sleep(5)  # 5 seconds is enough for transfer message + Twilio buffer
+
+        # Use Twilio REST API to update the call with <Dial> TwiML
+        try:
+            import httpx
+
+            twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Calls/{call_sid}.json"
+
+            # TwiML that dials the transfer number
+            # Use a longer timeout (60s) and ringback to give the human time to answer
+            if lang == "ar":
+                fallback_say = "عذراً، الشخص الذي تحاول الوصول إليه غير متاح حالياً. يرجى المحاولة لاحقاً. مع السلامة."
+                # Use Amazon Polly Zeina voice for natural Arabic TTS (much better than default Twilio)
+                say_voice = "Polly.Zeina"
+                say_lang = "ar-SA"
+            else:
+                fallback_say = "The person you are trying to reach is unavailable at the moment. Please try again later. Goodbye."
+                say_voice = "Polly.Joanna"
+                say_lang = "en-US"
+
+            transfer_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Dial callerId="{settings.twilio_phone_number}" timeout="60">
+        <Number>{transfer_number}</Number>
+    </Dial>
+    <Say voice="{say_voice}" language="{say_lang}">{fallback_say}</Say>
+</Response>'''
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    twilio_url,
+                    auth=(settings.twilio_account_sid, settings.twilio_auth_token),
+                    data={"Twiml": transfer_twiml}
+                )
+
+                if response.status_code == 200:
+                    logger.info(f"Orchestrator: Call {call_sid} successfully redirected to {transfer_number}")
+                else:
+                    logger.error(f"Orchestrator: Failed to redirect call: {response.status_code} - {response.text}")
+                    if lang == "ar":
+                        msg = "عذراً، حدث خطأ أثناء التحويل. هل يمكنني مساعدتك بشيء آخر؟"
+                    else:
+                        msg = "I'm sorry, there was an error transferring. Can I help you with something else?"
+                    await self._speak_to_caller(call_sid, msg, lang)
+
+        except Exception as e:
+            logger.error(f"Orchestrator: Transfer exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     async def end_call(self, call_sid: str) -> None:
         """
@@ -841,6 +1855,20 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Disconnecting call-specific STT for {call_sid}")
             await self._call_stt_instances[call_sid].disconnect()
             del self._call_stt_instances[call_sid]
+
+        # Clean up echo guard
+        if call_sid in self._echo_guard_until:
+            del self._echo_guard_until[call_sid]
+
+        # Clean up garbled counter
+        if call_sid in self._garbled_drop_count:
+            del self._garbled_drop_count[call_sid]
+
+        # Clean up barge-in per-call state
+        if call_sid in self._barge_in_consecutive:
+            del self._barge_in_consecutive[call_sid]
+        if call_sid in self._barge_in_speech_start:
+            del self._barge_in_speech_start[call_sid]
 
         # Clean up state lock
         if call_sid in self._call_state_locks:

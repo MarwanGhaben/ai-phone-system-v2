@@ -7,6 +7,7 @@ AI Voice Platform v2 - STT (Speech-to-Text) Services
 from .stt_base import STTServiceBase, STTResult, STTStatus, AudioChunk
 from .deepgram_service import DeepgramSTT, create_deepgram_stt
 from .whisper_service import WhisperSTT, create_whisper_stt
+from .elevenlabs_stt_service import ElevenLabsSTT, create_elevenlabs_stt
 
 __all__ = [
     'STTServiceBase',
@@ -17,6 +18,8 @@ __all__ = [
     'create_deepgram_stt',
     'WhisperSTT',
     'create_whisper_stt',
+    'ElevenLabsSTT',
+    'create_elevenlabs_stt',
 ]
 
 
@@ -25,7 +28,7 @@ def create_stt_service(provider: str, config: dict) -> STTServiceBase:
     Factory function to create STT service by provider name
 
     Args:
-        provider: 'deepgram' or 'whisper'
+        provider: 'deepgram', 'whisper', or 'elevenlabs'
         config: Configuration dictionary
 
     Returns:
@@ -37,6 +40,7 @@ def create_stt_service(provider: str, config: dict) -> STTServiceBase:
     providers = {
         'deepgram': create_deepgram_stt,
         'whisper': create_whisper_stt,
+        'elevenlabs': create_elevenlabs_stt,
     }
 
     if provider not in providers:

@@ -35,7 +35,17 @@ logger.add(lambda msg: print(msg, end=""), level=settings.log_level)
 async def lifespan(app: FastAPI):
     """Application lifespan management"""
     logger.info("AI Voice Platform v2 starting up...")
+
+    # Start the SMS reminder scheduler (checks every 60s for due reminders)
+    from services.sms.reminder_scheduler import get_reminder_scheduler
+    reminder_scheduler = get_reminder_scheduler()
+    reminder_scheduler.start()
+    logger.info("SMS reminder scheduler started")
+
     yield
+
+    # Stop reminder scheduler
+    reminder_scheduler.stop()
     logger.info("AI Voice Platform v2 shutting down...")
 
 
@@ -220,7 +230,11 @@ async def incoming_call(request: Request):
         phone_number=settings.twilio_phone_number
     )
 
-    twiml = await twilio.generate_twiml(ws_url)
+    # Extract caller's phone number from Twilio webhook params
+    caller_number = request.query_params.get("From", request.query_params.get("Caller", ""))
+    logger.info(f"Incoming call from: {caller_number}")
+
+    twiml = await twilio.generate_twiml(ws_url, caller_number=caller_number)
 
     # Log the WebSocket URL being sent to Twilio
     print(f"DEBUG: FINAL WebSocket URL: {ws_url}")
