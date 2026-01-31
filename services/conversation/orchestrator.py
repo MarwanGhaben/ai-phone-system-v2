@@ -707,9 +707,9 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Detected Arabic from text content")
             # Reset garbled counter since we got a valid Arabic transcript
             self._garbled_drop_count[call_sid] = 0
-            # Reconnect STT with explicit Arabic if it was in auto-detect
-            if prev_language == "auto":
-                await self._reconnect_stt_with_language(call_sid, "ar")
+            # Reconnect STT with Arabic if switching from a different language
+            if prev_language != "ar":
+                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
         elif context.language == "auto":
             if language and language != "auto":
                 context.language = language
