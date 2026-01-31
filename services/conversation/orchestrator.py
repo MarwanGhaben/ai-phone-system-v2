@@ -675,7 +675,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # This must be checked BEFORE other language detection logic.
         transcript_lower = transcript.strip().lower().rstrip('.,!?؟')
         arabic_keywords = ["arabic", "arabi", "arabik", "3arabi", "عربي"]
-        english_keywords = ["english", "inglizi", "انجليزي", "انكليزي"]
+        english_keywords = ["english", "inglish", "inglizi", "انجليزي", "انكليزي", "انجليش", "انجلش"]
         is_arabic_request = any(kw in transcript_lower for kw in arabic_keywords)
         is_english_request = any(kw in transcript_lower for kw in english_keywords)
 
@@ -688,6 +688,15 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             self._garbled_drop_count[call_sid] = 0
             if prev_language != "ar":
                 await self._reconnect_stt_with_language(call_sid, "ar", force=True)
+        elif is_english_request:
+            # Caller explicitly requested English (check BEFORE has_arabic
+            # because "انجليش" contains Arabic chars but means "English")
+            prev_language = context.language
+            context.language = "en"
+            logger.info(f"Orchestrator: Detected English language REQUEST from keyword: '{transcript}'")
+            self._garbled_drop_count[call_sid] = 0
+            if prev_language != "en":
+                await self._reconnect_stt_with_language(call_sid, "en", force=True)
         elif has_arabic:
             prev_language = context.language
             context.language = "ar"
@@ -697,12 +706,6 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Reconnect STT with explicit Arabic if it was in auto-detect
             if prev_language == "auto":
                 await self._reconnect_stt_with_language(call_sid, "ar")
-        elif is_english_request:
-            # Caller explicitly requested English
-            context.language = "en"
-            logger.info(f"Orchestrator: Detected English language REQUEST from keyword: '{transcript}'")
-            self._garbled_drop_count[call_sid] = 0
-            await self._reconnect_stt_with_language(call_sid, "en", force=True)
         elif context.language == "auto":
             if language and language != "auto":
                 context.language = language
@@ -749,6 +752,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
             # Mark that we've processed the language choice
             context._language_set = True
+            context._awaiting_name = True  # Next transcript should be caller's name
 
             # Ask for name in detected language
             if context.language == "ar":
@@ -757,6 +761,40 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 response = "Great! May I have your name please?"
             await self._speak_to_caller(call_sid, response, context.language)
             return
+
+        # =====================================================
+        # CODE-LEVEL NAME REGISTRATION FALLBACK
+        # =====================================================
+        # After asking for name, the next transcript is likely the caller's name.
+        # Register it directly here as a safety net — the LLM sometimes doesn't
+        # call register_caller_name even when instructed to.
+        if (not context.is_known_caller
+            and getattr(context, '_awaiting_name', False)
+            and not context.name_collected):
+            import re as _re
+            name_candidate = transcript.strip().strip('.,!?؟').strip()
+            # Accept if it looks like a name: 1-4 words, no obvious commands
+            word_count = len(name_candidate.split())
+            skip_words = {"arabic", "english", "arabi", "inglizi", "عربي", "انجليزي",
+                          "book", "booking", "appointment", "transfer", "help",
+                          "yes", "no", "yeah", "نعم", "لا", "حجز", "موعد"}
+            is_command = name_candidate.lower() in skip_words or word_count > 4
+
+            if name_candidate and not is_command and word_count <= 4:
+                # Register the name directly
+                context.caller_name = name_candidate
+                context.name_collected = True
+                context.is_known_caller = True
+                context._awaiting_name = False
+                self.caller_service.register_caller(
+                    context.phone_number,
+                    name_candidate,
+                    context.language
+                )
+                logger.info(f"Orchestrator: Code-level name registration: '{name_candidate}' for {context.phone_number}")
+            else:
+                # Not a name — clear the flag so we don't keep checking
+                context._awaiting_name = False
 
         # Detect intent
         intent = await self._detect_intent(transcript, context.language)
