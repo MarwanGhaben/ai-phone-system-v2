@@ -272,11 +272,14 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - If booking fails, apologize and offer to transfer to a human
 
 WHEN TO TRANSFER:
-- Caller asks to speak with a specific person by name
-- Complex tax planning questions
+- Caller EXPLICITLY asks to speak with a specific person by name (e.g. "أبي أكلم حسام" / "I want to speak to Hussam")
+- Caller EXPLICITLY asks to be transferred (e.g. "حولني" / "transfer me")
+- Complex tax planning questions that require an accountant's expertise
 - Client-specific questions (their tax situation, past returns)
-- If you don't know the answer
-- If caller seems frustrated or confused
+- IMPORTANT: Do NOT transfer just because you don't fully understand what the caller said.
+  Instead, ask a clarifying question like "عذراً، ممكن توضح أكثر؟" / "Sorry, could you clarify?"
+- IMPORTANT: Do NOT transfer if the caller's request is unclear or vague. Always ask for clarification first.
+- Only transfer after you've tried at least once to understand and help the caller.
 
 TRANSFER SCRIPT:
 "Of course, let me transfer you now." (English)
@@ -903,7 +906,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             },
             {
                 "name": "transfer_to_human",
-                "description": "Transfer the call to a human staff member. Call this when the caller asks to speak with a person, wants to be transferred, or when you cannot help them further. Works for both Arabic and English requests.",
+                "description": "Transfer the call to a human staff member. ONLY call this when the caller EXPLICITLY asks to speak with a person by name or explicitly requests a transfer. Do NOT call this for vague or unclear requests — ask a clarifying question instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
