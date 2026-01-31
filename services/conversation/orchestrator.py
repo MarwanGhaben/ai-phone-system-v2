@@ -267,6 +267,7 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - CRITICAL: date_time parameter MUST be in "YYYY-MM-DD HH:MM" format (24-hour). Use today's date ({today_str}) to calculate. NEVER pass Arabic text as date_time.
 - CRITICAL: accountant_name parameter MUST be the English name (e.g. "Hussam Saadaldin", "Rami Kahwaji", "Abdul ElFarra"). NEVER pass Arabic names.
 - If the system returns BOOKING_UNAVAILABLE, read the suggested dates/times EXACTLY as provided - do NOT change or guess dates. Tell the caller the exact alternatives.
+- CRITICAL: After BOOKING_UNAVAILABLE, when the caller picks a new time, you MUST call check_appointment AGAIN with the new date_time. NEVER call confirm_appointment directly after UNAVAILABLE — always re-check the new time first.
 - IMPORTANT: Do NOT tell the caller "I've booked it" unless you received BOOKING_SUCCESS from confirm_appointment.
 - If booking fails, apologize and offer to transfer to a human
 
@@ -1023,7 +1024,18 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                             break
 
                 if not slot_match:
-                    # Not available — offer alternatives
+                    # Not available — store partial booking so confirm_appointment
+                    # can still work if LLM skips re-checking
+                    context.pending_booking = {
+                        "service_id": service_id,
+                        "staff_id": staff_id,
+                        "staff_name": matched_staff_name or accountant_name,
+                        "appointment_time": None,  # No confirmed time yet
+                        "customer_name": customer_name,
+                        "client_type": client_type,
+                        "awaiting_recheck": True,
+                    }
+
                     same_day_slots = [s for s in available_slots if s.start_time.date() == requested_date]
 
                     if same_day_slots:
@@ -1033,7 +1045,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                             f"BOOKING_UNAVAILABLE: The requested time ({appointment_time.strftime(full_fmt)}) "
                             f"is not available for {staff_display}. "
                             f"Available slots: {alt_times}. "
-                            f"Please ask the caller which of these times works for them."
+                            f"Please ask the caller which of these times works for them. "
+                            f"IMPORTANT: When the caller picks a time, call check_appointment AGAIN with the new date_time."
                         )
                     else:
                         next_slots = []
@@ -1053,7 +1066,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                                 f"BOOKING_UNAVAILABLE: {staff_display} has no availability on "
                                 f"{appointment_time.strftime('%A, %B %d')}. "
                                 f"Next available slots: {alt_info}. "
-                                f"Please ask the caller if any of these work."
+                                f"Please ask the caller if any of these work. "
+                                f"IMPORTANT: When the caller picks a time, call check_appointment AGAIN with the new date_time."
                             )
                         else:
                             return (
@@ -1102,7 +1116,12 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         context = self._conversations.get(call_sid)
         if not context or not context.pending_booking:
-            return "BOOKING_ERROR: No pending appointment to confirm. Please use check_appointment first."
+            logger.warning("Orchestrator: confirm_appointment called but no pending booking")
+            return (
+                "BOOKING_NEEDS_RECHECK: No confirmed time slot to book. "
+                "You must call check_appointment with the caller's chosen date_time first, "
+                "then call confirm_appointment after SLOT_AVAILABLE."
+            )
 
         if not arguments.get("confirm", False):
             # Caller said no — clear pending booking
@@ -1110,6 +1129,17 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             return "BOOKING_CANCELLED: The caller chose not to book. Ask if they would like a different time or anything else."
 
         pending = context.pending_booking
+
+        # If pending booking is from an UNAVAILABLE check (no confirmed time),
+        # the LLM skipped re-checking — tell it to call check_appointment first
+        if pending.get("awaiting_recheck") or pending.get("appointment_time") is None:
+            logger.warning("Orchestrator: confirm_appointment called but pending booking has no confirmed time (awaiting recheck)")
+            return (
+                "BOOKING_NEEDS_RECHECK: The previous time was unavailable and no new time was checked. "
+                "You must call check_appointment with the caller's chosen date_time first, "
+                "then call confirm_appointment after SLOT_AVAILABLE."
+            )
+
         calendar = get_calendar_service()
 
         # Use the latest caller name from context (may have been registered after check_appointment)
@@ -1332,7 +1362,16 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
                         # Feed result back to LLM for a natural response
                         messages.append(Message(role=LLMRole.ASSISTANT, content=llm_response.content or ""))
-                        messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Now respond naturally to the caller about the booking result. Keep it brief.]"))
+
+                        if "BOOKING_NEEDS_RECHECK" in booking_result:
+                            # LLM skipped re-checking after unavailable — tell caller we need to verify
+                            messages.append(Message(role=LLMRole.USER, content=(
+                                f"[SYSTEM: {booking_result}. "
+                                f"Tell the caller: 'Let me check that time for you' or similar. "
+                                f"Do NOT say there was an error. Keep it brief.]"
+                            )))
+                        else:
+                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Now respond naturally to the caller about the booking result. Keep it brief.]"))
 
                         # Get final response (streaming, no tools)
                         follow_up_request = LLMRequest(
