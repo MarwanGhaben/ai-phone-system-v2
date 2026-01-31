@@ -612,20 +612,15 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     if twilio_handler:
                         await twilio_handler.clear_audio()
 
-                    # Feed this audio chunk to STT so the user's words aren't lost
-                    from services.stt.stt_base import AudioChunk
-                    await call_stt.stream_audio(AudioChunk(data=audio_data))
-                    return
-
-                # Skip STT while AI is speaking (prevents echo)
-                return
+                # NOTE: Do NOT return early here. Always fall through to feed
+                # audio to STT below. This keeps the ElevenLabs WebSocket alive
+                # during long playback (it disconnects after ~15s of no audio).
+                # Echo transcripts are filtered by the echo guard in process_transcript.
 
             # Always feed audio to STT to keep the WebSocket connection alive.
             # Echo filtering is done at the transcript level in process_transcript,
             # NOT here — blocking audio here causes ElevenLabs STT to disconnect
             # after its inactivity timeout (~15s).
-
-            # Stream to this call's STT instance
             from services.stt.stt_base import AudioChunk
             await call_stt.stream_audio(AudioChunk(data=audio_data))
             if process_audio._chunk_count == 1:
@@ -658,9 +653,10 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         # Track last processed final transcript to deduplicate
         # ElevenLabs sends both committed_transcript and final_transcript
-        # for the same utterance, causing duplicate processing
+        # for the same utterance, causing duplicate processing.
+        # NOTE: No time window — the duplicate can arrive many seconds later
+        # because process_transcript blocks while LLM responds and TTS plays.
         last_final_text = None
-        last_final_time = 0
 
         try:
             # get_transcript() returns an async iterator from THIS CALL's STT
@@ -668,16 +664,12 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 if not result or not result.text:
                     continue
 
-                # Deduplicate final transcripts: if we get the same final text
-                # within 2 seconds, skip the duplicate
-                import time
+                # Deduplicate final transcripts: skip if identical to last processed final
                 if result.is_final:
-                    now = time.time()
-                    if result.text == last_final_text and (now - last_final_time) < 2.0:
+                    if result.text == last_final_text:
                         logger.info(f"Orchestrator: Skipping duplicate transcript: '{result.text[:50]}'")
                         continue
                     last_final_text = result.text
-                    last_final_time = now
 
                 logger.info(f"Orchestrator: Got transcript: '{result.text}' (is_final={result.is_final})")
 
