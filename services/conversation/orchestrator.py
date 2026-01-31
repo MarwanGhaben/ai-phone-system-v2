@@ -380,7 +380,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             )
 
             response = await self.llm.chat(request)
-            greeting = response.strip().strip('"')  # Remove any quotes LLM might add
+            greeting = response.content.strip().strip('"')  # Remove any quotes LLM might add
 
             if greeting and len(greeting) > 5:
                 logger.info(f"Orchestrator: LLM generated greeting: '{greeting[:60]}...'")
@@ -483,7 +483,27 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Media handler registered")
 
             # =====================================================
-            # STEP 6: Generate greeting via LLM and send it
+            # STEP 6: Start connection handler + transcript consumer
+            # =====================================================
+            # IMPORTANT: Start these BEFORE the greeting so that:
+            # 1. The audio queue consumer is active (sends queued audio to Twilio)
+            # 2. Barge-in detection works during greeting playback
+            # 3. Transcript consumer is ready for caller's first response
+            logger.info(f"Orchestrator: Starting connection handler...")
+            connection_task = asyncio.create_task(
+                twilio_handler.handle_connection(),
+                name=f"connection_{call_sid}"
+            )
+            logger.info(f"Orchestrator: Starting transcript consumer...")
+            transcript_task = asyncio.create_task(
+                self._consume_stt_transcripts(call_sid),
+                name=f"transcript_consumer_{call_sid}"
+            )
+            # Brief pause for connection handler to initialize
+            await asyncio.sleep(0.2)
+
+            # =====================================================
+            # STEP 7: Generate greeting via LLM and send it
             # =====================================================
             # GPT-4o generates the greeting based on caller context
             # (returning vs new caller, language preference, etc.)
@@ -496,36 +516,25 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Add greeting to conversation history so LLM knows what it already said
             context.add_assistant_message(greeting)
 
-            # Send greeting immediately
-            await asyncio.sleep(0.5)  # Brief pause for audio queue to stabilize
+            # Send greeting (blocks until playback completes — barge-in active)
             logger.info(f"Orchestrator: Sending greeting...")
             async with state_lock:
                 context.state = ConversationState.SPEAKING
             try:
                 await self._speak_to_caller(call_sid, greeting, greeting_lang)
-                logger.info(f"Orchestrator: Greeting sent successfully")
+                logger.info(f"Orchestrator: Greeting playback complete")
             except Exception as e:
                 logger.error(f"Orchestrator: Failed to send greeting: {e}")
-            finally:
+                # Ensure we're in LISTENING state on error
                 async with state_lock:
                     context.state = ConversationState.LISTENING
 
             # =====================================================
-            # STEP 7: Start transcript consumer for this call's STT
+            # STEP 8: Wait for connection to end (call hangup)
             # =====================================================
-            logger.info(f"Orchestrator: Starting transcript consumer...")
-            transcript_task = asyncio.create_task(
-                self._consume_stt_transcripts(call_sid),
-                name=f"transcript_consumer_{call_sid}"
-            )
-
-            # =====================================================
-            # STEP 8: Handle WebSocket connection (incoming audio)
-            # =====================================================
-            # This runs concurrently with transcript consumer
-            logger.info(f"Orchestrator: Starting connection handler...")
+            logger.info(f"Orchestrator: Waiting for call to end...")
             try:
-                await twilio_handler.handle_connection()
+                await connection_task
             finally:
                 # Cancel transcript task when connection ends
                 if not transcript_task.done():
@@ -587,6 +596,9 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     logger.info("Orchestrator: === BARGE-IN DETECTED === User interrupted!")
                     async with state_lock:
                         context.state = ConversationState.LISTENING
+
+                    # Clear echo guard so the caller's speech isn't blocked
+                    self._echo_guard_until[call_sid] = 0
 
                     # Stop TTS generation
                     if self.tts:
@@ -1585,12 +1597,34 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             await twilio_handler.send_audio(mulaw_audio)
             logger.info(f"Orchestrator: Audio sent to Twilio successfully")
 
-            # SET ECHO GUARD: Calculate how long audio will play through phone speaker
-            # μ-law 8kHz = 8000 bytes/sec. Add 1.5s buffer for phone echo tail.
+            # =====================================================
+            # BARGE-IN WAIT: Keep SPEAKING state during audio playback
+            # =====================================================
+            # State stays SPEAKING so the energy-based barge-in detector
+            # in process_audio can detect caller speech and interrupt.
+            # We wait in small steps, checking if barge-in set state to LISTENING.
             import time
             audio_duration = len(mulaw_audio) / 8000.0
-            self._echo_guard_until[call_sid] = time.time() + audio_duration + 1.5
-            logger.info(f"Orchestrator: Echo guard set for {audio_duration + 1.5:.1f}s (audio={audio_duration:.1f}s + 1.5s buffer)")
+            playback_buffer = 1.0  # Buffer for Twilio network + phone speaker delay
+            total_wait = audio_duration + playback_buffer
+            step = 0.1  # Check every 100ms
+            elapsed = 0.0
+
+            logger.info(f"Orchestrator: Waiting {total_wait:.1f}s for playback (audio={audio_duration:.1f}s + {playback_buffer}s buffer) — barge-in active")
+
+            while elapsed < total_wait:
+                await asyncio.sleep(step)
+                elapsed += step
+                # Check if barge-in interrupted us (barge-in sets state to LISTENING)
+                if context.state != ConversationState.SPEAKING:
+                    logger.info(f"Orchestrator: Playback interrupted by barge-in at {elapsed:.1f}s/{total_wait:.1f}s")
+                    break
+
+            # Set a short echo guard for residual echo from phone speaker
+            # (only if playback completed naturally, not on barge-in)
+            if context.state == ConversationState.SPEAKING:
+                self._echo_guard_until[call_sid] = time.time() + 0.5
+                logger.info(f"Orchestrator: Playback complete, short echo guard 0.5s")
 
         except Exception as e:
             logger.error(f"Orchestrator: Exception in _speak_to_caller: {e}")
@@ -1600,10 +1634,12 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # =====================================================
             # STATE TRANSITION: SPEAKING -> LISTENING
             # Using lock to prevent race conditions
+            # Only transition if still SPEAKING (barge-in may have already set LISTENING)
             # =====================================================
             async with state_lock:
-                context.state = ConversationState.LISTENING
-            logger.info(f"Orchestrator: _speak_to_caller END")
+                if context.state == ConversationState.SPEAKING:
+                    context.state = ConversationState.LISTENING
+            logger.info(f"Orchestrator: _speak_to_caller END (state={context.state.value})")
 
 
     async def _detect_barge_in(self, audio_data: bytes) -> bool:
