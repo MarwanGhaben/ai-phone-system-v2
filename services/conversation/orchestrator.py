@@ -656,11 +656,28 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         logger.info(f"Orchestrator: Transcript consumer started for call {call_sid}")
 
+        # Track last processed final transcript to deduplicate
+        # ElevenLabs sends both committed_transcript and final_transcript
+        # for the same utterance, causing duplicate processing
+        last_final_text = None
+        last_final_time = 0
+
         try:
             # get_transcript() returns an async iterator from THIS CALL's STT
             async for result in call_stt.get_transcript():
                 if not result or not result.text:
                     continue
+
+                # Deduplicate final transcripts: if we get the same final text
+                # within 2 seconds, skip the duplicate
+                import time
+                if result.is_final:
+                    now = time.time()
+                    if result.text == last_final_text and (now - last_final_time) < 2.0:
+                        logger.info(f"Orchestrator: Skipping duplicate transcript: '{result.text[:50]}'")
+                        continue
+                    last_final_text = result.text
+                    last_final_time = now
 
                 logger.info(f"Orchestrator: Got transcript: '{result.text}' (is_final={result.is_final})")
 
@@ -1608,25 +1625,44 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # State stays SPEAKING so the energy-based barge-in detector
             # in process_audio can detect caller speech and interrupt.
             # We wait in small steps, checking if barge-in set state to LISTENING.
+            #
+            # IMPORTANT: Barge-in is only active during actual audio playback
+            # (audio_duration). The buffer period after that is just network
+            # delay padding — we switch to LISTENING then so the user's
+            # natural reply isn't treated as an interruption.
             import time
             audio_duration = len(mulaw_audio) / 8000.0
             playback_buffer = 1.0  # Buffer for Twilio network + phone speaker delay
             total_wait = audio_duration + playback_buffer
             step = 0.1  # Check every 100ms
             elapsed = 0.0
+            switched_to_listening = False
 
             logger.info(f"Orchestrator: Waiting {total_wait:.1f}s for playback (audio={audio_duration:.1f}s + {playback_buffer}s buffer) — barge-in active")
 
             while elapsed < total_wait:
                 await asyncio.sleep(step)
                 elapsed += step
-                # Check if barge-in interrupted us (barge-in sets state to LISTENING)
-                if context.state != ConversationState.SPEAKING:
-                    logger.info(f"Orchestrator: Playback interrupted by barge-in at {elapsed:.1f}s/{total_wait:.1f}s")
-                    break
+
+                # During actual audio playback: check for barge-in
+                if not switched_to_listening:
+                    if context.state != ConversationState.SPEAKING:
+                        logger.info(f"Orchestrator: Playback interrupted by barge-in at {elapsed:.1f}s/{total_wait:.1f}s")
+                        break
+
+                    # Once actual audio duration is over, switch to LISTENING
+                    # so the buffer period doesn't trigger false barge-in
+                    if elapsed >= audio_duration:
+                        switched_to_listening = True
+                        async with state_lock:
+                            if context.state == ConversationState.SPEAKING:
+                                context.state = ConversationState.LISTENING
+                        self._echo_guard_until[call_sid] = time.time() + 1.0
+                        logger.info(f"Orchestrator: Audio playback done, switched to LISTENING (echo guard 1.0s for buffer)")
+                # During buffer period: just wait, no barge-in check needed
 
             # Set a short echo guard for residual echo from phone speaker
-            # (only if playback completed naturally, not on barge-in)
+            # (only if playback completed naturally and we haven't already set it)
             if context.state == ConversationState.SPEAKING:
                 self._echo_guard_until[call_sid] = time.time() + 0.5
                 logger.info(f"Orchestrator: Playback complete, short echo guard 0.5s")
