@@ -677,14 +677,22 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # LANGUAGE KEYWORD DETECTION: If the caller says "Arabic" / "arabi" etc.
         # in English, they're requesting Arabic — NOT speaking English.
         # This must be checked BEFORE other language detection logic.
+        # IMPORTANT: Only treat as a language switch if the transcript is SHORT
+        # (a deliberate language request like "English please" or "عربي").
+        # Long sentences containing "english" or "arabic" as part of normal
+        # conversation (e.g. "I'm a living English speaker") should NOT trigger
+        # a language switch — the caller is already speaking that language.
         transcript_lower = transcript.strip().lower().rstrip('.,!?؟')
+        word_count = len(transcript_lower.split())
         arabic_keywords = ["arabic", "arabi", "arabik", "3arabi", "عربي"]
         english_keywords = ["english", "inglish", "inglizi", "انجليزي", "انكليزي", "انجليش", "انجلش"]
         is_arabic_request = any(kw in transcript_lower for kw in arabic_keywords)
         is_english_request = any(kw in transcript_lower for kw in english_keywords)
+        # Only treat as language switch if: short phrase (<=5 words) OR language not yet set
+        is_language_switch = (word_count <= 5 or context.language == "auto")
 
-        if is_arabic_request and not is_english_request:
-            # Caller is requesting Arabic language
+        if is_arabic_request and not is_english_request and is_language_switch:
+            # Caller is requesting Arabic language (short phrase like "Arabic" or "عربي")
             prev_language = context.language
             context.language = "ar"
             logger.info(f"Orchestrator: Detected Arabic language REQUEST from keyword: '{transcript}'")
@@ -692,9 +700,9 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             self._garbled_drop_count[call_sid] = 0
             if prev_language != "ar":
                 await self._reconnect_stt_with_language(call_sid, "ar", force=True)
-        elif is_english_request:
-            # Caller explicitly requested English (check BEFORE has_arabic
-            # because "انجليش" contains Arabic chars but means "English")
+        elif is_english_request and is_language_switch:
+            # Caller explicitly requested English (short phrase like "English please")
+            # Check BEFORE has_arabic because "انجليش" contains Arabic chars but means "English"
             prev_language = context.language
             context.language = "en"
             logger.info(f"Orchestrator: Detected English language REQUEST from keyword: '{transcript}'")
