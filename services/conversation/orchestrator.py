@@ -287,6 +287,13 @@ TRANSFER SCRIPT:
 "Of course, let me transfer you now." (English)
 "بالتأكيد، سأحولك الآن." (Arabic)
 
+ENDING THE CALL:
+- When the caller says goodbye, thanks you and is done, or clearly wants to hang up — say a brief goodbye and call the end_call tool.
+- Examples: "bye" / "goodbye" / "thanks, that's all" / "مع السلامة" / "شكراً، خلص" / "يلا باي"
+- IMPORTANT: Do NOT end the call just because the caller says "thank you" in the middle of a conversation. "Thanks" mid-conversation is NOT a goodbye — the caller may have more questions.
+- Only end when the conversation is truly finished and the caller has no more requests.
+- Always say a natural goodbye BEFORE calling end_call — never hang up silently.
+
 LANGUAGE DETECTION:
 - If caller speaks Arabic, respond in Arabic
 - If caller speaks English, respond in English
@@ -777,19 +784,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             await self._speak_to_caller(call_sid, response, context.language)
             return
 
-        # Detect intent
-        intent = await self._detect_intent(transcript, context.language)
-        context.detected_intent = intent
-        context.intent_history.append(intent.value)
-
-        # Handle based on intent
-        if intent == Intent.GOODBYE:
-            await self._handle_goodbye(call_sid)
-            return
-
-        if intent == Intent.TRANSFER_TO_HUMAN:
-            await self._handle_transfer(call_sid)
-            return
+        # All transcripts go to GPT-4o — the LLM decides intent (goodbye, transfer, booking, etc.)
+        # via function calling tools. No hardcoded keyword matching.
 
         # Get state lock for this call
         state_lock = self._call_state_locks.get(call_sid)
@@ -891,6 +887,20 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         "reason": {
                             "type": "string",
                             "description": "Brief reason for the transfer"
+                        }
+                    },
+                    "required": ["reason"]
+                }
+            },
+            {
+                "name": "end_call",
+                "description": "End the phone call. Call this AFTER you've said goodbye to the caller. Use when: the caller says goodbye/bye/thanks and is done, OR the caller explicitly asks to hang up. Do NOT end the call just because the caller said 'thank you' mid-conversation — only when the conversation is truly finished.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "Brief reason for ending (e.g. 'caller said goodbye', 'conversation complete')"
                         }
                     },
                     "required": ["reason"]
@@ -1371,6 +1381,21 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         context.add_assistant_message("[transferred to human]")
                         return "__TRANSFER_HANDLED__"
 
+                    # --- End call (LLM decided conversation is over) ---
+                    if tool_name == "end_call":
+                        reason = arguments.get("reason", "conversation complete")
+                        logger.info(f"Orchestrator: LLM triggered end_call - reason: {reason}")
+
+                        # If LLM also provided a goodbye message, speak it first
+                        goodbye_text = (llm_response.content or "").strip()
+                        if goodbye_text:
+                            context.add_assistant_message(goodbye_text)
+                            await self._speak_to_caller(call_sid, goodbye_text, context.language)
+
+                        # End the call after goodbye is spoken
+                        await self.end_call(call_sid)
+                        return "__TRANSFER_HANDLED__"  # Reuse marker to skip outer speaking
+
                     # --- Booking tools ---
                     if tool_name in ("check_appointment", "confirm_appointment"):
                         # Execute the appropriate booking step
@@ -1526,96 +1551,6 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 context.state = ConversationState.LISTENING
             logger.info(f"Orchestrator: _speak_to_caller END")
 
-    async def _detect_intent(self, text: str, language: str) -> Intent:
-        """
-        Detect user intent from transcript
-
-        Args:
-            text: User's transcript
-            language: Language code
-
-        Returns:
-            Detected intent
-        """
-        text_lower = text.lower()
-
-        # Simple keyword matching (can be enhanced with LLM)
-        if any(word in text_lower for word in ["goodbye", "bye", "thanks", "thank", "finish"]):
-            return Intent.GOODBYE
-
-        if any(word in text_lower for word in ["transfer", "speak to", "talk to", "human", "person"]):
-            return Intent.TRANSFER_TO_HUMAN
-
-        if any(word in text_lower for word in ["book", "appointment", "schedule", "reserve"]):
-            return Intent.BOOK_APPOINTMENT
-
-        if any(word in text_lower for word in ["payroll", "pay", "salary", "employees"]):
-            return Intent.PAYROLL_INQUIRY
-
-        return Intent.GENERAL_INQUIRY
-
-    def _extract_caller_name(self, transcript: str) -> Optional[str]:
-        """
-        Extract caller name from transcript
-
-        Handles various formats:
-        - "My name is John" → "John"
-        - "This is Ahmed" → "Ahmed"
-        - "أنا محمد" → "محمد"
-        - "I'm Sarah" → "Sarah"
-
-        Args:
-            transcript: User's transcript
-
-        Returns:
-            Extracted name or None
-        """
-        import re
-
-        transcript = transcript.strip()
-        if not transcript:
-            return None
-
-        # English patterns
-        en_patterns = [
-            r"(?:my name is|i'm|i am|this is|call me|it's) (\w+)",
-            r"^(\w+) here",  # "John here"
-            r"speaking (\w+)",  # "This is John speaking"
-        ]
-
-        for pattern in en_patterns:
-            match = re.search(pattern, transcript, re.IGNORECASE)
-            if match:
-                name = match.group(1).strip()
-                # Filter out non-name words
-                if len(name) > 1 and name.lower() not in ["yes", "no", "not", "is", "it"]:
-                    return name.capitalize()
-
-        # Arabic patterns (basic)
-        # "أنا أحمد" → "أحمد"
-        # Blacklist: common Arabic words that are NOT names
-        arabic_non_names = {
-            "عميل", "عملاء", "فردي", "شركة", "موعد", "حجز",
-            "محاسب", "محاسبة", "مساعدة", "سؤال", "استفسار",
-            "شخص", "زبون", "بحاجة", "أريد", "اريد", "أبغى",
-            "أحتاج", "احتاج", "عندي", "بدي", "أبي", "ابي",
-            "هنا", "كذلك", "أيضا", "جديد", "قديم",
-            "من", "في", "على", "إلى", "مع", "عن",
-            "لا", "نعم", "أي", "هذا", "هذه", "ذلك",
-            "واحد", "اثنين", "يوم", "وقت", "ساعة",
-        }
-
-        if "أنا " in transcript or "انا " in transcript or "اسمي " in transcript:
-            parts = transcript.split()
-            for i, part in enumerate(parts):
-                if part in ["أنا", "انا", "اسمي"]:
-                    # Look at next words, skip non-name words
-                    for j in range(i + 1, min(i + 3, len(parts))):
-                        candidate = parts[j]
-                        if candidate not in arabic_non_names and len(candidate) > 1:
-                            return candidate
-
-        return None
 
     async def _detect_barge_in(self, audio_data: bytes) -> bool:
         """
@@ -1655,11 +1590,6 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             self._barge_in_consecutive = 0
 
         return False
-
-    async def _handle_goodbye(self, call_sid: str) -> None:
-        """Handle goodbye intent"""
-        logger.info(f"Orchestrator: Call {call_sid} ended (goodbye)")
-        await self.end_call(call_sid)
 
     async def _reconnect_stt_with_language(self, call_sid: str, language: str, force: bool = False) -> None:
         """
