@@ -184,8 +184,9 @@ class ConversationOrchestrator:
         self._call_stt_instances: Dict[str, Any] = {}  # Per-call STT instances
         self._call_state_locks: Dict[str, asyncio.Lock] = {}  # Per-call state locks
 
-        # Barge-in detection
-        self._energy_threshold: float = settings.interruption_energy_threshold
+        # Barge-in detection (per-call)
+        self._barge_in_consecutive: Dict[str, int] = {}  # Per-call consecutive high-energy frame count
+        self._barge_in_speech_start: Dict[str, float] = {}  # Per-call timestamp when SPEAKING started
 
         # Echo guard: tracks when audio playback is expected to finish per call
         # During this window, STT transcripts are ignored (echo from phone speaker)
@@ -518,8 +519,10 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
             # Send greeting (blocks until playback completes — barge-in active)
             logger.info(f"Orchestrator: Sending greeting...")
+            import time
             async with state_lock:
                 context.state = ConversationState.SPEAKING
+            self._barge_in_speech_start[call_sid] = time.time()
             try:
                 await self._speak_to_caller(call_sid, greeting, greeting_lang)
                 logger.info(f"Orchestrator: Greeting playback complete")
@@ -592,7 +595,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
             if current_state == ConversationState.SPEAKING:
                 # Check for barge-in (user speech during AI speech)
-                if await self._detect_barge_in(audio_data):
+                if await self._detect_barge_in(audio_data, call_sid):
                     logger.info("Orchestrator: === BARGE-IN DETECTED === User interrupted!")
                     async with state_lock:
                         context.state = ConversationState.LISTENING
@@ -877,8 +880,10 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         context.ai_response = response
         context.turn_count += 1
 
+        import time
         async with state_lock:
             context.state = ConversationState.SPEAKING
+        self._barge_in_speech_start[call_sid] = time.time()
 
         # Stream response to caller (this waits for audio to complete)
         await self._speak_to_caller(call_sid, response, context.language)
@@ -1642,42 +1647,69 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: _speak_to_caller END (state={context.state.value})")
 
 
-    async def _detect_barge_in(self, audio_data: bytes) -> bool:
+    async def _detect_barge_in(self, audio_data: bytes, call_sid: str = None) -> bool:
         """
         Detect if user is speaking during AI speech (barge-in)
 
         Uses energy-based detection with consecutive frame requirement
         to avoid false triggers from noise bursts.
 
+        IMPORTANT: μ-law encoding maps silence to byte values 0xFF (255)
+        and 0x7F (127). We must decode to linear PCM first to get real energy.
+
         Args:
-            audio_data: Audio chunk to analyze
+            audio_data: Audio chunk to analyze (μ-law encoded)
+            call_sid: Call identifier for per-call state
 
         Returns:
             True if user is speaking (barge-in detected)
         """
-        # Calculate audio energy (μ-law: silence is ~128, speech deviates from 128)
+        import time
+
         sample_count = min(len(audio_data), 1000)
         if sample_count == 0:
             return False
 
-        energy = sum(abs(byte - 128) for byte in audio_data[:sample_count]) / sample_count
+        # Check grace period: skip barge-in detection for first 1.5s after speech starts
+        # This prevents Twilio line noise from immediately killing playback
+        sid = call_sid or "_default"
+        now = time.time()
+        grace_start = self._barge_in_speech_start.get(sid, 0)
+        if grace_start > 0 and (now - grace_start) < 1.5:
+            return False
 
-        # Track consecutive high-energy frames to avoid false triggers
-        if not hasattr(self, '_barge_in_consecutive'):
-            self._barge_in_consecutive = 0
+        # Decode μ-law to linear PCM to get real energy values
+        # μ-law lookup table for absolute linear value (simplified)
+        # silence in μ-law = 0xFF/0x7F -> linear ~0
+        # speech in μ-law deviates significantly
+        import audioop
+        try:
+            linear_data = audioop.ulaw2lin(audio_data[:sample_count], 2)
+            # Calculate RMS energy from 16-bit linear PCM
+            rms = audioop.rms(linear_data, 2)
+        except Exception:
+            return False
 
-        # Threshold: 0.3 * 100 = 30 is default. Use lower value (15) for better sensitivity.
-        threshold = self._energy_threshold * 50  # More sensitive (was *100)
+        # Initialize per-call consecutive counter
+        if sid not in self._barge_in_consecutive:
+            self._barge_in_consecutive[sid] = 0
 
-        if energy > threshold:
-            self._barge_in_consecutive += 1
-            # Require 3 consecutive high-energy frames (~60ms of speech) to trigger
-            if self._barge_in_consecutive >= 3:
-                logger.info(f"Orchestrator: Barge-in triggered - energy={energy:.1f}, threshold={threshold:.1f}, consecutive={self._barge_in_consecutive}")
-                self._barge_in_consecutive = 0
+        # RMS threshold for actual speech over phone line (μ-law decoded)
+        # Typical phone line noise: RMS ~14
+        # Medium speech: RMS ~200
+        # Loud speech: RMS ~900+
+        # Use 200 as threshold to catch speech but ignore line noise
+        threshold = 200
+
+        if rms > threshold:
+            self._barge_in_consecutive[sid] += 1
+            # Require 5 consecutive high-energy frames (~100ms of speech) to trigger
+            if self._barge_in_consecutive[sid] >= 5:
+                logger.info(f"Orchestrator: Barge-in triggered - rms={rms}, threshold={threshold}, consecutive={self._barge_in_consecutive[sid]}")
+                self._barge_in_consecutive[sid] = 0
                 return True
         else:
-            self._barge_in_consecutive = 0
+            self._barge_in_consecutive[sid] = 0
 
         return False
 
@@ -1831,6 +1863,12 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # Clean up garbled counter
         if call_sid in self._garbled_drop_count:
             del self._garbled_drop_count[call_sid]
+
+        # Clean up barge-in per-call state
+        if call_sid in self._barge_in_consecutive:
+            del self._barge_in_consecutive[call_sid]
+        if call_sid in self._barge_in_speech_start:
+            del self._barge_in_speech_start[call_sid]
 
         # Clean up state lock
         if call_sid in self._call_state_locks:
