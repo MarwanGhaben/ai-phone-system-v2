@@ -191,6 +191,11 @@ class ConversationOrchestrator:
         # During this window, STT transcripts are ignored (echo from phone speaker)
         self._echo_guard_until: Dict[str, float] = {}
 
+        # Garbled transcript counter: tracks consecutive garbled drops per call
+        # After N garbled drops, auto-reconnect STT with Arabic (the most common cause)
+        self._garbled_drop_count: Dict[str, int] = {}
+        self._GARBLED_AUTO_SWITCH_THRESHOLD = 3  # After 3 garbled drops, try Arabic
+
         # System prompt for the AI
         self._system_prompt = self._get_system_prompt()
 
@@ -647,16 +652,56 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # STT garbled the audio into an unexpected script.
             # This is usually echo or misrecognized Arabic on phone-quality audio.
             logger.warning(f"Orchestrator: Detected non-Latin/Arabic script in transcript: '{transcript}' (foreign chars: '{allowed_chars[:30]}') — ignoring")
-            # Don't even send to LLM — just drop it entirely.
+
+            # Track consecutive garbled drops for this call
+            self._garbled_drop_count[call_sid] = self._garbled_drop_count.get(call_sid, 0) + 1
+            garbled_count = self._garbled_drop_count[call_sid]
+            logger.info(f"Orchestrator: Garbled drop count for {call_sid}: {garbled_count}")
+
+            # After N garbled drops, the caller is almost certainly speaking Arabic
+            # but STT auto-detect is failing. Auto-switch to Arabic and re-prompt.
+            if garbled_count == self._GARBLED_AUTO_SWITCH_THRESHOLD and context.language == "auto":
+                logger.warning(f"Orchestrator: {garbled_count} consecutive garbled transcripts — auto-switching to Arabic")
+                context.language = "ar"
+                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
+                # Re-prompt the caller so they know the system is still listening
+                await self._speak_to_caller(call_sid, "عذراً، ممكن تعيد من فضلك؟", "ar")
+
             return
 
-        if has_arabic:
+        # LANGUAGE KEYWORD DETECTION: If the caller says "Arabic" / "arabi" etc.
+        # in English, they're requesting Arabic — NOT speaking English.
+        # This must be checked BEFORE other language detection logic.
+        transcript_lower = transcript.strip().lower().rstrip('.,!?؟')
+        arabic_keywords = ["arabic", "arabi", "arabik", "3arabi", "عربي"]
+        english_keywords = ["english", "inglizi", "انجليزي", "انكليزي"]
+        is_arabic_request = any(kw in transcript_lower for kw in arabic_keywords)
+        is_english_request = any(kw in transcript_lower for kw in english_keywords)
+
+        if is_arabic_request and not is_english_request:
+            # Caller is requesting Arabic language
+            prev_language = context.language
+            context.language = "ar"
+            logger.info(f"Orchestrator: Detected Arabic language REQUEST from keyword: '{transcript}'")
+            # Reset garbled counter since we got a valid signal
+            self._garbled_drop_count[call_sid] = 0
+            if prev_language != "ar":
+                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
+        elif has_arabic:
             prev_language = context.language
             context.language = "ar"
             logger.info(f"Orchestrator: Detected Arabic from text content")
+            # Reset garbled counter since we got a valid Arabic transcript
+            self._garbled_drop_count[call_sid] = 0
             # Reconnect STT with explicit Arabic if it was in auto-detect
             if prev_language == "auto":
                 await self._reconnect_stt_with_language(call_sid, "ar")
+        elif is_english_request:
+            # Caller explicitly requested English
+            context.language = "en"
+            logger.info(f"Orchestrator: Detected English language REQUEST from keyword: '{transcript}'")
+            self._garbled_drop_count[call_sid] = 0
+            await self._reconnect_stt_with_language(call_sid, "en", force=True)
         elif context.language == "auto":
             if language and language != "auto":
                 context.language = language
@@ -667,6 +712,10 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 context.language = "en"
                 logger.info(f"Orchestrator: Defaulting to English")
                 await self._reconnect_stt_with_language(call_sid, "en")
+
+        # Reset garbled counter on any successful transcript
+        if call_sid in self._garbled_drop_count and not has_unexpected_script:
+            self._garbled_drop_count[call_sid] = 0
 
         # =====================================================
         # ADD USER MESSAGE TO CONVERSATION HISTORY (Phase 1.2)
@@ -1549,23 +1598,27 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         logger.info(f"Orchestrator: Call {call_sid} ended (goodbye)")
         await self.end_call(call_sid)
 
-    async def _reconnect_stt_with_language(self, call_sid: str, language: str) -> None:
+    async def _reconnect_stt_with_language(self, call_sid: str, language: str, force: bool = False) -> None:
         """
         Reconnect the per-call STT instance with an explicit language code.
         This dramatically improves accuracy vs auto-detect on phone audio.
-        Only reconnects if the STT is currently in auto-detect mode.
+
+        Args:
+            force: If True, reconnect even if STT already has a language set.
+                   Used when we need to correct a wrong language choice.
         """
         call_stt = self._call_stt_instances.get(call_sid)
         if not call_stt:
             return
 
-        # Only reconnect if currently in auto-detect mode
+        # Skip if already set to the requested language
         if call_stt.language and call_stt.language == language:
             logger.info(f"Orchestrator: STT already set to '{language}', skipping reconnect")
             return
 
-        if call_stt.language and call_stt.language != "":
-            logger.info(f"Orchestrator: STT already set to '{call_stt.language}', skipping reconnect")
+        # If not forcing, only reconnect from auto-detect mode
+        if not force and call_stt.language and call_stt.language != "":
+            logger.info(f"Orchestrator: STT already set to '{call_stt.language}', skipping reconnect (use force=True to override)")
             return
 
         try:
@@ -1691,6 +1744,10 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # Clean up echo guard
         if call_sid in self._echo_guard_until:
             del self._echo_guard_until[call_sid]
+
+        # Clean up garbled counter
+        if call_sid in self._garbled_drop_count:
+            del self._garbled_drop_count[call_sid]
 
         # Clean up state lock
         if call_sid in self._call_state_locks:
