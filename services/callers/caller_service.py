@@ -176,14 +176,11 @@ class CallerRecognitionService:
             else:
                 return f"Hey {caller_name}! It's Sarah from Flexible Accounting, great to hear from you again. How can I help you today?"
         else:
-            # New caller — bilingual greeting, ask for language preference
+            # New caller — English-only greeting, caller can request Arabic
             return (
                 "Hi, thank you for contacting Flexible Accounting! "
                 "My name is Sarah, and I speak English and Arabic. "
-                "Which language do you prefer? "
-                "مرحبا، شكراً لاتصالك بفليكسبل أكاونتنغ! "
-                "اسمي سارة، وأتكلم عربي وإنجليزي. "
-                "أي لغة تفضل؟"
+                "Which language do you prefer?"
             )
 
     def get_all_callers(self) -> Dict:
