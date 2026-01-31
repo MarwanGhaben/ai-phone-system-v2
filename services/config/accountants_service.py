@@ -86,10 +86,20 @@ class AccountantsService:
         if name_lower in self._accountants_by_name:
             return self._accountants_by_name[name_lower]
 
-        # Partial match
+        # Partial match (substring)
         for key, acc in self._accountants_by_name.items():
             if name_lower in key or key in name_lower:
                 return acc
+
+        # Fuzzy match — first name starts with same prefix (at least 3 chars)
+        if len(name_lower) >= 3:
+            for key, acc in self._accountants_by_name.items():
+                # Compare first 3+ characters for close matches
+                key_first = key.split()[0] if ' ' in key else key
+                if (key_first.startswith(name_lower[:3]) or
+                    name_lower.startswith(key_first[:3])):
+                    logger.info(f"Fuzzy matched '{name}' to '{acc['name']}'")
+                    return acc
 
         return None
 

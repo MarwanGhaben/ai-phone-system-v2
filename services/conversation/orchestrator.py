@@ -266,6 +266,7 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - STEP 3: ONLY after the caller says YES/confirms, call confirm_appointment with confirm=true. If they say no, call confirm_appointment with confirm=false.
 - CRITICAL: date_time parameter MUST be in "YYYY-MM-DD HH:MM" format (24-hour). Use today's date ({today_str}) to calculate. NEVER pass Arabic text as date_time.
 - CRITICAL: accountant_name parameter MUST be the English name (e.g. "Hussam Saadaldin", "Rami Kahwaji", "Abdul ElFarra"). NEVER pass Arabic names.
+- IMPORTANT: Callers may mispronounce or approximate accountant names. Match to the closest name: "Husain"/"Hussein"/"Hosam" → "Hussam Saadaldin", "Rami"/"رامي" → "Rami Kahwaji", "Abdul"/"عبدول" → "Abdul ElFarra". NEVER say "we don't have that accountant" if the name is close to one on the list.
 - If the system returns BOOKING_UNAVAILABLE, read the suggested dates/times EXACTLY as provided - do NOT change or guess dates. Tell the caller the exact alternatives.
 - CRITICAL: After BOOKING_UNAVAILABLE, when the caller picks a new time, you MUST call check_appointment AGAIN with the new date_time. NEVER call confirm_appointment directly after UNAVAILABLE — always re-check the new time first.
 - IMPORTANT: Do NOT tell the caller "I've booked it" unless you received BOOKING_SUCCESS from confirm_appointment.
@@ -301,14 +302,14 @@ CRITICAL - ARABIC NUMBER/TIME PRONUNCIATION:
 - Example: instead of "Monday, February 02 at 2:30 PM", say "يوم الاثنين الثاني من فبراير الساعة الثانية والنصف بعد الظهر"
 
 CALLER NAME REGISTRATION:
-- CRITICAL: When the caller tells you their name, you MUST IMMEDIATELY call the register_caller_name tool. Do NOT just acknowledge the name — call the tool FIRST, then respond.
+- CRITICAL: When the caller tells you their name, you MUST call the register_caller_name tool BEFORE responding. This is your #1 priority — never skip this tool call.
+- After you asked "what's your name?", the VERY NEXT thing the caller says is their name. You MUST call register_caller_name with it.
 - Only register real human names (e.g. "مروان", "Marwan", "Ahmed", "أحمد")
-- NEVER register common words, verbs, or phrases as names
+- NEVER register garbled/unclear speech as a name. If the text looks nonsensical or garbled (random sounds, filler words like "همم", "اه"), ask the caller to repeat their name clearly.
 - If the caller says "أنا اسمي مروان" → call register_caller_name with "مروان"
 - If the caller says "My name is John" → call register_caller_name with "John"
 - If the caller says something like "أنا بحب العربي" (I prefer Arabic) → this is NOT a name, do not register anything
-- Use context to understand what is a name vs what is just conversation
-- If you already asked for their name and they respond, that response is almost certainly their name — register it!
+- A real name is typically 1-3 words and is a recognizable personal name. If it doesn't look like a name, ask again.
 
 HANDLING UNCLEAR/GARBLED SPEECH:
 - Phone calls often have audio quality issues — speech may be unclear or garbled
@@ -755,7 +756,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
             # Mark that we've processed the language choice
             context._language_set = True
-            context._awaiting_name = True  # Next transcript should be caller's name
+            # LLM will handle name registration via register_caller_name tool
 
             # Ask for name in detected language
             if context.language == "ar":
@@ -764,40 +765,6 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 response = "Great! May I have your name please?"
             await self._speak_to_caller(call_sid, response, context.language)
             return
-
-        # =====================================================
-        # CODE-LEVEL NAME REGISTRATION FALLBACK
-        # =====================================================
-        # After asking for name, the next transcript is likely the caller's name.
-        # Register it directly here as a safety net — the LLM sometimes doesn't
-        # call register_caller_name even when instructed to.
-        if (not context.is_known_caller
-            and getattr(context, '_awaiting_name', False)
-            and not context.name_collected):
-            import re as _re
-            name_candidate = transcript.strip().strip('.,!?؟').strip()
-            # Accept if it looks like a name: 1-4 words, no obvious commands
-            word_count = len(name_candidate.split())
-            skip_words = {"arabic", "english", "arabi", "inglizi", "عربي", "انجليزي",
-                          "book", "booking", "appointment", "transfer", "help",
-                          "yes", "no", "yeah", "نعم", "لا", "حجز", "موعد"}
-            is_command = name_candidate.lower() in skip_words or word_count > 4
-
-            if name_candidate and not is_command and word_count <= 4:
-                # Register the name directly
-                context.caller_name = name_candidate
-                context.name_collected = True
-                context.is_known_caller = True
-                context._awaiting_name = False
-                self.caller_service.register_caller(
-                    context.phone_number,
-                    name_candidate,
-                    context.language
-                )
-                logger.info(f"Orchestrator: Code-level name registration: '{name_candidate}' for {context.phone_number}")
-            else:
-                # Not a name — clear the flag so we don't keep checking
-                context._awaiting_name = False
 
         # Detect intent
         intent = await self._detect_intent(transcript, context.language)
