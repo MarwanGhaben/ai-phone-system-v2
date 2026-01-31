@@ -196,6 +196,14 @@ class ConversationOrchestrator:
         self._garbled_drop_count: Dict[str, int] = {}
         self._GARBLED_AUTO_SWITCH_THRESHOLD = 3  # After 3 garbled drops, try Arabic
 
+        # Silence timeout: for new callers in auto-detect mode, if no valid transcript
+        # arrives within N seconds after greeting finishes, auto-switch to Arabic.
+        # This handles the case where STT in auto-detect produces NOTHING at all
+        # (not even garbled text) for Arabic phone audio.
+        self._first_transcript_received: Dict[str, bool] = {}
+        self._silence_timeout_tasks: Dict[str, asyncio.Task] = {}
+        self._SILENCE_TIMEOUT_SECONDS = 5  # seconds after greeting ends to wait
+
         # System prompt for the AI
         self._system_prompt = self._get_system_prompt()
 
@@ -420,6 +428,19 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             finally:
                 async with state_lock:
                     context.state = ConversationState.LISTENING
+
+            # =====================================================
+            # STEP 6b: Start silence timeout for new auto-detect callers
+            # =====================================================
+            # If STT is in auto-detect mode (new caller), start a background
+            # timer. If no transcript arrives within N seconds after the
+            # greeting finishes playing, auto-switch STT to Arabic and re-prompt.
+            if caller_language == "auto":
+                self._first_transcript_received[call_sid] = False
+                self._silence_timeout_tasks[call_sid] = asyncio.create_task(
+                    self._silence_timeout_handler(call_sid),
+                    name=f"silence_timeout_{call_sid}"
+                )
 
             # =====================================================
             # STEP 7: Start transcript consumer for this call's STT
@@ -668,6 +689,9 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 await self._speak_to_caller(call_sid, "عذراً، ممكن تعيد من فضلك؟", "ar")
 
             return
+
+        # Mark that we received a valid (non-garbled) transcript — cancels silence timeout
+        self._first_transcript_received[call_sid] = True
 
         # LANGUAGE KEYWORD DETECTION: If the caller says "Arabic" / "arabi" etc.
         # in English, they're requesting Arabic — NOT speaking English.
@@ -1598,6 +1622,50 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         logger.info(f"Orchestrator: Call {call_sid} ended (goodbye)")
         await self.end_call(call_sid)
 
+    async def _silence_timeout_handler(self, call_sid: str) -> None:
+        """
+        Background task for new callers in auto-detect mode.
+        Waits until the greeting finishes playing + SILENCE_TIMEOUT_SECONDS.
+        If no valid transcript has arrived by then, assumes the caller is
+        speaking Arabic (since auto-detect fails on Arabic phone audio)
+        and proactively switches STT to Arabic with a re-prompt.
+        """
+        try:
+            # Wait for the echo guard to expire (greeting finishes playing)
+            import time
+            while True:
+                echo_end = self._echo_guard_until.get(call_sid, 0)
+                now = time.time()
+                if now >= echo_end:
+                    break
+                await asyncio.sleep(0.5)
+
+            # Now wait SILENCE_TIMEOUT_SECONDS for a valid transcript
+            await asyncio.sleep(self._SILENCE_TIMEOUT_SECONDS)
+
+            # Check if we got a valid transcript by now
+            if self._first_transcript_received.get(call_sid, False):
+                logger.info(f"Orchestrator: Silence timeout for {call_sid}: transcript already received, no action needed")
+                return
+
+            # Check if the call is still active
+            context = self._conversations.get(call_sid)
+            if not context or context.state == ConversationState.ENDED:
+                return
+
+            # No transcript received — auto-switch to Arabic
+            logger.warning(f"Orchestrator: Silence timeout for {call_sid}: no transcript after {self._SILENCE_TIMEOUT_SECONDS}s — auto-switching to Arabic")
+            context.language = "ar"
+            await self._reconnect_stt_with_language(call_sid, "ar", force=True)
+
+            # Re-prompt in Arabic so the caller knows the system is listening
+            await self._speak_to_caller(call_sid, "مرحبا، أهلاً فيك بفليكسبل أكاونتنغ. كيف ممكن أساعدك؟", "ar")
+
+        except asyncio.CancelledError:
+            logger.info(f"Orchestrator: Silence timeout cancelled for {call_sid}")
+        except Exception as e:
+            logger.error(f"Orchestrator: Error in silence timeout handler: {e}")
+
     async def _reconnect_stt_with_language(self, call_sid: str, language: str, force: bool = False) -> None:
         """
         Reconnect the per-call STT instance with an explicit language code.
@@ -1748,6 +1816,15 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # Clean up garbled counter
         if call_sid in self._garbled_drop_count:
             del self._garbled_drop_count[call_sid]
+
+        # Clean up silence timeout
+        if call_sid in self._silence_timeout_tasks:
+            task = self._silence_timeout_tasks[call_sid]
+            if not task.done():
+                task.cancel()
+            del self._silence_timeout_tasks[call_sid]
+        if call_sid in self._first_transcript_received:
+            del self._first_transcript_received[call_sid]
 
         # Clean up state lock
         if call_sid in self._call_state_locks:
