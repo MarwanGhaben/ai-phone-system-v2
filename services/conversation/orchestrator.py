@@ -363,13 +363,14 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     f"Use their name. Ask how you can help today."
                 )
             else:
-                # New caller — need to introduce yourself and ask language preference
+                # New caller — need to introduce yourself, ask language, and ask name
                 greeting_prompt = (
                     "You are Sarah, phone receptionist at Flexible Accounting. "
                     "A new caller just picked up the phone. You don't know their name yet. "
-                    "Generate a brief, friendly greeting (1-2 sentences max) in English. "
+                    "Generate a brief, friendly greeting (2-3 sentences max) in English. "
                     "Introduce yourself as Sarah from Flexible Accounting. "
                     "Mention you speak English and Arabic, and ask which language they prefer. "
+                    "Also ask for their name so you can assist them better. "
                     "Keep it short and natural."
                 )
 
@@ -1468,6 +1469,27 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
                         # If LLM also provided a goodbye message, speak it first
                         goodbye_text = (llm_response.content or "").strip()
+                        if not goodbye_text:
+                            # LLM returned tool call without text — ask it to generate farewell
+                            lang_hint = "Arabic" if context.language == "ar" else "English"
+                            caller_ref = f" The caller's name is {context.caller_name}." if context.caller_name else ""
+                            messages.append(Message(role=LLMRole.ASSISTANT, content=""))
+                            messages.append(Message(role=LLMRole.USER, content=(
+                                f"[SYSTEM: The call is ending. Reason: {reason}.{caller_ref} "
+                                f"Say a warm, brief goodbye in {lang_hint}. One sentence max.]"
+                            )))
+                            farewell_request = LLMRequest(
+                                messages=messages,
+                                temperature=0.7,
+                                max_tokens=80,
+                                stream=False
+                            )
+                            try:
+                                farewell_response = await self.llm.chat(farewell_request)
+                                goodbye_text = (farewell_response.content or "").strip().strip('"')
+                            except Exception as e:
+                                logger.warning(f"Orchestrator: Farewell LLM call failed: {e}")
+
                         if goodbye_text:
                             context.add_assistant_message(goodbye_text)
                             await self._speak_to_caller(call_sid, goodbye_text, context.language)
