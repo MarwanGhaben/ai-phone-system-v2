@@ -247,13 +247,14 @@ SERVICES OFFERED:
 - Corporate tax planning
 
 CRITICAL - RESPONSE STYLE:
-- Keep responses EXTREMELY BRIEF — maximum 1-2 short sentences (under 30 words)
-- This is a VOICE call — every extra word wastes the caller's time
-- NEVER give long explanations or list multiple items
-- If asked about services, give a ONE-SENTENCE summary and ask if they want details on anything specific
-- Get straight to the point. Don't repeat the question back.
+- Keep responses EXTREMELY BRIEF — maximum 1-2 short sentences (under 25 words)
+- This is a VOICE call on a phone — every extra word wastes the caller's time and sounds robotic
+- NEVER give long explanations, lists, or detailed descriptions
+- If asked about services, give a ONE-SENTENCE summary (e.g. "We handle personal and corporate taxes, bookkeeping, and payroll.") and ask what they need
+- Get straight to the point. Don't repeat the question back. Don't add filler phrases.
 - Ask ONE question at a time
 - In Arabic, be even shorter — Arabic speech takes longer to say
+- NEVER exceed 2 sentences in any response
 
 APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - Accountants available: {accountant_names_en}
@@ -312,7 +313,8 @@ CRITICAL - ARABIC NUMBER/TIME PRONUNCIATION:
 
 FIRST INTERACTION WITH NEW CALLERS:
 - After greeting, the caller will respond (choose a language, say hello, or ask a question directly).
-- If their name is unknown, ask for it naturally early in the conversation — but DON'T force it. If the caller jumps straight to asking a question, help them first and ask for the name when it fits naturally.
+- If their name is unknown, ask for it in your FIRST response after they choose a language. For example in Arabic: "أهلاً! ممكن أعرف اسمك؟" or in English: "Great! And what's your name?"
+- This is important — always ask for the name before helping with their request.
 - If the caller says their name unprompted, register it immediately.
 
 CALLER NAME REGISTRATION:
@@ -367,17 +369,16 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 greeting_prompt = (
                     "You are Sarah, phone receptionist at Flexible Accounting. "
                     "A new caller just picked up the phone. You don't know their name yet. "
-                    "Generate a brief, friendly greeting (2-3 sentences max) in English. "
+                    "Generate a SHORT greeting (2 sentences max, under 20 words total). "
                     "Introduce yourself as Sarah from Flexible Accounting. "
-                    "Mention you speak English and Arabic, and ask which language they prefer. "
-                    "Also ask for their name so you can assist them better. "
-                    "Keep it short and natural."
+                    "Mention you speak English and Arabic, ask which they prefer, "
+                    "and ask for their name. Keep it very brief — this is a phone call."
                 )
 
             request = LLMRequest(
                 messages=[Message(role=LLMRole.USER, content=greeting_prompt)],
                 temperature=0.8,
-                max_tokens=80,
+                max_tokens=60,
                 stream=False
             )
 
@@ -1404,7 +1405,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         request = LLMRequest(
             messages=messages,
             temperature=0.7,
-            max_tokens=300,
+            max_tokens=150,
             stream=False,
             tools=tools
         )
@@ -1543,7 +1544,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             request = LLMRequest(
                 messages=messages,
                 temperature=0.7,
-                max_tokens=300,
+                max_tokens=150,
                 stream=True
             )
             full_response = ""
