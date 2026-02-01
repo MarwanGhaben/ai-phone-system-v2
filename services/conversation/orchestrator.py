@@ -429,12 +429,19 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # =====================================================
             # STEP 1b: Create per-call STT with language hint
             # =====================================================
-            # For known callers, set STT language explicitly.
-            # This DRAMATICALLY improves accuracy vs auto-detect on phone audio.
+            # ALWAYS set STT language explicitly — auto-detect is unreliable on phone audio.
+            # For known callers: use their stored language preference.
+            # For new callers: start with Arabic (primary business language).
+            #   - Arabic STT can still detect "English"/"انجلش" keywords for language switching
+            #   - Auto-detect drops short Arabic words like "عربي" entirely
             stt_config = self._stt_config.copy()
             if caller_language and caller_language != "auto":
                 stt_config['elevenlabs_stt_language'] = caller_language
                 logger.info(f"Orchestrator: Setting STT language to '{caller_language}' for known caller")
+            else:
+                # New caller: start with Arabic instead of unreliable auto-detect
+                stt_config['elevenlabs_stt_language'] = "ar"
+                logger.info(f"Orchestrator: Setting STT language to 'ar' for new caller (Arabic-first business)")
 
             logger.info(f"Orchestrator: Creating per-call STT instance (provider={self._stt_provider})")
             call_stt = create_stt_service(self._stt_provider, stt_config)
@@ -804,7 +811,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Detected Arabic language REQUEST from keyword: '{transcript}'")
             # Reset garbled counter since we got a valid signal
             self._garbled_drop_count[call_sid] = 0
-            if prev_language != "ar":
+            # Skip reconnect if STT already started in Arabic (new callers start in ar)
+            if prev_language not in ("ar", "auto"):
                 await self._reconnect_stt_with_language(call_sid, "ar", force=True)
         elif is_english_request and is_language_switch:
             # Caller explicitly requested English (short phrase like "English please")
@@ -822,7 +830,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Reset garbled counter since we got a valid Arabic transcript
             self._garbled_drop_count[call_sid] = 0
             # Reconnect STT with Arabic if switching from a different language
-            if prev_language != "ar":
+            # Skip reconnect if prev was "auto" and STT already started in Arabic
+            if prev_language not in ("ar", "auto"):
                 await self._reconnect_stt_with_language(call_sid, "ar", force=True)
         elif context.language == "auto":
             # Check for romanized Arabic (STT auto-detect often romanizes Arabic speech)
