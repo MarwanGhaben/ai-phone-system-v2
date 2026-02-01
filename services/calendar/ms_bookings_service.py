@@ -341,7 +341,7 @@ class MSBookingsService(CalendarServiceBase):
             # Sort by start time
             slots.sort(key=lambda s: s.start_time)
             logger.info(f"MS Bookings: Found {len(slots)} available slots")
-            return slots[:20]  # Return first 20
+            return slots  # Return all slots — truncation here broke day matching
 
         except Exception as e:
             logger.error(f"MS Bookings: Failed to get availability: {e}")
