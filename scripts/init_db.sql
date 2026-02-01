@@ -166,6 +166,28 @@ CREATE INDEX idx_knowledge_category ON knowledge_articles(category);
 CREATE INDEX idx_knowledge_language ON knowledge_articles(language);
 
 -- =====================================================
+-- CALLERS TABLE - Caller recognition / profiles
+-- =====================================================
+CREATE SEQUENCE IF NOT EXISTS callers_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS callers (
+    id INTEGER PRIMARY KEY DEFAULT nextval('callers_id_seq'),
+    phone_number VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    language VARCHAR(10) DEFAULT 'en',
+    call_count INTEGER DEFAULT 1,
+    first_call TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_call TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    tenant_id INTEGER DEFAULT 1,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_callers_phone ON callers(phone_number);
+CREATE INDEX idx_callers_tenant ON callers(tenant_id);
+CREATE INDEX idx_callers_last_call ON callers(last_call);
+
+-- =====================================================
 -- ANALYTICS EVENTS TABLE - Usage metrics
 -- =====================================================
 CREATE TABLE IF NOT EXISTS analytics_events (
@@ -212,6 +234,9 @@ CREATE TRIGGER update_tenants_updated_at BEFORE UPDATE ON tenants
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_knowledge_updated_at BEFORE UPDATE ON knowledge_articles
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_callers_updated_at BEFORE UPDATE ON callers
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- =====================================================

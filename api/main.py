@@ -36,6 +36,11 @@ async def lifespan(app: FastAPI):
     """Application lifespan management"""
     logger.info("AI Voice Platform v2 starting up...")
 
+    # Initialize async database connection pool
+    from services.database import get_db_pool, close_db_pool
+    await get_db_pool()
+    logger.info("Database connection pool initialized")
+
     # Start the SMS reminder scheduler (checks every 60s for due reminders)
     from services.sms.reminder_scheduler import get_reminder_scheduler
     reminder_scheduler = get_reminder_scheduler()
@@ -46,6 +51,8 @@ async def lifespan(app: FastAPI):
 
     # Stop reminder scheduler
     reminder_scheduler.stop()
+    # Close database pool
+    await close_db_pool()
     logger.info("AI Voice Platform v2 shutting down...")
 
 
@@ -399,7 +406,7 @@ async def get_recent_callers(limit: int = 10):
     """Get recent callers"""
     from services.callers.caller_service import get_caller_service
     caller_service = get_caller_service()
-    return {"callers": caller_service.get_recent_callers(limit)}
+    return {"callers": await caller_service.get_recent_callers(limit)}
 
 
 @app.get("/api/callers/frequent")
@@ -407,7 +414,7 @@ async def get_frequent_callers(limit: int = 5, min_calls: int = 2):
     """Get frequent callers (VIPs)"""
     from services.callers.caller_service import get_caller_service
     caller_service = get_caller_service()
-    return {"callers": caller_service.get_frequent_callers(limit, min_calls)}
+    return {"callers": await caller_service.get_frequent_callers(limit, min_calls)}
 
 
 @app.get("/api/callers/stats")
@@ -415,7 +422,7 @@ async def get_caller_stats():
     """Get caller statistics"""
     from services.callers.caller_service import get_caller_service
     caller_service = get_caller_service()
-    all_callers = caller_service.get_all_callers()
+    all_callers = await caller_service.get_all_callers()
 
     total_unique = len(all_callers)
     returning = sum(1 for c in all_callers.values() if c.get("call_count", 0) > 1)

@@ -422,7 +422,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # STEP 1a: Get caller info FIRST (need language for STT)
             # =====================================================
             logger.info(f"Orchestrator: Getting caller info for {phone_number}")
-            caller_info = self.caller_service.get_caller_info(phone_number)
+            caller_info = await self.caller_service.get_caller_info(phone_number)
             caller_name = caller_info.get("name") if caller_info else None
             caller_language = caller_info.get("language", "auto") if caller_info else "auto"
 
@@ -1426,7 +1426,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                             context.caller_name = caller_name
                             context.name_collected = True
                             context.is_known_caller = True
-                            self.caller_service.register_caller(
+                            await self.caller_service.register_caller(
                                 context.phone_number,
                                 caller_name,
                                 context.language
