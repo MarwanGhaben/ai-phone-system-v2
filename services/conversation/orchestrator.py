@@ -367,15 +367,9 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     f"Use their name. Ask how you can help today."
                 )
             else:
-                # New caller — need to introduce yourself, ask language, and ask name
-                greeting_prompt = (
-                    "You are Sarah, phone receptionist at Flexible Accounting. "
-                    "A new caller just picked up the phone. You don't know their name yet. "
-                    "Generate a SHORT greeting (2 sentences max, under 20 words total). "
-                    "Introduce yourself as Sarah from Flexible Accounting. "
-                    "Mention you speak English and Arabic, ask which they prefer, "
-                    "and ask for their name. Keep it very brief — this is a phone call."
-                )
+                # New caller — use hardcoded short greeting (LLM greetings are too wordy)
+                # Name will be asked naturally by LLM after caller picks a language
+                return "Hi, I'm Sarah from Flexible Accounting. English or Arabic?"
 
             request = LLMRequest(
                 messages=[Message(role=LLMRole.USER, content=greeting_prompt)],
@@ -401,7 +395,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             else:
                 return f"Hey {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?"
         else:
-            return "Hi, thank you for calling Flexible Accounting! I'm Sarah, and I speak English and Arabic. Which language do you prefer?"
+            return "Hi, I'm Sarah from Flexible Accounting. English or Arabic?"
 
     async def handle_call(self, call_sid: str, phone_number: str, websocket, stream_sid: str = "") -> None:
         """
@@ -1155,14 +1149,12 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     same_day_slots = [s for s in available_slots if s.start_time.date() == requested_date]
 
                     if same_day_slots:
-                        alt_times = ", ".join([s.start_time.strftime(full_fmt) for s in same_day_slots[:5]])
+                        alt_times = ", ".join([s.start_time.strftime(full_fmt) for s in same_day_slots[:2]])
                         logger.info(f"Orchestrator: Requested time not available. Alternatives: {alt_times}")
                         return (
-                            f"BOOKING_UNAVAILABLE: The requested time ({appointment_time.strftime(full_fmt)}) "
-                            f"is not available for {staff_display}. "
-                            f"Available slots: {alt_times}. "
-                            f"Please ask the caller which of these times works for them. "
-                            f"IMPORTANT: When the caller picks a time, call check_appointment AGAIN with the new date_time."
+                            f"BOOKING_UNAVAILABLE: Time not available for {staff_display}. "
+                            f"Nearest: {alt_times}. "
+                            f"Ask which works. Call check_appointment AGAIN with new time."
                         )
                     else:
                         next_slots = []
@@ -1172,23 +1164,21 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                             if day_key not in seen_days:
                                 next_slots.append(s.start_time.strftime(full_fmt))
                                 seen_days.add(day_key)
-                            if len(seen_days) >= 3:
+                            if len(seen_days) >= 2:
                                 break
 
                         if next_slots:
                             alt_info = ", ".join(next_slots)
                             logger.info(f"Orchestrator: No slots on requested day. Next available: {alt_info}")
                             return (
-                                f"BOOKING_UNAVAILABLE: {staff_display} has no availability on "
-                                f"{appointment_time.strftime('%A, %B %d')}. "
-                                f"Next available slots: {alt_info}. "
-                                f"Please ask the caller if any of these work. "
-                                f"IMPORTANT: When the caller picks a time, call check_appointment AGAIN with the new date_time."
+                                f"BOOKING_UNAVAILABLE: No slots on that day for {staff_display}. "
+                                f"Nearest: {alt_info}. "
+                                f"Ask which works. Call check_appointment AGAIN with new time."
                             )
                         else:
                             return (
-                                f"BOOKING_UNAVAILABLE: {staff_display} has no available slots in the next 7 days. "
-                                f"Please apologize and offer to transfer the caller to speak with someone directly."
+                                f"BOOKING_UNAVAILABLE: {staff_display} has no slots in the next 7 days. "
+                                f"Apologize and offer to transfer."
                             )
 
             # =====================================================
@@ -1523,13 +1513,13 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                                 f"Do NOT say there was an error. Keep it brief.]"
                             )))
                         else:
-                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Respond in ONE short sentence. Example: 'تم الحجز غداً الساعة العاشرة صباحاً مع حسام.' Do NOT add 'anything else?' or extra details.]"))
+                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Reply in ONE short sentence (max 10 words). For unavailable: just say the time is taken and give ONE alternative. For confirmed: 'تم الحجز.' Do NOT list multiple times. Do NOT add 'anything else?'.]"))
 
                         # Get final response (streaming, no tools)
                         follow_up_request = LLMRequest(
                             messages=messages,
                             temperature=0.7,
-                            max_tokens=80,
+                            max_tokens=50,
                             stream=True
                         )
                         full_response = ""
