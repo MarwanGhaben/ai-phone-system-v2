@@ -1436,7 +1436,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         request = LLMRequest(
             messages=messages,
             temperature=0.7,
-            max_tokens=80,
+            max_tokens=60,
             stream=False,
             tools=tools
         )
@@ -1668,7 +1668,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Estimate how much audio is still buffered at Twilio
             # (audio_duration minus the time we spent streaming)
             remaining_playback = max(0, audio_duration - tts_elapsed)
-            playback_buffer = min(remaining_playback + 0.5, audio_duration)
+            playback_buffer = min(remaining_playback + 0.2, audio_duration)
             step = 0.1
 
             if playback_buffer > 0:
@@ -1691,8 +1691,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 await call_stt.reset_for_listening()
 
             # Set echo guard for residual phone speaker echo (shortened since STT is clean)
-            self._echo_guard_until[call_sid] = time.time() + 0.3
-            logger.info(f"Orchestrator: Playback complete, echo guard 0.3s")
+            self._echo_guard_until[call_sid] = time.time() + 0.15
+            logger.info(f"Orchestrator: Playback complete, echo guard 0.15s")
 
         except Exception as e:
             logger.error(f"Orchestrator: Exception in _speak_to_caller: {e}")

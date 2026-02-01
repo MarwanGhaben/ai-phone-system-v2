@@ -90,7 +90,7 @@ class ElevenLabsSTT(STTServiceBase):
                 "audio_format": "ulaw_8000",
                 "sample_rate": "8000",
                 "commit_strategy": "vad",
-                "vad_silence_threshold_secs": "0.5",
+                "vad_silence_threshold_secs": "0.3",
                 "include_language_detection": "true",
             }
 
@@ -276,19 +276,12 @@ class ElevenLabsSTT(STTServiceBase):
                     msg_type = data.get("message_type", data.get("type", ""))
 
                     if msg_type in ("partial_transcript", "transcript"):
-                        # Partial/interim result
+                        # Partial/interim result — log only, don't queue.
+                        # Partials are discarded by process_transcript (is_final=False),
+                        # so queuing them just adds latency and overhead.
                         text = data.get("text", "")
                         if text:
-                            # Extract detected language if available
-                            detected_lang = self._extract_language(data)
-                            result = STTResult(
-                                text=text,
-                                language=detected_lang,
-                                confidence=data.get("confidence", 0.9),
-                                is_final=False,
-                            )
-                            await self._transcript_queue.put(result)
-                            logger.debug(f"ElevenLabs STT: Partial: '{text}' (lang={detected_lang})")
+                            logger.debug(f"ElevenLabs STT: Partial: '{text}'")
 
                     elif msg_type in ("committed_transcript", "committed_transcript_with_timestamps", "final_transcript"):
                         # Final result
@@ -378,7 +371,7 @@ class ElevenLabsSTT(STTServiceBase):
             try:
                 result = await asyncio.wait_for(
                     self._transcript_queue.get(),
-                    timeout=0.5
+                    timeout=0.1
                 )
                 yield result
             except asyncio.TimeoutError:
