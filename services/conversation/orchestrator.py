@@ -247,14 +247,16 @@ SERVICES OFFERED:
 - Corporate tax planning
 
 CRITICAL - RESPONSE STYLE:
-- Keep responses EXTREMELY BRIEF — maximum 1-2 short sentences (under 25 words)
-- This is a VOICE call on a phone — every extra word wastes the caller's time and sounds robotic
+- Keep responses EXTREMELY BRIEF — maximum 1 short sentence (under 15 words)
+- This is a VOICE call on a phone — every extra word wastes the caller's time
 - NEVER give long explanations, lists, or detailed descriptions
-- If asked about services, give a ONE-SENTENCE summary (e.g. "We handle personal and corporate taxes, bookkeeping, and payroll.") and ask what they need
+- If asked about services: "We handle taxes, bookkeeping, and payroll." — that's it
 - Get straight to the point. Don't repeat the question back. Don't add filler phrases.
 - Ask ONE question at a time
-- In Arabic, be even shorter — Arabic speech takes longer to say
-- NEVER exceed 2 sentences in any response
+- In Arabic, be even shorter — Arabic speech takes 2x longer to say aloud
+- NEVER exceed 1 sentence in any response. If you must confirm details, use the shortest form possible.
+- For booking confirmations: "تم الحجز مع حسام غداً الساعة العاشرة صباحاً." — ONE sentence, no extra details
+- NEVER say "Is there anything else?" after a booking — just confirm and stop
 
 APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - Accountants available: {accountant_names_en}
@@ -848,17 +850,20 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # =====================================================
         context.add_user_message(transcript)
 
-        # NOISE FILTER: Ignore very short/meaningless utterances like "Eee", "Uh", etc.
-        # These are hesitation sounds on phone audio, not real speech.
+        # NOISE FILTER: Ignore meaningless utterances (hesitation sounds).
+        # IMPORTANT: Do NOT filter by length — Arabic words like "نعم" (yes, 3 chars)
+        # and "لا" (no, 2 chars) are short but critically meaningful.
+        # Use an explicit noise list instead.
         cleaned = transcript.strip().strip('.,!?؟').strip()
-        is_noise = (
-            len(cleaned) <= 3
-            or cleaned.lower() in [
-                "eee", "ee", "uh", "um", "ah", "eh", "hmm", "hm",
-                "uhh", "umm", "ahh", "ehh", "mmm", "mm",
-                "اه", "هم", "ام", "آه",
-            ]
-        )
+        noise_words = {
+            # English hesitation sounds
+            "eee", "ee", "uh", "um", "ah", "eh", "hmm", "hm",
+            "uhh", "umm", "ahh", "ehh", "mmm", "mm", "mhm",
+            "ugh", "oh", "ooh", "err", "er",
+            # Arabic hesitation sounds
+            "اه", "هم", "ام", "آه", "امم", "اهه",
+        }
+        is_noise = cleaned.lower() in noise_words
         if is_noise:
             logger.info(f"Orchestrator: Ignoring noise/hesitation: '{transcript}'")
             return
@@ -1405,7 +1410,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         request = LLMRequest(
             messages=messages,
             temperature=0.7,
-            max_tokens=150,
+            max_tokens=80,
             stream=False,
             tools=tools
         )
@@ -1442,7 +1447,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         follow_up_request = LLMRequest(
                             messages=messages,
                             temperature=0.7,
-                            max_tokens=150,
+                            max_tokens=60,
                             stream=True
                         )
                         full_response = ""
@@ -1518,13 +1523,13 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                                 f"Do NOT say there was an error. Keep it brief.]"
                             )))
                         else:
-                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Now respond naturally to the caller about the booking result. Keep it brief.]"))
+                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Respond in ONE short sentence. Example: 'تم الحجز غداً الساعة العاشرة صباحاً مع حسام.' Do NOT add 'anything else?' or extra details.]"))
 
                         # Get final response (streaming, no tools)
                         follow_up_request = LLMRequest(
                             messages=messages,
                             temperature=0.7,
-                            max_tokens=200,
+                            max_tokens=80,
                             stream=True
                         )
                         full_response = ""
@@ -1544,7 +1549,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             request = LLMRequest(
                 messages=messages,
                 temperature=0.7,
-                max_tokens=150,
+                max_tokens=80,
                 stream=True
             )
             full_response = ""

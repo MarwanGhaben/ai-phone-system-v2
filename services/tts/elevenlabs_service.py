@@ -275,7 +275,10 @@ class ElevenLabsTTS(TTSServiceBase):
             "xi-api-key": self.api_key,
             "Content-Type": "application/json",
         }
-        params = {"output_format": self.output_format}
+        params = {
+            "output_format": self.output_format,
+            "optimize_streaming_latency": "3",  # Max latency optimization for faster TTFB
+        }
         body = {
             "text": request.text,
             "model_id": self.model,
