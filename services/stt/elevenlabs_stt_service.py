@@ -264,6 +264,10 @@ class ElevenLabsSTT(STTServiceBase):
 
     async def _receive_loop(self) -> None:
         """Receive and process messages from WebSocket"""
+        # Deduplicate: ElevenLabs sends both committed_transcript AND
+        # final_transcript for the same utterance. Track last text to skip dupes.
+        last_final_text = None
+
         try:
             while self._is_listening and self._websocket:
                 try:
@@ -284,9 +288,14 @@ class ElevenLabsSTT(STTServiceBase):
                             logger.debug(f"ElevenLabs STT: Partial: '{text}'")
 
                     elif msg_type in ("committed_transcript", "committed_transcript_with_timestamps", "final_transcript"):
-                        # Final result
+                        # Final result — deduplicate (ElevenLabs sends 2 events per utterance)
                         text = data.get("text", "")
                         if text:
+                            if text == last_final_text:
+                                logger.debug(f"ElevenLabs STT: Skipping duplicate final: '{text}'")
+                                continue
+                            last_final_text = text
+
                             detected_lang = self._extract_language(data)
                             result = STTResult(
                                 text=text,

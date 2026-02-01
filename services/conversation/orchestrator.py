@@ -662,32 +662,54 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # Track last processed final transcript to deduplicate
         # ElevenLabs sends both committed_transcript and final_transcript
         # for the same utterance, causing duplicate processing.
-        # NOTE: No time window — the duplicate can arrive many seconds later
-        # because process_transcript blocks while LLM responds and TTS plays.
         last_final_text = None
 
         try:
-            # get_transcript() returns an async iterator from THIS CALL's STT
-            async for result in call_stt.get_transcript():
-                if not result or not result.text:
-                    continue
-
-                # Deduplicate final transcripts: skip if identical to last processed final
-                if result.is_final:
-                    if result.text == last_final_text:
-                        logger.info(f"Orchestrator: Skipping duplicate transcript: '{result.text[:50]}'")
-                        continue
-                    last_final_text = result.text
-
-                logger.info(f"Orchestrator: Got transcript: '{result.text}' (is_final={result.is_final})")
-
-                # Process the transcript
-                await self.process_transcript(call_sid, result.text, result.language, result.is_final)
-
-                # If call ended, stop consuming
+            # Outer loop: survives STT resets (disconnect + reconnect).
+            # When reset_for_listening() disconnects STT, get_transcript() ends
+            # because _is_listening becomes False. Without this outer loop,
+            # the consumer dies and no transcripts are ever processed again.
+            while True:
+                # Check if call is still active
                 if context.state == ConversationState.ENDED:
                     logger.info(f"Orchestrator: Call ended, stopping transcript consumer")
                     break
+
+                # Re-fetch STT instance (same object, but its internal queue
+                # is recreated on reconnect)
+                call_stt = self._call_stt_instances.get(call_sid)
+                if not call_stt:
+                    logger.info(f"Orchestrator: STT instance removed, stopping consumer")
+                    break
+
+                try:
+                    async for result in call_stt.get_transcript():
+                        if not result or not result.text:
+                            continue
+
+                        # Deduplicate final transcripts
+                        if result.is_final:
+                            if result.text == last_final_text:
+                                logger.info(f"Orchestrator: Skipping duplicate transcript: '{result.text[:50]}'")
+                                continue
+                            last_final_text = result.text
+
+                        logger.info(f"Orchestrator: Got transcript: '{result.text}' (is_final={result.is_final})")
+                        await self.process_transcript(call_sid, result.text, result.language, result.is_final)
+
+                        if context.state == ConversationState.ENDED:
+                            break
+
+                except asyncio.CancelledError:
+                    raise  # Propagate cancellation
+                except Exception as e:
+                    logger.warning(f"Orchestrator: Transcript iterator error (will retry): {e}")
+
+                # get_transcript() ended — STT was likely reset.
+                # Wait briefly then retry with the new STT connection.
+                if context.state != ConversationState.ENDED:
+                    logger.info(f"Orchestrator: Transcript iterator ended (STT reset?), retrying in 0.1s...")
+                    await asyncio.sleep(0.1)
 
         except asyncio.CancelledError:
             logger.info(f"Orchestrator: Transcript consumer cancelled for call {call_sid}")
