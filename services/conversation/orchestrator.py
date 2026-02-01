@@ -195,7 +195,7 @@ class ConversationOrchestrator:
         # Garbled transcript counter: tracks consecutive garbled drops per call
         # After N garbled drops, auto-reconnect STT with Arabic (the most common cause)
         self._garbled_drop_count: Dict[str, int] = {}
-        self._GARBLED_AUTO_SWITCH_THRESHOLD = 3  # After 3 garbled drops, try Arabic
+        self._GARBLED_AUTO_SWITCH_THRESHOLD = 1  # After 1 garbled drop, try Arabic immediately
 
         # System prompt for the AI
         self._system_prompt = self._get_system_prompt()
@@ -825,15 +825,39 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             if prev_language != "ar":
                 await self._reconnect_stt_with_language(call_sid, "ar", force=True)
         elif context.language == "auto":
-            if language and language != "auto":
-                context.language = language
-                logger.info(f"Orchestrator: Auto-detected language from STT: {language}")
-                # Reconnect STT with explicit language
-                await self._reconnect_stt_with_language(call_sid, language)
-            else:
+            # Check for romanized Arabic (STT auto-detect often romanizes Arabic speech)
+            romanized_arabic_patterns = [
+                "allah", "inshallah", "yalla", "habibi", "habibti", "shukran",
+                "marhaba", "ahlan", "salam", "wallah", "khalas", "mashallah",
+                "bilawasamat", "bukra", "sabah", "masa", "aiwa", "naam",
+                "mumkin", "arabi", "araby",
+            ]
+            transcript_words = transcript_lower.split()
+            is_romanized_arabic = any(
+                any(pat in word for pat in romanized_arabic_patterns)
+                for word in transcript_words
+            )
+
+            if is_romanized_arabic:
+                # Romanized Arabic detected — switch to Arabic STT
+                context.language = "ar"
+                logger.info(f"Orchestrator: Detected romanized Arabic in: '{transcript}' — switching to Arabic")
+                self._garbled_drop_count[call_sid] = 0
+                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
+                # Re-prompt in Arabic
+                await self._speak_to_caller(call_sid, "عذراً، ممكن تعيد من فضلك؟", "ar")
+                return
+            elif language and language != "auto" and language == "en":
+                # STT explicitly detected English — trust it
                 context.language = "en"
-                logger.info(f"Orchestrator: Defaulting to English")
+                logger.info(f"Orchestrator: Auto-detected English from STT")
                 await self._reconnect_stt_with_language(call_sid, "en")
+            else:
+                # Unknown or unclear language — default to Arabic (primary business language)
+                # If they're speaking English, next transcript will be clearly English
+                context.language = "ar"
+                logger.info(f"Orchestrator: Defaulting to Arabic (primary business language)")
+                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
 
         # Reset garbled counter on any successful transcript
         if call_sid in self._garbled_drop_count and not has_unexpected_script:
