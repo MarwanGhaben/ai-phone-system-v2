@@ -196,6 +196,44 @@ class ElevenLabsSTT(STTServiceBase):
         self._status = STTStatus.DISCONNECTED
         logger.info("ElevenLabs STT: Disconnected")
 
+    async def reset_for_listening(self) -> None:
+        """
+        Reset STT for a fresh listening session by reconnecting.
+
+        Called when the AI finishes speaking. During SPEAKING, the AI's voice
+        comes back through the phone mic as echo, polluting the STT's VAD buffer.
+        Without a reset, the first 1-3 user utterances after AI speech are missed
+        or delayed by 5-15 seconds.
+
+        Reconnection takes ~100ms. Language setting is preserved.
+        """
+        try:
+            logger.info(f"ElevenLabs STT: Resetting for listening (language={self.language})")
+
+            # Drain any echo transcripts from queue
+            drained = 0
+            if self._transcript_queue:
+                while not self._transcript_queue.empty():
+                    try:
+                        self._transcript_queue.get_nowait()
+                        drained += 1
+                    except asyncio.QueueEmpty:
+                        break
+            if drained:
+                logger.info(f"ElevenLabs STT: Drained {drained} echo transcripts from queue")
+
+            # Quick disconnect + reconnect (language is preserved)
+            await self.disconnect()
+            await self.connect()
+
+        except Exception as e:
+            logger.warning(f"ElevenLabs STT: Error during reset: {e}")
+            # Try to reconnect even if disconnect failed
+            try:
+                await self.connect()
+            except Exception:
+                logger.error("ElevenLabs STT: Failed to reconnect after reset error")
+
     async def stream_audio(self, audio_chunk: AudioChunk) -> None:
         """
         Stream audio chunk to ElevenLabs STT

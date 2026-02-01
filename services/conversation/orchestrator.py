@@ -617,15 +617,18 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     if twilio_handler:
                         await twilio_handler.clear_audio()
 
-                # NOTE: Do NOT return early here. Always fall through to feed
-                # audio to STT below. This keeps the ElevenLabs WebSocket alive
-                # during long playback (it disconnects after ~15s of no audio).
-                # Echo transcripts are filtered by the echo guard in process_transcript.
+                    # Reset STT for clean listening after barge-in
+                    await call_stt.reset_for_listening()
+                else:
+                    # SPEAKING and no barge-in: Do NOT feed audio to STT.
+                    # The AI's voice comes back through the phone mic as echo.
+                    # Feeding this echo to STT pollutes its VAD buffer, causing
+                    # it to miss the user's first words after AI finishes speaking.
+                    # STT will be reset with a clean connection when we transition
+                    # to LISTENING (see _speak_to_caller).
+                    return
 
-            # Always feed audio to STT to keep the WebSocket connection alive.
-            # Echo filtering is done at the transcript level in process_transcript,
-            # NOT here — blocking audio here causes ElevenLabs STT to disconnect
-            # after its inactivity timeout (~15s).
+            # LISTENING state: feed audio to STT
             from services.stt.stt_base import AudioChunk
             await call_stt.stream_audio(AudioChunk(data=audio_data))
             if process_audio._chunk_count == 1:
@@ -1680,9 +1683,16 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         logger.info(f"Orchestrator: Barge-in during post-stream wait at {elapsed:.1f}s")
                         break
 
-            # Set echo guard for residual phone speaker echo
-            self._echo_guard_until[call_sid] = time.time() + 0.5
-            logger.info(f"Orchestrator: Playback complete, echo guard 0.5s")
+            # Reset STT for clean listening — reconnects to flush echo buffer
+            # This gives STT a completely clean slate so the user's first words
+            # are detected immediately instead of being lost in echo noise.
+            call_stt = self._call_stt_instances.get(call_sid)
+            if call_stt:
+                await call_stt.reset_for_listening()
+
+            # Set echo guard for residual phone speaker echo (shortened since STT is clean)
+            self._echo_guard_until[call_sid] = time.time() + 0.3
+            logger.info(f"Orchestrator: Playback complete, echo guard 0.3s")
 
         except Exception as e:
             logger.error(f"Orchestrator: Exception in _speak_to_caller: {e}")
