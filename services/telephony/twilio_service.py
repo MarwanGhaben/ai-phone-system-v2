@@ -311,6 +311,98 @@ class TwilioMediaStreamHandler:
             logger.info(f"Twilio: Barge-in cleared {cleared} queued audio(s)")
         logger.info(f"Twilio: Audio playback interrupted")
 
+    async def stream_audio_chunks(self, audio_stream) -> int:
+        """
+        Stream audio chunks directly to Twilio WebSocket in real-time.
+
+        Instead of waiting for full audio, this sends 160-byte (20ms) chunks
+        to Twilio as they arrive from TTS. The caller starts hearing audio
+        within ~200ms of the TTS request, not after the full synthesis.
+
+        Args:
+            audio_stream: Async iterator yielding raw ulaw_8000 audio bytes
+
+        Returns:
+            Total bytes sent to Twilio
+        """
+        if not self._is_streaming or not self.stream_sid:
+            logger.warning("Twilio: Cannot stream audio - not streaming or no stream_sid")
+            return 0
+
+        self._interrupted = False
+
+        # Clear any pending audio and stop current playback
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        await self.send_event("clear")
+
+        CHUNK_SIZE = 160  # 20ms at 8kHz ulaw
+        CHUNK_INTERVAL = 0.015  # Send slightly faster than real-time
+        buffer = bytearray()
+        total_bytes = 0
+        chunks_sent = 0
+
+        try:
+            async for audio_data in audio_stream:
+                if self._interrupted:
+                    logger.info(f"Twilio: Stream interrupted by barge-in at {total_bytes} bytes")
+                    await self.send_event("clear")
+                    break
+
+                buffer.extend(audio_data)
+
+                # Send complete 160-byte chunks as they accumulate
+                while len(buffer) >= CHUNK_SIZE:
+                    if self._interrupted:
+                        break
+
+                    chunk = bytes(buffer[:CHUNK_SIZE])
+                    buffer = bytearray(buffer[CHUNK_SIZE:])
+
+                    payload = base64.b64encode(chunk).decode("utf-8")
+                    media_event = {
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {
+                            "payload": payload
+                        }
+                    }
+                    await self.websocket.send_json(media_event)
+                    total_bytes += CHUNK_SIZE
+                    chunks_sent += 1
+
+                    if chunks_sent == 1:
+                        logger.info(f"Twilio: First audio chunk streamed to caller")
+                    elif chunks_sent % 50 == 0:
+                        logger.info(f"Twilio: Streamed {chunks_sent} chunks ({total_bytes} bytes)")
+
+                    await asyncio.sleep(CHUNK_INTERVAL)
+
+            # Send any remaining bytes in the buffer
+            if buffer and not self._interrupted:
+                payload = base64.b64encode(bytes(buffer)).decode("utf-8")
+                media_event = {
+                    "event": "media",
+                    "streamSid": self.stream_sid,
+                    "media": {
+                        "payload": payload
+                    }
+                }
+                await self.websocket.send_json(media_event)
+                total_bytes += len(buffer)
+
+            logger.info(f"Twilio: Stream complete - {total_bytes} bytes in {chunks_sent} chunks")
+            return total_bytes
+
+        except Exception as e:
+            logger.error(f"Twilio: Stream error: {e}")
+            import traceback
+            logger.error(f"Twilio: Traceback:\n{traceback.format_exc()}")
+            return total_bytes
+
     async def _send_audio_chunked(self, audio_data: bytes) -> None:
         """
         Send audio to Twilio with proper chunking

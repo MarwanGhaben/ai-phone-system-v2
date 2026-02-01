@@ -3,6 +3,10 @@
 AI Voice Platform v2 - ElevenLabs TTS Service
 =====================================================
 Real-time streaming Text-to-Speech using ElevenLabs
+
+KEY DESIGN: Uses async HTTP streaming to send audio to Twilio
+as it's generated, reducing time-to-first-audio from seconds
+to ~200ms. The caller hears audio almost immediately.
 """
 
 import asyncio
@@ -16,6 +20,13 @@ try:
 except ImportError:
     ELEVENLABS_AVAILABLE = False
     ElevenLabs = None
+
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
+    httpx = None
 
 from .tts_base import TTSServiceBase, TTSRequest, TTSResponse, TTSChunk, TTSStatus
 
@@ -78,14 +89,22 @@ class ElevenLabsTTS(TTSServiceBase):
         self.similarity_boost = similarity_boost
         self.output_format = output_format
 
-        # Create ElevenLabs client
-        self._client = Optional[ElevenLabs]
+        # Reuse ElevenLabs client (don't recreate per call)
+        self._client: Optional[ElevenLabs] = ElevenLabs(api_key=self.api_key) if ELEVENLABS_AVAILABLE else None
+        # Reuse httpx client for streaming TTS
+        self._http_client: Optional[httpx.AsyncClient] = None
         self._voices_cache: Optional[List[dict]] = None
         self._stop_event = asyncio.Event()
 
     def _get_client(self) -> ElevenLabs:
-        """Get or create ElevenLabs client"""
-        return ElevenLabs(api_key=self.api_key)
+        """Get ElevenLabs SDK client (reused)"""
+        return self._client
+
+    async def _get_http_client(self) -> "httpx.AsyncClient":
+        """Get or create async HTTP client for streaming TTS"""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=30.0)
+        return self._http_client
 
     def _get_voice_id(self, voice_name: str) -> str:
         """Convert voice name to voice_id"""
@@ -221,6 +240,85 @@ class ElevenLabsTTS(TTSServiceBase):
         except Exception as e:
             self._status = TTSStatus.ERROR
             logger.error(f"ElevenLabs: Streaming error: {e}")
+            raise
+
+    async def synthesize_stream_async(self, request: TTSRequest) -> AsyncIterator[bytes]:
+        """
+        Stream TTS audio using async HTTP — yields raw audio chunks as they're generated.
+
+        This uses the ElevenLabs /stream endpoint with httpx async streaming,
+        so audio bytes flow to the caller as they're generated (~200ms to first chunk)
+        instead of waiting for the entire audio to be synthesized (~2-3s).
+
+        The output is raw ulaw_8000 bytes ready for Twilio — no conversion needed.
+
+        Args:
+            request: TTS request with text and voice settings
+
+        Yields:
+            Raw audio bytes (ulaw_8000 format) as they arrive from ElevenLabs
+        """
+        if not HTTPX_AVAILABLE:
+            logger.warning("ElevenLabs: httpx not available, falling back to blocking synthesize")
+            response = await self.synthesize(request)
+            yield response.audio_data
+            return
+
+        self._status = TTSStatus.SPEAKING
+        self._current_request = request
+        self._stop_event.clear()
+
+        voice_id = self._get_voice_id(request.voice_id or self.default_voice_id)
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+
+        headers = {
+            "xi-api-key": self.api_key,
+            "Content-Type": "application/json",
+        }
+        params = {"output_format": self.output_format}
+        body = {
+            "text": request.text,
+            "model_id": self.model,
+            "voice_settings": {
+                "stability": self.stability,
+                "similarity_boost": self.similarity_boost,
+            }
+        }
+
+        logger.info(f"ElevenLabs: Streaming async '{request.text[:50]}...' voice={voice_id} model={self.model}")
+
+        try:
+            client = await self._get_http_client()
+            async with client.stream(
+                "POST", url,
+                headers=headers,
+                params=params,
+                json=body,
+                timeout=30.0,
+            ) as response:
+                response.raise_for_status()
+                chunk_count = 0
+                async for chunk in response.aiter_bytes(1024):
+                    if self._stop_event.is_set():
+                        self._status = TTSStatus.INTERRUPTED
+                        logger.info("ElevenLabs: Async stream interrupted by stop event")
+                        break
+                    chunk_count += 1
+                    if chunk_count == 1:
+                        logger.info(f"ElevenLabs: First audio chunk received ({len(chunk)} bytes)")
+                    yield chunk
+
+            if not self._stop_event.is_set():
+                self._status = TTSStatus.IDLE
+                logger.info(f"ElevenLabs: Async stream complete ({chunk_count} chunks)")
+
+        except httpx.HTTPStatusError as e:
+            self._status = TTSStatus.ERROR
+            logger.error(f"ElevenLabs: HTTP streaming error {e.response.status_code}: {e.response.text[:200]}")
+            raise
+        except Exception as e:
+            self._status = TTSStatus.ERROR
+            logger.error(f"ElevenLabs: Async streaming error: {e}")
             raise
 
     async def stop(self) -> None:

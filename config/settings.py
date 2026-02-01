@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     # =====================================================
     elevenlabs_api_key: str = Field(..., alias="ELEVENLABS_API_KEY")
     elevenlabs_voice_id: str = Field(default="Rachel", alias="ELEVENLABS_VOICE_ID")
-    elevenlabs_model: str = "eleven_flash_v2_5"
+    elevenlabs_model: str = "eleven_multilingual_v2"
     elevenlabs_stability: float = 0.5  # 0-1, lower = more expressive
     elevenlabs_similarity_boost: float = 0.75  # 0-1, higher = more similar to original
     elevenlabs_output_format: str = "ulaw_8000"
@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     # =====================================================
     elevenlabs_stt_model: str = Field(default="scribe_v2_realtime", alias="ELEVENLABS_STT_MODEL")
     elevenlabs_stt_language: str = Field(default="", alias="ELEVENLABS_STT_LANGUAGE")  # Empty = auto-detect
-    elevenlabs_stt_sample_rate: int = Field(default=16000, alias="ELEVENLABS_STT_SAMPLE_RATE")
+    elevenlabs_stt_sample_rate: int = Field(default=8000, alias="ELEVENLABS_STT_SAMPLE_RATE")  # 8000 for Twilio ulaw
 
     # =====================================================
     # OPENAI
