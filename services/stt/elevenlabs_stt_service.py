@@ -198,14 +198,17 @@ class ElevenLabsSTT(STTServiceBase):
 
     async def reset_for_listening(self) -> None:
         """
-        Reset STT for a fresh listening session by reconnecting.
+        Reset STT for a fresh listening session by swapping the WebSocket.
 
         Called when the AI finishes speaking. During SPEAKING, the AI's voice
         comes back through the phone mic as echo, polluting the STT's VAD buffer.
         Without a reset, the first 1-3 user utterances after AI speech are missed
         or delayed by 5-15 seconds.
 
-        Reconnection takes ~100ms. Language setting is preserved.
+        IMPORTANT: This does NOT call disconnect()/connect() because that would
+        toggle _is_listening to False, causing get_transcript() to exit and the
+        transcript consumer to spin-loop. Instead, we swap the WebSocket and
+        receive task while keeping _is_listening=True and the same queue.
         """
         try:
             logger.info(f"ElevenLabs STT: Resetting for listening (language={self.language})")
@@ -222,17 +225,66 @@ class ElevenLabsSTT(STTServiceBase):
             if drained:
                 logger.info(f"ElevenLabs STT: Drained {drained} echo transcripts from queue")
 
-            # Quick disconnect + reconnect (language is preserved)
-            await self.disconnect()
-            await self.connect()
+            # Cancel old receive task (but do NOT set _is_listening = False)
+            old_receive_task = self._receive_task
+            self._receive_task = None
+            if old_receive_task and not old_receive_task.done():
+                old_receive_task.cancel()
+                try:
+                    await old_receive_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Close old WebSocket
+            old_ws = self._websocket
+            self._websocket = None
+            if old_ws:
+                try:
+                    await old_ws.send(json.dumps({"message_type": "end_of_stream"}))
+                    await old_ws.close()
+                except Exception:
+                    pass
+
+            # Build new WebSocket connection (reuse same params)
+            params = {
+                "model_id": self.model,
+                "audio_format": "ulaw_8000",
+                "sample_rate": "8000",
+                "commit_strategy": "vad",
+                "vad_silence_threshold_secs": "0.3",
+                "include_language_detection": "true",
+            }
+            if self.language:
+                params["language_code"] = self.language
+
+            query_string = "&".join(f"{k}={v}" for k, v in params.items())
+            ws_url = f"{self.WEBSOCKET_URL}?{query_string}"
+
+            self._websocket = await websockets.connect(
+                ws_url,
+                extra_headers={"xi-api-key": self.api_key},
+                ping_interval=30,
+                ping_timeout=10,
+            )
+
+            # Start new receive task (pushes to the SAME queue)
+            # _is_listening was never set to False, so get_transcript() keeps blocking
+            self._receive_task = asyncio.create_task(
+                self._receive_loop(),
+                name="elevenlabs_stt_receive"
+            )
+
+            self._status = STTStatus.CONNECTED
+            logger.info(f"ElevenLabs STT: Reset complete (language={self.language})")
 
         except Exception as e:
             logger.warning(f"ElevenLabs STT: Error during reset: {e}")
-            # Try to reconnect even if disconnect failed
+            # Try full reconnect as fallback
             try:
+                await self.disconnect()
                 await self.connect()
             except Exception:
-                logger.error("ElevenLabs STT: Failed to reconnect after reset error")
+                logger.error("ElevenLabs STT: Failed to recover after reset error")
 
     async def stream_audio(self, audio_chunk: AudioChunk) -> None:
         """
@@ -333,10 +385,9 @@ class ElevenLabsSTT(STTServiceBase):
             logger.info(f"ElevenLabs STT: WebSocket closed: {e}")
         except asyncio.CancelledError:
             logger.debug("ElevenLabs STT: Receive loop cancelled")
+            return  # Don't touch _is_listening — reset_for_listening manages it
         except Exception as e:
             logger.error(f"ElevenLabs STT: Receive loop error: {e}")
-        finally:
-            self._is_listening = False
 
     def _extract_language(self, data: dict) -> str:
         """

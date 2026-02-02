@@ -705,11 +705,12 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 except Exception as e:
                     logger.warning(f"Orchestrator: Transcript iterator error (will retry): {e}")
 
-                # get_transcript() ended — STT was likely reset.
-                # Wait briefly then retry with the new STT connection.
+                # get_transcript() ended — this should rarely happen now since
+                # reset_for_listening() keeps _is_listening=True.
+                # Use exponential backoff to avoid spin-looping if something is wrong.
                 if context.state != ConversationState.ENDED:
-                    logger.info(f"Orchestrator: Transcript iterator ended (STT reset?), retrying in 0.1s...")
-                    await asyncio.sleep(0.1)
+                    logger.warning(f"Orchestrator: Transcript iterator ended unexpectedly, retrying in 1s...")
+                    await asyncio.sleep(1.0)
 
         except asyncio.CancelledError:
             logger.info(f"Orchestrator: Transcript consumer cancelled for call {call_sid}")
