@@ -354,17 +354,19 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     f"You are Sarah, phone receptionist at Flexible Accounting. "
                     f"A returning caller just picked up the phone. Their name is {context.caller_name} "
                     f"and they prefer {'Arabic' if context.language == 'ar' else 'English'}. "
-                    f"Generate a warm, brief greeting (1 sentence max). Use their name. "
-                    f"Speak in their preferred language. Ask how you can help today. "
-                    f"Be natural and human — like greeting someone you know."
+                    f"Generate a warm, brief greeting (1 sentence max). Introduce yourself as Sarah. "
+                    f"Use their name. Speak in their preferred language. Ask how you can help today. "
+                    f"Example Arabic: 'مرحباً مروان! أنا سارة من فليكسبل أكاونتنغ، كيف أقدر أساعدك؟' "
+                    f"Example English: 'Hey Marwan! It's Sarah from Flexible Accounting. How can I help you today?'"
                 )
             elif context.caller_name:
                 # Known caller, unknown language
                 greeting_prompt = (
                     f"You are Sarah, phone receptionist at Flexible Accounting. "
                     f"A returning caller just picked up the phone. Their name is {context.caller_name}. "
-                    f"Generate a warm, brief greeting (1 sentence max) in English. "
-                    f"Use their name. Ask how you can help today."
+                    f"Generate a warm, brief greeting (1 sentence max) in English. Introduce yourself as Sarah. "
+                    f"Use their name. Ask how you can help today. "
+                    f"Example: 'Hey {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?'"
                 )
             else:
                 # New caller — use hardcoded short greeting (LLM greetings are too wordy)
@@ -388,10 +390,10 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         except Exception as e:
             logger.warning(f"Orchestrator: LLM greeting failed, using fallback: {e}")
 
-        # Fallback — simple templates if LLM fails
+        # Fallback — simple templates if LLM fails (always include Sarah's name)
         if context.caller_name:
             if context.language == "ar":
-                return f"هلا {context.caller_name}! أنا سارة من فليكسبل أكاونتنغ. كيف أقدر أساعدك؟"
+                return f"مرحباً {context.caller_name}! أنا سارة من فليكسبل أكاونتنغ، كيف أقدر أساعدك؟"
             else:
                 return f"Hey {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?"
         else:
@@ -1459,7 +1461,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         request = LLMRequest(
             messages=messages,
             temperature=0.7,
-            max_tokens=60,
+            max_tokens=80,
             stream=False,
             tools=tools
         )
