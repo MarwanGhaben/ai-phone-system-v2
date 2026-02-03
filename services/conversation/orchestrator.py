@@ -818,19 +818,42 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # LANGUAGE KEYWORD DETECTION: If the caller says "Arabic" / "arabi" etc.
         # in English, they're requesting Arabic — NOT speaking English.
         # This must be checked BEFORE other language detection logic.
-        # IMPORTANT: Only treat as a language switch if the transcript is SHORT
-        # (a deliberate language request like "English please" or "عربي").
-        # Long sentences containing "english" or "arabic" as part of normal
-        # conversation (e.g. "I'm a living English speaker") should NOT trigger
-        # a language switch — the caller is already speaking that language.
+        #
+        # Two detection modes:
+        # 1. SHORT phrases (<=5 words): keyword match (e.g. "Arabic please", "عربي")
+        # 2. LONGER sentences: explicit switch PHRASES that unambiguously request
+        #    a language change (e.g. "I want to talk in Arabic", "can you speak Arabic")
+        #    This avoids false positives on "I'm an English speaker" while still
+        #    catching "switch to Arabic" or "talk to me in Arabic".
         transcript_lower = transcript.strip().lower().rstrip('.,!?؟')
         word_count = len(transcript_lower.split())
         arabic_keywords = ["arabic", "arabi", "arabik", "3arabi", "عربي"]
         english_keywords = ["english", "inglish", "inglizi", "انجليزي", "انكليزي", "انجليش", "انجلش"]
         is_arabic_request = any(kw in transcript_lower for kw in arabic_keywords)
         is_english_request = any(kw in transcript_lower for kw in english_keywords)
-        # Only treat as language switch if: short phrase (<=5 words) OR language not yet set
-        is_language_switch = (word_count <= 5 or context.language == "auto")
+
+        # Explicit switch phrases — unambiguous even in long sentences
+        arabic_switch_phrases = [
+            "speak arabic", "talk arabic", "talk in arabic", "speak in arabic",
+            "switch to arabic", "change to arabic", "in arabic please",
+            "can you speak arabic", "want arabic", "prefer arabic",
+            "let's speak arabic", "let's talk arabic", "use arabic",
+            "respond in arabic", "answer in arabic", "reply in arabic",
+            "تكلم عربي", "كلمني عربي", "حكي عربي", "بالعربي",
+        ]
+        english_switch_phrases = [
+            "speak english", "talk english", "talk in english", "speak in english",
+            "switch to english", "change to english", "in english please",
+            "can you speak english", "want english", "prefer english",
+            "let's speak english", "let's talk english", "use english",
+            "respond in english", "answer in english", "reply in english",
+            "تكلم انجليزي", "كلمني انجليزي", "بالانجليزي",
+        ]
+        has_arabic_switch_phrase = any(phrase in transcript_lower for phrase in arabic_switch_phrases)
+        has_english_switch_phrase = any(phrase in transcript_lower for phrase in english_switch_phrases)
+
+        # Treat as language switch if: short phrase OR explicit switch phrase OR language not yet set
+        is_language_switch = (word_count <= 5 or has_arabic_switch_phrase or has_english_switch_phrase or context.language == "auto")
 
         if is_arabic_request and not is_english_request and is_language_switch:
             # Caller is requesting Arabic language (short phrase like "Arabic" or "عربي")
@@ -1713,6 +1736,27 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # are detected immediately instead of being lost in echo noise.
             call_stt = self._call_stt_instances.get(call_sid)
             if call_stt:
+                # LANGUAGE SAFETY NET: Detect the ACTUAL language of the LLM response
+                # from its text content, and update STT if it differs.
+                # This catches cases where the user requested a language switch
+                # (e.g. "speak Arabic") but the keyword detection missed it —
+                # the LLM understood and responded in Arabic, but STT stayed English.
+                # We detect Arabic by character presence (definitive signal).
+                import re
+                response_has_arabic = bool(re.search(r'[\u0600-\u06FF]', text))
+
+                if response_has_arabic and call_stt.language != "ar":
+                    logger.info(f"Orchestrator: LLM responded in Arabic but STT is '{call_stt.language}' — switching STT to Arabic before reset")
+                    call_stt.language = "ar"
+                    if context:
+                        context.language = "ar"
+                elif not response_has_arabic and call_stt.language == "ar":
+                    # LLM responded in English (no Arabic chars) but STT is Arabic
+                    logger.info(f"Orchestrator: LLM responded in English but STT is 'ar' — switching STT to English before reset")
+                    call_stt.language = "en"
+                    if context:
+                        context.language = "en"
+
                 await call_stt.reset_for_listening()
 
             # Set echo guard for residual phone speaker echo (shortened since STT is clean)
