@@ -190,6 +190,7 @@ class ConversationOrchestrator:
         # Barge-in detection (per-call)
         self._barge_in_consecutive: Dict[str, int] = {}  # Per-call consecutive high-energy frame count
         self._barge_in_speech_start: Dict[str, float] = {}  # Per-call timestamp when SPEAKING started
+        self._barge_in_reset_done: Dict[str, bool] = {}  # Per-call flag: True if barge-in already triggered STT reset
 
         # Echo guard: tracks when audio playback is expected to finish per call
         # During this window, STT transcripts are ignored (echo from phone speaker)
@@ -280,8 +281,9 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - CRITICAL: date_time parameter MUST be in "YYYY-MM-DD HH:MM" format (24-hour). Use today's date ({today_str}) to calculate. NEVER pass Arabic text as date_time.
 - CRITICAL: accountant_name parameter MUST be the English name (e.g. "Hussam Saadaldin", "Rami Kahwaji", "Abdul ElFarra"). NEVER pass Arabic names.
 - IMPORTANT: Callers may mispronounce or approximate accountant names. Match to the closest name: "Husain"/"Hussein"/"Hosam" → "Hussam Saadaldin", "Rami"/"رامي" → "Rami Kahwaji", "Abdul"/"عبدول" → "Abdul ElFarra". NEVER say "we don't have that accountant" if the name is close to one on the list.
-- If the system returns BOOKING_UNAVAILABLE, read the suggested dates/times EXACTLY as provided - do NOT change or guess dates. Tell the caller the exact alternatives.
-- CRITICAL: After BOOKING_UNAVAILABLE, when the caller picks a new time, you MUST call check_appointment AGAIN with the new date_time. NEVER call confirm_appointment directly after UNAVAILABLE — always re-check the new time first.
+- IMPORTANT: SLOT_BUSY/SCHEDULE_FULL means the ACCOUNTANT is busy, NOT that the office is closed. The office is open Monday-Friday. Only weekends (Saturday/Sunday) are when the office is actually closed.
+- If the system returns SLOT_BUSY or SCHEDULE_FULL, tell the caller the accountant is busy at that time (not "office closed") and read the alternative times EXACTLY as provided.
+- CRITICAL: After SLOT_BUSY/SCHEDULE_FULL, when the caller picks a new time, you MUST call check_appointment AGAIN with the new date_time. NEVER call confirm_appointment directly — always re-check the new time first.
 - IMPORTANT: Do NOT tell the caller "I've booked it" unless you received BOOKING_SUCCESS from confirm_appointment.
 - If booking fails, apologize and offer to transfer to a human
 
@@ -660,6 +662,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
                     # Reset STT for clean listening after barge-in
                     await call_stt.reset_for_listening()
+                    # Mark that barge-in already did the reset (prevent double reset in _speak_to_caller)
+                    self._barge_in_reset_done[call_sid] = True
                 else:
                     # SPEAKING and no barge-in: Do NOT feed audio to STT.
                     # The AI's voice comes back through the phone mic as echo.
@@ -1298,8 +1302,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         alt_times = ", ".join([s.start_time.strftime(full_fmt) for s in same_day_slots[:2]])
                         logger.info(f"Orchestrator: Requested time not available. Alternatives: {alt_times}")
                         return (
-                            f"BOOKING_UNAVAILABLE: Time not available for {staff_display}. "
-                            f"Nearest: {alt_times}. "
+                            f"SLOT_BUSY: {staff_display} is busy at that exact time (the office IS open, just that time slot is taken). "
+                            f"Same-day alternatives: {alt_times}. "
                             f"Ask which works. Call check_appointment AGAIN with new time."
                         )
                     else:
@@ -1317,14 +1321,14 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                             alt_info = ", ".join(next_slots)
                             logger.info(f"Orchestrator: No slots on requested day. Next available: {alt_info}")
                             return (
-                                f"BOOKING_UNAVAILABLE: No slots on that day for {staff_display}. "
-                                f"Nearest: {alt_info}. "
+                                f"SCHEDULE_FULL: {staff_display}'s schedule is full that day (office IS open Monday-Friday, but this accountant is booked). "
+                                f"Next available: {alt_info}. "
                                 f"Ask which works. Call check_appointment AGAIN with new time."
                             )
                         else:
                             return (
-                                f"BOOKING_UNAVAILABLE: {staff_display} has no slots in the next 7 days. "
-                                f"Apologize and offer to transfer."
+                                f"NO_AVAILABILITY: {staff_display} has no available slots in the next 7 days. "
+                                f"Apologize and offer to transfer or suggest a different accountant."
                             )
 
             # =====================================================
@@ -1903,6 +1907,10 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             return
 
         try:
+            # Clear the barge-in reset flag at the start of each TTS turn
+            # This ensures we track fresh barge-ins for this utterance
+            self._barge_in_reset_done[call_sid] = False
+
             # Pre-process Arabic text: convert numbers/times to Arabic words
             if language == "ar":
                 from services.audio.arabic_text_processor import process_arabic_text
@@ -1966,8 +1974,11 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Reset STT for clean listening — reconnects to flush echo buffer
             # This gives STT a completely clean slate so the user's first words
             # are detected immediately instead of being lost in echo noise.
+            # IMPORTANT: Skip if barge-in already triggered a reset (prevents double reset race condition)
             call_stt = self._call_stt_instances.get(call_sid)
-            if call_stt:
+            barge_in_already_reset = self._barge_in_reset_done.get(call_sid, False)
+
+            if call_stt and not barge_in_already_reset:
                 # LANGUAGE SAFETY NET: Detect the ACTUAL language of the LLM response
                 # from its text content, and update STT if it differs.
                 # This catches cases where the user requested a language switch
@@ -1990,6 +2001,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         context.language = "en"
 
                 await call_stt.reset_for_listening()
+            elif barge_in_already_reset:
+                logger.info(f"Orchestrator: Skipping post-TTS STT reset (barge-in already did it)")
 
             # Set echo guard for residual phone speaker echo (shortened since STT is clean)
             self._echo_guard_until[call_sid] = time.time() + 0.15
@@ -2276,6 +2289,8 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             del self._barge_in_consecutive[call_sid]
         if call_sid in self._barge_in_speech_start:
             del self._barge_in_speech_start[call_sid]
+        if call_sid in self._barge_in_reset_done:
+            del self._barge_in_reset_done[call_sid]
 
         # Clean up state lock
         if call_sid in self._call_state_locks:
