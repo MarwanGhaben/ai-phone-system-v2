@@ -488,18 +488,26 @@ class MSBookingsService(CalendarServiceBase):
                 normalized_appt_phone = ''.join(c for c in appt_phone if c.isdigit())[-10:]
 
                 if normalized_appt_phone == normalized_phone:
-                    # Parse start time
+                    # Parse start time - API returns in timezone specified when booking (Eastern)
+                    # but we need to handle both UTC (Z suffix) and offset formats
                     start_dt_str = appt.get('startDateTime', {}).get('dateTime', '')
                     start_dt = None
                     formatted_time = "Unknown time"
 
                     if start_dt_str:
                         try:
-                            start_dt = datetime.fromisoformat(start_dt_str.replace('Z', '+00:00'))
-                            start_dt = start_dt.replace(tzinfo=None)
+                            # Parse the datetime - MS Graph returns in the business timezone
+                            # which we set as Eastern Standard Time when creating appointments
+                            if start_dt_str.endswith('Z'):
+                                # UTC format - convert to Eastern (UTC-5)
+                                start_dt = datetime.fromisoformat(start_dt_str.replace('Z', ''))
+                                start_dt = start_dt - timedelta(hours=5)  # Convert UTC to Eastern
+                            else:
+                                # Already in local time format
+                                start_dt = datetime.fromisoformat(start_dt_str.split('+')[0].split('-')[0] if '+' in start_dt_str or start_dt_str.count('-') > 2 else start_dt_str)
                             formatted_time = start_dt.strftime('%A, %B %d at %I:%M %p')
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"MS Bookings: Failed to parse time {start_dt_str}: {e}")
 
                     # Get staff name
                     staff_ids = appt.get('staffMemberIds', [])
@@ -510,8 +518,12 @@ class MSBookingsService(CalendarServiceBase):
                                 staff_name = s.name
                                 break
 
+                    # Log the actual appointment ID for debugging
+                    appt_id = appt.get('id', '')
+                    logger.info(f"MS Bookings: Found appointment ID={appt_id[:20]}... time={formatted_time}")
+
                     appointments.append({
-                        'id': appt.get('id', ''),
+                        'id': appt_id,
                         'staff_name': staff_name,
                         'customer_name': appt.get('customerName', ''),
                         'start_time': start_dt,

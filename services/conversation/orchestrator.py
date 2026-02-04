@@ -1095,20 +1095,16 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             },
             {
                 "name": "cancel_booking",
-                "description": "Cancel an existing appointment. Call this ONLY after lookup_my_bookings found the caller's appointment AND the caller explicitly confirmed they want to cancel it. After cancellation, offer to book a new appointment.",
+                "description": "Cancel an existing appointment. Call this ONLY after lookup_my_bookings found the caller's appointment AND the caller explicitly confirmed they want to cancel it. The system automatically uses the appointment found by lookup_my_bookings. After cancellation, offer to book a new appointment.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "appointment_id": {
-                            "type": "string",
-                            "description": "The appointment ID returned from lookup_my_bookings"
-                        },
                         "confirm_cancel": {
                             "type": "boolean",
                             "description": "Must be true to confirm cancellation"
                         }
                     },
-                    "required": ["appointment_id", "confirm_cancel"]
+                    "required": ["confirm_cancel"]
                 }
             }
         ]
@@ -1554,7 +1550,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         Args:
             call_sid: Call identifier
-            arguments: Must include appointment_id and confirm_cancel=True
+            arguments: Must include confirm_cancel=True (appointment_id is taken from context)
 
         Returns:
             Result message
@@ -1563,14 +1559,25 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         from services.database import get_db_pool
 
         context = self._conversations.get(call_sid)
-        appointment_id = arguments.get("appointment_id", "")
         confirm_cancel = arguments.get("confirm_cancel", False)
 
         if not confirm_cancel:
             return "CANCEL_ABORTED: Cancellation not confirmed. Ask if they still want to cancel or if they'd like to keep the appointment."
 
+        # Get appointment ID from stored context (not from LLM arguments - LLM often hallucinates IDs)
+        appointment_id = None
+        if context and context.found_appointments and len(context.found_appointments) > 0:
+            # Use the first found appointment (most common case: single appointment)
+            appointment_id = context.found_appointments[0].get('id', '')
+            logger.info(f"Orchestrator: Using appointment ID from context: {appointment_id[:30]}...")
+
+        # Fallback to LLM argument only if context doesn't have it
         if not appointment_id:
-            return "CANCEL_ERROR: No appointment ID provided. Call lookup_my_bookings first to get the appointment ID."
+            appointment_id = arguments.get("appointment_id", "")
+            logger.warning(f"Orchestrator: No appointment in context, using LLM argument: {appointment_id}")
+
+        if not appointment_id:
+            return "CANCEL_ERROR: No appointment found. Call lookup_my_bookings first to find the appointment."
 
         calendar = get_calendar_service()
 
