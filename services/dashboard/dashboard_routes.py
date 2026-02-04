@@ -297,6 +297,43 @@ async def get_system_status(user: dict = Depends(require_auth)):
         return {"status": "ERROR", "error": str(e)}
 
 
+@router.get("/api/active-calls")
+async def get_active_calls(user: dict = Depends(require_auth)):
+    """Get list of currently active calls with details"""
+    try:
+        from services.conversation.orchestrator import get_orchestrator
+        orchestrator = get_orchestrator()
+        active_calls = orchestrator.get_active_calls()
+
+        # Format duration as MM:SS
+        for call in active_calls:
+            duration = call.get("duration_seconds", 0)
+            minutes = duration // 60
+            seconds = duration % 60
+            call["duration_formatted"] = f"{minutes:02d}:{seconds:02d}"
+
+            # Translate state to user-friendly text
+            state_map = {
+                "connecting": "Connecting",
+                "greeting": "Greeting",
+                "listening": "Listening",
+                "thinking": "Processing",
+                "speaking": "Speaking",
+                "interrupted": "Interrupted",
+                "closing": "Ending",
+                "ended": "Ended"
+            }
+            call["state_display"] = state_map.get(call.get("state", ""), call.get("state", "Unknown"))
+
+        return {
+            "count": len(active_calls),
+            "calls": active_calls
+        }
+    except Exception as e:
+        logger.error(f"Error getting active calls: {e}")
+        return {"count": 0, "calls": [], "error": str(e)}
+
+
 @router.get("/api/ai-models")
 async def get_ai_models(user: dict = Depends(require_auth)):
     """Get AI model configuration"""

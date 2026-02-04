@@ -485,6 +485,27 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Conversation context created")
 
             # =====================================================
+            # STEP 3b: Log call start to database
+            # =====================================================
+            try:
+                from services.database import get_db_pool
+                pool = await get_db_pool()
+                await pool.execute(
+                    """
+                    INSERT INTO call_logs (call_sid, phone_number, caller_name, language, started_at, status)
+                    VALUES ($1, $2, $3, $4, NOW(), 'in_progress')
+                    ON CONFLICT (call_sid) DO NOTHING
+                    """,
+                    call_sid,
+                    phone_number,
+                    caller_name or "Unknown",
+                    caller_language or "en"
+                )
+                logger.info(f"Orchestrator: Call logged to database")
+            except Exception as db_err:
+                logger.warning(f"Orchestrator: Failed to log call start to DB: {db_err}")
+
+            # =====================================================
             # STEP 4: Create Twilio handler
             # =====================================================
             logger.info(f"Orchestrator: Creating Twilio handler")
@@ -2182,9 +2203,57 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         """
         logger.info(f"Orchestrator: Ending call {call_sid}")
 
+        # Capture context data before cleanup for database logging
+        context = self._conversations.get(call_sid)
+        caller_name = context.caller_name if context else None
+        language = context.language if context else "en"
+        turn_count = context.turn_count if context else 0
+        booking_made = False
+        transfer_requested = False
+
+        # Check if booking was made during this call
+        if context and context.pending_booking:
+            booking_made = True
+
+        # Check intent history for transfer requests
+        if context and context.intent_history:
+            for intent in context.intent_history:
+                if intent == Intent.TRANSFER_TO_HUMAN:
+                    transfer_requested = True
+                    break
+
         # Update context
         if call_sid in self._conversations:
             self._conversations[call_sid].state = ConversationState.ENDED
+
+        # =====================================================
+        # Log call end to database
+        # =====================================================
+        try:
+            from services.database import get_db_pool
+            pool = await get_db_pool()
+            # Update call log with end time and duration
+            await pool.execute(
+                """
+                UPDATE call_logs
+                SET ended_at = NOW(),
+                    duration_seconds = EXTRACT(EPOCH FROM (NOW() - started_at))::INTEGER,
+                    status = 'completed',
+                    caller_name = COALESCE($2, caller_name),
+                    language = COALESCE($3, language),
+                    booking_made = $4,
+                    transfer_requested = $5
+                WHERE call_sid = $1
+                """,
+                call_sid,
+                caller_name,
+                language,
+                booking_made,
+                transfer_requested
+            )
+            logger.info(f"Orchestrator: Call end logged to database (duration calculated, booking={booking_made}, transfer={transfer_requested})")
+        except Exception as db_err:
+            logger.warning(f"Orchestrator: Failed to log call end to DB: {db_err}")
 
         # =====================================================
         # CRITICAL: Disconnect and cleanup this call's STT instance
@@ -2221,11 +2290,31 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         if call_sid in self._conversations:
             del self._conversations[call_sid]
 
-        # TODO: Save conversation to database
-
     def get_conversation_context(self, call_sid: str) -> Optional[ConversationContext]:
         """Get conversation context for a call"""
         return self._conversations.get(call_sid)
+
+    def get_active_calls(self) -> list:
+        """Get list of active calls with details for dashboard"""
+        import time
+        active_calls = []
+        current_time = time.time()
+
+        for call_sid, context in self._conversations.items():
+            # Calculate duration in seconds
+            duration = int(current_time - context.start_time)
+
+            active_calls.append({
+                "call_sid": call_sid,
+                "phone_number": context.phone_number,
+                "caller_name": context.caller_name or "Unknown",
+                "language": context.language or "en",
+                "state": context.state.value,
+                "duration_seconds": duration,
+                "turn_count": context.turn_count
+            })
+
+        return active_calls
 
 
 # Global orchestrator instance

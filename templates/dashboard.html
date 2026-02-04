@@ -253,6 +253,23 @@
             color: #dc3545;
         }
 
+        .status-badge.success {
+            background: rgba(40, 167, 69, 0.2);
+            color: #28a745;
+        }
+
+        .status-badge.info {
+            background: rgba(23, 162, 184, 0.2);
+            color: #17a2b8;
+        }
+
+        /* Pulse animation for active calls */
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.6; }
+            100% { opacity: 1; }
+        }
+
         /* Metrics Grid */
         .metrics-grid {
             display: grid;
@@ -776,6 +793,31 @@
         <section id="calls" style="margin-top: 30px;">
             <h2 style="margin-bottom: 20px;"><i class="fas fa-users"></i> Caller Analytics & Personalization</h2>
 
+            <!-- Active Calls Card (Full Width) -->
+            <div class="card" style="margin-bottom: 20px;">
+                <div class="card-header">
+                    <div class="icon success" style="animation: pulse 2s infinite;"><i class="fas fa-phone-volume"></i></div>
+                    <h3>Active Calls Now</h3>
+                    <span id="activeCallCount" style="margin-left: auto; background: var(--success); padding: 4px 12px; border-radius: 20px; font-weight: bold;">0</span>
+                </div>
+                <div class="table-container" id="activeCallsContainer">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Caller</th>
+                                <th>Phone</th>
+                                <th>Language</th>
+                                <th>Status</th>
+                                <th>Duration</th>
+                            </tr>
+                        </thead>
+                        <tbody id="activeCallsBody">
+                            <tr><td colspan="5" style="text-align: center; color: var(--text-secondary);">No active calls</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
             <div class="section-grid">
                 <!-- Recent Calls -->
                 <div class="card">
@@ -1088,6 +1130,37 @@
             }
         }
 
+        // Load active calls (live)
+        async function loadActiveCalls() {
+            try {
+                const response = await fetch(`${API_BASE}/active-calls`);
+                const data = await response.json();
+
+                // Update count badge
+                const countBadge = document.getElementById('activeCallCount');
+                countBadge.textContent = data.count;
+                countBadge.style.background = data.count > 0 ? 'var(--success)' : 'var(--text-secondary)';
+
+                const tbody = document.getElementById('activeCallsBody');
+                if (data.count === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-secondary);">No active calls</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = data.calls.map(call => `
+                    <tr>
+                        <td><strong style="color: #ffffff;">${call.caller_name}</strong></td>
+                        <td style="color: #ffffff;">${call.phone_number}</td>
+                        <td><span class="lang-badge ${call.language}">${call.language === 'ar' ? 'Arabic 🇸🇦' : 'English 🇺🇸'}</span></td>
+                        <td><span class="status-badge ${call.state === 'speaking' ? 'success' : call.state === 'listening' ? 'info' : 'warning'}">${call.state_display}</span></td>
+                        <td style="color: #ffffff; font-family: monospace;">${call.duration_formatted}</td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading active calls:', error);
+            }
+        }
+
         // Load recent calls
         async function loadRecentCalls() {
             try {
@@ -1353,6 +1426,7 @@
                 loadCPUUsage(),
                 loadMemoryUsage(),
                 loadDiskUsage(),
+                loadActiveCalls(),
                 loadRecentCalls(),
                 loadCallStatistics(),
                 loadFrequentCallers(),
@@ -1373,6 +1447,9 @@
 
             // Auto-refresh every 30 seconds
             setInterval(refreshAll, 30000);
+
+            // Refresh active calls more frequently (every 5 seconds) for live monitoring
+            setInterval(loadActiveCalls, 5000);
         });
 
         // Smooth scroll for nav links
