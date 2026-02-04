@@ -1,0 +1,1388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - AI Voice Platform</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --success-gradient: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+            --warning-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            --info-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            --dark-bg: #0f0f1a;
+            --card-bg: #1a1a2e;
+            --card-bg-light: #242442;
+            --text-primary: #eaeaea;
+            --text-secondary: #a0a0a0;
+            --border-color: rgba(255, 255, 255, 0.1);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--dark-bg);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            position: fixed;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 260px;
+            background: var(--card-bg);
+            border-right: 1px solid var(--border-color);
+            padding: 20px;
+            overflow-y: auto;
+            z-index: 1000;
+        }
+
+        .sidebar-logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 0 30px;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+        }
+
+        .sidebar-logo .icon {
+            width: 45px;
+            height: 45px;
+            background: var(--primary-gradient);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        .sidebar-logo h1 {
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .sidebar-logo span {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        .nav-section {
+            margin-bottom: 25px;
+        }
+
+        .nav-section-title {
+            font-size: 11px;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+            padding-left: 10px;
+        }
+
+        .nav-link {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 15px;
+            color: var(--text-secondary);
+            text-decoration: none;
+            border-radius: 10px;
+            margin-bottom: 5px;
+            transition: all 0.3s ease;
+        }
+
+        .nav-link:hover, .nav-link.active {
+            background: rgba(102, 126, 234, 0.15);
+            color: #667eea;
+        }
+
+        .nav-link i {
+            width: 20px;
+            text-align: center;
+        }
+
+        .user-info {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            right: 20px;
+            padding: 15px;
+            background: var(--card-bg-light);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .user-avatar {
+            width: 40px;
+            height: 40px;
+            background: var(--primary-gradient);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+        }
+
+        .user-details {
+            flex: 1;
+        }
+
+        .user-details .name {
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .user-details .role {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .btn-logout {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 5px;
+            transition: color 0.3s ease;
+        }
+
+        .btn-logout:hover {
+            color: #f5576c;
+        }
+
+        /* Main Content */
+        .main-content {
+            margin-left: 260px;
+            padding: 30px;
+        }
+
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+        }
+
+        .page-header h1 {
+            font-size: 28px;
+            font-weight: 600;
+        }
+
+        .page-header .last-updated {
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .card-header .icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+        }
+
+        .card-header .icon.primary { background: rgba(102, 126, 234, 0.2); color: #667eea; }
+        .card-header .icon.success { background: rgba(40, 167, 69, 0.2); color: #28a745; }
+        .card-header .icon.warning { background: rgba(255, 193, 7, 0.2); color: #ffc107; }
+        .card-header .icon.danger { background: rgba(220, 53, 69, 0.2); color: #dc3545; }
+        .card-header .icon.info { background: rgba(23, 162, 184, 0.2); color: #17a2b8; }
+
+        .card-header h3 {
+            font-size: 16px;
+            font-weight: 600;
+            margin: 0;
+        }
+
+        /* Status Badge */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .status-badge.operational {
+            background: rgba(40, 167, 69, 0.2);
+            color: #28a745;
+        }
+
+        .status-badge.warning {
+            background: rgba(255, 193, 7, 0.2);
+            color: #ffc107;
+        }
+
+        .status-badge.critical {
+            background: rgba(220, 53, 69, 0.2);
+            color: #dc3545;
+        }
+
+        /* Metrics Grid */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+
+        .metric-item {
+            background: var(--card-bg-light);
+            padding: 15px;
+            border-radius: 12px;
+        }
+
+        .metric-item .label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 5px;
+        }
+
+        .metric-item .value {
+            font-size: 24px;
+            font-weight: 600;
+        }
+
+        .metric-item .sub {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        /* Progress Bar */
+        .progress-bar-container {
+            background: rgba(255, 255, 255, 0.1);
+            height: 8px;
+            border-radius: 4px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s ease;
+        }
+
+        .progress-bar.success { background: var(--success-gradient); }
+        .progress-bar.warning { background: var(--warning-gradient); }
+        .progress-bar.danger { background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%); }
+        .progress-bar.info { background: var(--info-gradient); }
+
+        /* Table */
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .data-table th {
+            text-align: left;
+            padding: 12px 15px;
+            font-size: 12px;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .data-table td {
+            padding: 12px 15px;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 14px;
+        }
+
+        .data-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .data-table tr:hover td {
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        /* Language Badge */
+        .lang-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 4px 10px;
+            border-radius: 15px;
+            font-size: 12px;
+        }
+
+        .lang-badge.ar {
+            background: rgba(40, 167, 69, 0.2);
+            color: #28a745;
+        }
+
+        .lang-badge.en {
+            background: rgba(23, 162, 184, 0.2);
+            color: #17a2b8;
+        }
+
+        /* Caller List */
+        .caller-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .caller-item:last-child {
+            border-bottom: none;
+        }
+
+        .caller-info {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .caller-avatar {
+            width: 36px;
+            height: 36px;
+            background: var(--primary-gradient);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .caller-name {
+            font-weight: 500;
+        }
+
+        .caller-meta {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .caller-calls {
+            font-weight: 600;
+            color: #667eea;
+        }
+
+        /* Action Buttons */
+        .btn-action {
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            border: none;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .btn-action.edit {
+            background: rgba(102, 126, 234, 0.2);
+            color: #667eea;
+        }
+
+        .btn-action.delete {
+            background: rgba(220, 53, 69, 0.2);
+            color: #dc3545;
+        }
+
+        .btn-action:hover {
+            transform: translateY(-1px);
+        }
+
+        /* Refresh Button */
+        .btn-refresh {
+            background: var(--card-bg-light);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.3s ease;
+        }
+
+        .btn-refresh:hover {
+            border-color: #667eea;
+            color: #667eea;
+        }
+
+        .btn-refresh.loading i {
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Section Grid */
+        .section-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+        }
+
+        .section-grid.triple {
+            grid-template-columns: repeat(3, 1fr);
+        }
+
+        @media (max-width: 1400px) {
+            .section-grid.triple {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 1200px) {
+            .section-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Loading Skeleton */
+        .skeleton {
+            background: linear-gradient(90deg, var(--card-bg-light) 25%, var(--card-bg) 50%, var(--card-bg-light) 75%);
+            background-size: 200% 100%;
+            animation: shimmer 1.5s infinite;
+            border-radius: 4px;
+        }
+
+        @keyframes shimmer {
+            0% { background-position: -200% 0; }
+            100% { background-position: 200% 0; }
+        }
+
+        /* Cost Cards */
+        .cost-card {
+            background: var(--card-bg-light);
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 15px;
+        }
+
+        .cost-card .service-name {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        .cost-card .service-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .cost-card .amounts {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+
+        .cost-card .spent {
+            font-size: 20px;
+            font-weight: 600;
+        }
+
+        .cost-card .budget {
+            color: var(--text-secondary);
+        }
+
+        /* Scrollable Table */
+        .table-container {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .table-container::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .table-container::-webkit-scrollbar-track {
+            background: var(--card-bg-light);
+            border-radius: 3px;
+        }
+
+        .table-container::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 3px;
+        }
+
+        /* Mobile Responsive */
+        @media (max-width: 768px) {
+            .sidebar {
+                transform: translateX(-100%);
+                transition: transform 0.3s ease;
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .main-content {
+                margin-left: 0;
+                padding: 15px;
+            }
+
+            .mobile-menu-btn {
+                display: block;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Sidebar -->
+    <nav class="sidebar">
+        <div class="sidebar-logo">
+            <div class="icon"><i class="fas fa-phone-volume"></i></div>
+            <div>
+                <h1>AI Voice</h1>
+                <span>Admin Dashboard</span>
+            </div>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-section-title">Overview</div>
+            <a href="#system" class="nav-link active"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
+            <a href="#calls" class="nav-link"><i class="fas fa-phone"></i> Calls</a>
+            <a href="#bookings" class="nav-link"><i class="fas fa-calendar"></i> Bookings</a>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-section-title">Analytics</div>
+            <a href="#callers" class="nav-link"><i class="fas fa-users"></i> Callers</a>
+            <a href="#sms" class="nav-link"><i class="fas fa-sms"></i> SMS Logs</a>
+            <a href="#costs" class="nav-link"><i class="fas fa-dollar-sign"></i> API Costs</a>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-section-title">Management</div>
+            <a href="#caller-mgmt" class="nav-link"><i class="fas fa-user-cog"></i> Caller Management</a>
+        </div>
+
+        <div class="user-info">
+            <div class="user-avatar" id="userAvatar">A</div>
+            <div class="user-details">
+                <div class="name" id="userName">Admin</div>
+                <div class="role">Administrator</div>
+            </div>
+            <button class="btn-logout" onclick="logout()" title="Logout">
+                <i class="fas fa-sign-out-alt"></i>
+            </button>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <div class="page-header">
+            <div>
+                <h1>System Dashboard</h1>
+                <p class="last-updated">Last Updated: <span id="lastUpdated">--</span></p>
+            </div>
+            <button class="btn-refresh" onclick="refreshAll()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+
+        <!-- System Status Section -->
+        <section id="system" class="section-grid triple">
+            <!-- System Status -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="icon primary"><i class="fas fa-server"></i></div>
+                    <h3>System Status</h3>
+                </div>
+                <div class="metrics-grid">
+                    <div class="metric-item">
+                        <div class="label">Status</div>
+                        <div class="status-badge operational" id="systemStatus">
+                            <i class="fas fa-check-circle"></i> OPERATIONAL
+                        </div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="label">Uptime</div>
+                        <div class="value" id="uptime">--</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="label">Rate Limiting</div>
+                        <div class="value" style="font-size: 16px;" id="rateLimiting">--</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="label">Storage</div>
+                        <div class="value" style="font-size: 16px;" id="storageType">--</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- AI Models -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="icon info"><i class="fas fa-brain"></i></div>
+                    <h3>AI Models</h3>
+                </div>
+                <div class="metrics-grid">
+                    <div class="metric-item">
+                        <div class="label">Language Model</div>
+                        <div class="value" style="font-size: 16px;" id="llmModel">--</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="label">Voice Services</div>
+                        <div class="value" style="font-size: 14px;" id="voiceServices">--</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="label">Max Tokens</div>
+                        <div class="value" id="maxTokens">--</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Active Calls -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="icon success"><i class="fas fa-phone-alt"></i></div>
+                    <h3>Active Calls</h3>
+                </div>
+                <div class="metrics-grid">
+                    <div class="metric-item">
+                        <div class="label">Current Calls</div>
+                        <div class="value" id="activeCalls">0</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="label">Workers</div>
+                        <div class="value" style="font-size: 16px;" id="workers">--</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="label">Port</div>
+                        <div class="value" style="font-size: 16px;" id="port">--</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- CPU Usage -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="icon warning"><i class="fas fa-microchip"></i></div>
+                    <h3>CPU Usage</h3>
+                </div>
+                <div class="metric-item">
+                    <div class="label">Current Usage</div>
+                    <div class="value"><span id="cpuPercent">--</span>%</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar success" id="cpuBar" style="width: 0%"></div>
+                    </div>
+                    <div class="sub" style="margin-top: 10px;">Cores: <span id="cpuCores">--</span></div>
+                </div>
+            </div>
+
+            <!-- Memory Usage -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="icon info"><i class="fas fa-memory"></i></div>
+                    <h3>Memory Usage</h3>
+                </div>
+                <div class="metric-item">
+                    <div class="label">Used / Total</div>
+                    <div class="value" style="font-size: 18px;"><span id="memoryUsed">--</span> / <span id="memoryTotal">--</span> GB</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar info" id="memoryBar" style="width: 0%"></div>
+                    </div>
+                    <div class="sub" style="margin-top: 10px;">Available: <span id="memoryAvailable">--</span> GB</div>
+                </div>
+            </div>
+
+            <!-- Disk Usage -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="icon primary"><i class="fas fa-hdd"></i></div>
+                    <h3>Disk Storage</h3>
+                </div>
+                <div class="metric-item">
+                    <div class="label">Used / Total</div>
+                    <div class="value" style="font-size: 18px;"><span id="diskUsed">--</span> / <span id="diskTotal">--</span> GB</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar warning" id="diskBar" style="width: 0%"></div>
+                    </div>
+                    <div class="sub" style="margin-top: 10px;">Free: <span id="diskFree">--</span> GB</div>
+                </div>
+            </div>
+
+            <!-- Security -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="icon success"><i class="fas fa-shield-alt"></i></div>
+                    <h3>Security</h3>
+                </div>
+                <div class="metrics-grid" style="grid-template-columns: 1fr 1fr;">
+                    <div class="metric-item">
+                        <div class="label">Twilio Auth</div>
+                        <div class="status-badge operational"><i class="fas fa-check"></i> Enabled</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="label">Rate Limiting</div>
+                        <div class="status-badge operational"><i class="fas fa-check"></i> Enabled</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="label">MFA</div>
+                        <div class="status-badge operational"><i class="fas fa-check"></i> Enabled</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="label">SSRF Protection</div>
+                        <div class="status-badge operational"><i class="fas fa-check"></i> Enabled</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Caller Analytics Section -->
+        <section id="calls" style="margin-top: 30px;">
+            <h2 style="margin-bottom: 20px;"><i class="fas fa-users"></i> Caller Analytics & Personalization</h2>
+
+            <div class="section-grid">
+                <!-- Recent Calls -->
+                <div class="card">
+                    <div class="card-header">
+                        <div class="icon primary"><i class="fas fa-phone"></i></div>
+                        <h3>Recent Calls (Last 20)</h3>
+                    </div>
+                    <div class="table-container" id="recentCallsContainer">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Caller</th>
+                                    <th>Language</th>
+                                    <th>Date</th>
+                                    <th>Duration</th>
+                                </tr>
+                            </thead>
+                            <tbody id="recentCallsBody">
+                                <tr><td colspan="4" style="text-align: center;">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Call Statistics -->
+                <div class="card">
+                    <div class="card-header">
+                        <div class="icon info"><i class="fas fa-chart-bar"></i></div>
+                        <h3>Call Statistics</h3>
+                    </div>
+                    <div class="metrics-grid">
+                        <div class="metric-item">
+                            <div class="label">Total Calls</div>
+                            <div class="value" id="totalCalls">--</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="label">Unique Callers</div>
+                            <div class="value" id="uniqueCallers">--</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="label">Returning</div>
+                            <div class="value" id="returningCallers">--</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="label">Avg Duration</div>
+                            <div class="value" style="font-size: 18px;" id="avgDuration">--</div>
+                        </div>
+                    </div>
+
+                    <h4 style="margin-top: 20px; margin-bottom: 15px; font-size: 14px; color: var(--text-secondary);">
+                        <i class="fas fa-globe"></i> Language Distribution
+                    </h4>
+                    <div id="languageDistribution"></div>
+                </div>
+            </div>
+
+            <div class="section-grid" style="margin-top: 20px;">
+                <!-- Frequent Callers -->
+                <div class="card">
+                    <div class="card-header">
+                        <div class="icon warning"><i class="fas fa-star"></i></div>
+                        <h3>Frequent Callers (VIP)</h3>
+                    </div>
+                    <div id="frequentCallers">
+                        <p style="color: var(--text-secondary);">Loading...</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Bookings Section -->
+        <section id="bookings" style="margin-top: 30px;">
+            <h2 style="margin-bottom: 20px;"><i class="fas fa-calendar"></i> Appointment Bookings</h2>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="icon success"><i class="fas fa-calendar-check"></i></div>
+                    <h3>Recent Bookings</h3>
+                    <span style="margin-left: auto; color: var(--text-secondary);">
+                        Total: <strong id="totalBookings">--</strong> | Upcoming: <strong id="upcomingBookings">--</strong>
+                    </span>
+                </div>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Client</th>
+                                <th>Phone</th>
+                                <th>Accountant</th>
+                                <th>Time</th>
+                                <th>Type</th>
+                                <th>Lang</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="bookingsBody">
+                            <tr><td colspan="8" style="text-align: center;">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- SMS Section -->
+        <section id="sms" style="margin-top: 30px;">
+            <h2 style="margin-bottom: 20px;"><i class="fas fa-sms"></i> SMS Notifications</h2>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="icon info"><i class="fas fa-envelope"></i></div>
+                    <h3>Recent SMS Messages</h3>
+                    <span style="margin-left: auto; color: var(--text-secondary);">
+                        Total: <strong id="totalSms">--</strong> | Today: <strong id="todaySms">--</strong>
+                    </span>
+                </div>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Sent At</th>
+                                <th>To</th>
+                                <th>Client</th>
+                                <th>Message</th>
+                                <th>Provider</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="smsBody">
+                            <tr><td colspan="6" style="text-align: center;">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- API Costs Section -->
+        <section id="costs" style="margin-top: 30px;">
+            <h2 style="margin-bottom: 20px;"><i class="fas fa-dollar-sign"></i> API Budget & Usage</h2>
+
+            <div class="section-grid">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="icon warning"><i class="fas fa-receipt"></i></div>
+                        <h3>Service Costs</h3>
+                    </div>
+                    <div id="apiCosts">
+                        <p style="color: var(--text-secondary);">Loading...</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="icon success"><i class="fas fa-wallet"></i></div>
+                        <h3>Monthly Summary</h3>
+                    </div>
+                    <div class="metric-item" style="text-align: center; padding: 30px;">
+                        <div class="label">Total Monthly Cost</div>
+                        <div class="value" style="font-size: 36px; color: #28a745;">$<span id="totalMonthlyCost">--</span></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Caller Management Section -->
+        <section id="caller-mgmt" style="margin-top: 30px;">
+            <h2 style="margin-bottom: 20px;"><i class="fas fa-user-cog"></i> Caller Management</h2>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="icon primary"><i class="fas fa-users-cog"></i></div>
+                    <h3>Manage Callers</h3>
+                    <button class="btn-refresh" style="margin-left: auto;" onclick="loadCallers()">
+                        <i class="fas fa-sync-alt"></i> Refresh
+                    </button>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 15px; font-size: 14px;">
+                    Edit or delete caller names that were incorrectly captured by the AI.
+                </p>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Phone</th>
+                                <th>Language</th>
+                                <th>Calls</th>
+                                <th>Last Call</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="callersBody">
+                            <tr><td colspan="6" style="text-align: center;">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <footer style="text-align: center; padding: 30px; color: var(--text-secondary); font-size: 12px;">
+            AI Voice Platform - Flexible Accounting &copy; 2026
+        </footer>
+    </main>
+
+    <script>
+        // API Base URL
+        const API_BASE = '/dashboard/api';
+
+        // Load user info
+        async function loadUserInfo() {
+            try {
+                const response = await fetch(`${API_BASE}/me`);
+                if (response.status === 401) {
+                    window.location.href = '/dashboard/login';
+                    return;
+                }
+                const data = await response.json();
+                document.getElementById('userName').textContent = data.username;
+                document.getElementById('userAvatar').textContent = data.username.charAt(0).toUpperCase();
+            } catch (error) {
+                console.error('Error loading user info:', error);
+            }
+        }
+
+        // Logout
+        async function logout() {
+            try {
+                await fetch(`${API_BASE}/logout`, { method: 'POST' });
+                window.location.href = '/dashboard/login';
+            } catch (error) {
+                console.error('Error logging out:', error);
+            }
+        }
+
+        // Load system status
+        async function loadSystemStatus() {
+            try {
+                const response = await fetch(`${API_BASE}/system-status`);
+                const data = await response.json();
+
+                document.getElementById('uptime').textContent = data.uptime;
+                document.getElementById('rateLimiting').textContent = data.rate_limiting;
+                document.getElementById('storageType').textContent = data.storage_type;
+                document.getElementById('activeCalls').textContent = data.active_calls;
+                document.getElementById('workers').textContent = `${data.workers} (${data.workers <= 4 ? 'optimal' : 'high capacity'})`;
+                document.getElementById('port').textContent = `${data.port} (Internal)`;
+            } catch (error) {
+                console.error('Error loading system status:', error);
+            }
+        }
+
+        // Load AI models
+        async function loadAIModels() {
+            try {
+                const response = await fetch(`${API_BASE}/ai-models`);
+                const data = await response.json();
+
+                document.getElementById('llmModel').textContent = data.language_model;
+                document.getElementById('voiceServices').textContent = `${data.tts_service} TTS + ${data.stt_service} STT`;
+                document.getElementById('maxTokens').textContent = data.max_tokens;
+            } catch (error) {
+                console.error('Error loading AI models:', error);
+            }
+        }
+
+        // Load CPU usage
+        async function loadCPUUsage() {
+            try {
+                const response = await fetch(`${API_BASE}/cpu-usage`);
+                const data = await response.json();
+
+                document.getElementById('cpuPercent').textContent = data.current_percent;
+                document.getElementById('cpuCores').textContent = data.cores;
+                document.getElementById('cpuBar').style.width = `${data.current_percent}%`;
+
+                const bar = document.getElementById('cpuBar');
+                bar.className = 'progress-bar ' + (data.current_percent < 50 ? 'success' : data.current_percent < 80 ? 'warning' : 'danger');
+            } catch (error) {
+                console.error('Error loading CPU usage:', error);
+            }
+        }
+
+        // Load memory usage
+        async function loadMemoryUsage() {
+            try {
+                const response = await fetch(`${API_BASE}/memory-usage`);
+                const data = await response.json();
+
+                document.getElementById('memoryUsed').textContent = data.used_gb;
+                document.getElementById('memoryTotal').textContent = data.total_gb;
+                document.getElementById('memoryAvailable').textContent = data.available_gb;
+                document.getElementById('memoryBar').style.width = `${data.percent}%`;
+            } catch (error) {
+                console.error('Error loading memory usage:', error);
+            }
+        }
+
+        // Load disk usage
+        async function loadDiskUsage() {
+            try {
+                const response = await fetch(`${API_BASE}/disk-usage`);
+                const data = await response.json();
+
+                document.getElementById('diskUsed').textContent = data.used_gb;
+                document.getElementById('diskTotal').textContent = data.total_gb;
+                document.getElementById('diskFree').textContent = data.free_gb;
+                document.getElementById('diskBar').style.width = `${data.percent}%`;
+            } catch (error) {
+                console.error('Error loading disk usage:', error);
+            }
+        }
+
+        // Load recent calls
+        async function loadRecentCalls() {
+            try {
+                const response = await fetch(`${API_BASE}/recent-calls?limit=20`);
+                const data = await response.json();
+
+                const tbody = document.getElementById('recentCallsBody');
+                if (data.calls.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-secondary);">No calls yet</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = data.calls.map(call => `
+                    <tr>
+                        <td><strong>${call.name}</strong></td>
+                        <td><span class="lang-badge ${call.language}">${call.language === 'ar' ? 'Arabic' : 'English'} ${call.language === 'ar' ? '🇸🇦' : '🇺🇸'}</span></td>
+                        <td>${call.date}</td>
+                        <td>${call.duration ? call.duration + 's' : (call.call_count ? call.call_count + ' calls' : '--')}</td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading recent calls:', error);
+            }
+        }
+
+        // Load call statistics
+        async function loadCallStatistics() {
+            try {
+                const response = await fetch(`${API_BASE}/call-statistics`);
+                const data = await response.json();
+
+                document.getElementById('totalCalls').textContent = data.total_calls;
+                document.getElementById('uniqueCallers').textContent = data.unique_callers + ' 👤';
+                document.getElementById('returningCallers').textContent = data.returning_callers + ' 🔄';
+                document.getElementById('avgDuration').textContent = data.avg_duration_seconds + 's ⏱️';
+
+                // Language distribution
+                const langDiv = document.getElementById('languageDistribution');
+                langDiv.innerHTML = data.language_distribution.map(lang => `
+                    <div class="metric-item" style="margin-bottom: 10px;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                            <span>${lang.language} ${lang.code === 'ar' ? '🇸🇦' : '🇺🇸'}</span>
+                            <span>${lang.count} (${lang.percentage}%)</span>
+                        </div>
+                        <div class="progress-bar-container">
+                            <div class="progress-bar ${lang.code === 'ar' ? 'success' : 'info'}" style="width: ${lang.percentage}%"></div>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading call statistics:', error);
+            }
+        }
+
+        // Load frequent callers
+        async function loadFrequentCallers() {
+            try {
+                const response = await fetch(`${API_BASE}/frequent-callers?limit=5`);
+                const data = await response.json();
+
+                const div = document.getElementById('frequentCallers');
+                if (data.callers.length === 0) {
+                    div.innerHTML = '<p style="color: var(--text-secondary);">No frequent callers yet</p>';
+                    return;
+                }
+
+                div.innerHTML = data.callers.map((caller, i) => `
+                    <div class="caller-item">
+                        <div class="caller-info">
+                            <div class="caller-avatar">${i === 0 ? '⭐' : caller.name.charAt(0)}</div>
+                            <div>
+                                <div class="caller-name">${i < 2 ? '⭐ ' : ''}${caller.name}</div>
+                            </div>
+                        </div>
+                        <div class="caller-calls">${caller.calls} calls</div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading frequent callers:', error);
+            }
+        }
+
+        // Load bookings
+        async function loadBookings() {
+            try {
+                const response = await fetch(`${API_BASE}/bookings?limit=20`);
+                const data = await response.json();
+
+                document.getElementById('totalBookings').textContent = data.total;
+                document.getElementById('upcomingBookings').textContent = data.upcoming;
+
+                const tbody = document.getElementById('bookingsBody');
+                if (data.bookings.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-secondary);">No bookings yet</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = data.bookings.map(booking => `
+                    <tr>
+                        <td><strong>${booking.client}</strong></td>
+                        <td>${booking.phone}</td>
+                        <td>${booking.accountant}</td>
+                        <td>${booking.time ? new Date(booking.time).toLocaleString() : '--'}</td>
+                        <td>${booking.type || '--'}</td>
+                        <td><span class="lang-badge ${booking.language}">${booking.language === 'ar' ? '🇸🇦' : '🇺🇸'}</span></td>
+                        <td><span class="status-badge operational">${booking.status}</span></td>
+                        <td>
+                            <button class="btn-action delete" onclick="deleteBooking(${booking.id})">Delete</button>
+                        </td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading bookings:', error);
+            }
+        }
+
+        // Delete booking
+        async function deleteBooking(id) {
+            if (!confirm('Delete this booking?')) return;
+            try {
+                await fetch(`${API_BASE}/bookings/${id}`, { method: 'DELETE' });
+                loadBookings();
+            } catch (error) {
+                console.error('Error deleting booking:', error);
+            }
+        }
+
+        // Load SMS logs
+        async function loadSmsLogs() {
+            try {
+                const response = await fetch(`${API_BASE}/sms-logs?limit=20`);
+                const data = await response.json();
+
+                document.getElementById('totalSms').textContent = data.total;
+                document.getElementById('todaySms').textContent = data.today;
+
+                const tbody = document.getElementById('smsBody');
+                if (data.messages.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">No SMS messages yet</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = data.messages.map(sms => `
+                    <tr>
+                        <td>${sms.sent_at ? new Date(sms.sent_at).toLocaleString() : '--'}</td>
+                        <td>${sms.phone}</td>
+                        <td>${sms.name}</td>
+                        <td>${sms.message || '--'}</td>
+                        <td>${sms.provider}</td>
+                        <td><span class="status-badge operational">${sms.status}</span></td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading SMS logs:', error);
+            }
+        }
+
+        // Load API costs
+        async function loadApiCosts() {
+            try {
+                const response = await fetch(`${API_BASE}/api-usage`);
+                const data = await response.json();
+
+                document.getElementById('totalMonthlyCost').textContent = data.total_monthly_cost.toFixed(2);
+
+                const div = document.getElementById('apiCosts');
+                div.innerHTML = data.services.map(service => {
+                    const percent = service.budget ? (service.spent / service.budget * 100) : 0;
+                    const barClass = percent < 50 ? 'success' : percent < 80 ? 'warning' : 'danger';
+
+                    return `
+                        <div class="cost-card">
+                            <div class="service-name">
+                                <strong>${service.name}</strong>
+                                <span class="status-badge ${service.status === 'healthy' ? 'operational' : 'warning'}" style="margin-left: auto;">
+                                    ${service.status === 'healthy' ? '✅ Under Budget' : '⚠️ Warning'}
+                                </span>
+                            </div>
+                            <div class="amounts">
+                                <span class="spent">$${service.spent?.toFixed(2) || service.balance?.toFixed(2) || '0.00'}</span>
+                                <span class="budget">${service.budget ? '/ $' + service.budget.toFixed(2) : 'Balance'}</span>
+                            </div>
+                            ${service.budget ? `
+                                <div class="progress-bar-container">
+                                    <div class="progress-bar ${barClass}" style="width: ${percent}%"></div>
+                                </div>
+                            ` : ''}
+                            <div class="sub" style="margin-top: 8px; font-size: 12px; color: var(--text-secondary);">
+                                ${service.tokens ? service.tokens.toLocaleString() + ' tokens' : ''}
+                                ${service.characters ? service.characters.toLocaleString() + ' chars' : ''}
+                                ${service.minutes ? service.minutes + ' min' : ''}
+                                ${service.requests ? ', ' + service.requests + ' requests' : ''}
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (error) {
+                console.error('Error loading API costs:', error);
+            }
+        }
+
+        // Load callers for management
+        async function loadCallers() {
+            try {
+                const response = await fetch(`${API_BASE}/callers`);
+                const data = await response.json();
+
+                const tbody = document.getElementById('callersBody');
+                if (data.callers.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">No callers yet</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = data.callers.map(caller => `
+                    <tr>
+                        <td><strong>${caller.name || 'Unknown'}</strong></td>
+                        <td>${caller.phone}</td>
+                        <td><span class="lang-badge ${caller.language}">${caller.language === 'ar' ? '🇸🇦' : '🇺🇸'}</span></td>
+                        <td>${caller.calls}</td>
+                        <td>${caller.last_call || '--'}</td>
+                        <td>
+                            <button class="btn-action edit" onclick="editCaller('${caller.phone}', '${caller.name || ''}')">✏️ Edit</button>
+                            <button class="btn-action delete" onclick="deleteCaller('${caller.phone}')">🗑️</button>
+                        </td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading callers:', error);
+            }
+        }
+
+        // Edit caller
+        function editCaller(phone, currentName) {
+            const newName = prompt('Enter new name:', currentName);
+            if (newName === null) return;
+
+            fetch(`${API_BASE}/callers/${encodeURIComponent(phone)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: newName })
+            }).then(() => loadCallers());
+        }
+
+        // Delete caller
+        async function deleteCaller(phone) {
+            if (!confirm(`Delete caller ${phone}?`)) return;
+            try {
+                await fetch(`${API_BASE}/callers/${encodeURIComponent(phone)}`, { method: 'DELETE' });
+                loadCallers();
+            } catch (error) {
+                console.error('Error deleting caller:', error);
+            }
+        }
+
+        // Refresh all data
+        async function refreshAll() {
+            const btn = document.querySelector('.btn-refresh');
+            btn.classList.add('loading');
+
+            await Promise.all([
+                loadSystemStatus(),
+                loadAIModels(),
+                loadCPUUsage(),
+                loadMemoryUsage(),
+                loadDiskUsage(),
+                loadRecentCalls(),
+                loadCallStatistics(),
+                loadFrequentCallers(),
+                loadBookings(),
+                loadSmsLogs(),
+                loadApiCosts(),
+                loadCallers()
+            ]);
+
+            document.getElementById('lastUpdated').textContent = new Date().toLocaleString();
+            btn.classList.remove('loading');
+        }
+
+        // Initialize dashboard
+        document.addEventListener('DOMContentLoaded', () => {
+            loadUserInfo();
+            refreshAll();
+
+            // Auto-refresh every 30 seconds
+            setInterval(refreshAll, 30000);
+        });
+
+        // Smooth scroll for nav links
+        document.querySelectorAll('.nav-link').forEach(link => {
+            link.addEventListener('click', (e) => {
+                const href = link.getAttribute('href');
+                if (href.startsWith('#')) {
+                    e.preventDefault();
+                    document.querySelector(href)?.scrollIntoView({ behavior: 'smooth' });
+
+                    // Update active state
+                    document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+                    link.classList.add('active');
+                }
+            });
+        });
+    </script>
+</body>
+</html>

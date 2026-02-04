@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - AI Voice Platform</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --dark-bg: #1a1a2e;
+            --card-bg: #16213e;
+            --text-primary: #eaeaea;
+            --text-secondary: #a0a0a0;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--dark-bg);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-primary);
+        }
+
+        .login-container {
+            width: 100%;
+            max-width: 420px;
+            padding: 20px;
+        }
+
+        .login-card {
+            background: var(--card-bg);
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .login-header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .login-header .logo {
+            width: 80px;
+            height: 80px;
+            background: var(--primary-gradient);
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 36px;
+        }
+
+        .login-header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        .login-header p {
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        .input-group {
+            position: relative;
+        }
+
+        .input-group i {
+            position: absolute;
+            left: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-secondary);
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 14px 14px 14px 45px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-size: 15px;
+            transition: all 0.3s ease;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: #667eea;
+            background: rgba(255, 255, 255, 0.08);
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+        }
+
+        .form-control::placeholder {
+            color: var(--text-secondary);
+        }
+
+        .btn-login {
+            width: 100%;
+            padding: 14px;
+            background: var(--primary-gradient);
+            border: none;
+            border-radius: 10px;
+            color: white;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .btn-login:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-login:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-login .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            display: none;
+        }
+
+        .btn-login.loading .spinner {
+            display: block;
+        }
+
+        .btn-login.loading .btn-text {
+            display: none;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .alert {
+            padding: 12px 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            display: none;
+        }
+
+        .alert-danger {
+            background: rgba(220, 53, 69, 0.2);
+            border: 1px solid rgba(220, 53, 69, 0.3);
+            color: #ff6b6b;
+        }
+
+        .alert-success {
+            background: rgba(40, 167, 69, 0.2);
+            border: 1px solid rgba(40, 167, 69, 0.3);
+            color: #51cf66;
+        }
+
+        /* MFA Section */
+        .mfa-section {
+            display: none;
+        }
+
+        .mfa-section.active {
+            display: block;
+        }
+
+        .login-section.hidden {
+            display: none;
+        }
+
+        .mfa-code-input {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin: 20px 0;
+        }
+
+        .mfa-code-input input {
+            width: 50px;
+            height: 60px;
+            text-align: center;
+            font-size: 24px;
+            font-weight: 600;
+            background: rgba(255, 255, 255, 0.05);
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            color: var(--text-primary);
+            transition: all 0.3s ease;
+        }
+
+        .mfa-code-input input:focus {
+            outline: none;
+            border-color: #667eea;
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        .email-hint {
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin-bottom: 20px;
+        }
+
+        .email-hint strong {
+            color: #667eea;
+        }
+
+        .back-link {
+            text-align: center;
+            margin-top: 20px;
+        }
+
+        .back-link a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 14px;
+            transition: color 0.3s ease;
+        }
+
+        .back-link a:hover {
+            color: #667eea;
+        }
+
+        .footer-text {
+            text-align: center;
+            margin-top: 30px;
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-card">
+            <!-- Login Section -->
+            <div class="login-section" id="loginSection">
+                <div class="login-header">
+                    <div class="logo">
+                        <i class="fas fa-phone-volume"></i>
+                    </div>
+                    <h1>AI Voice Platform</h1>
+                    <p>Admin Dashboard Login</p>
+                </div>
+
+                <div class="alert alert-danger" id="loginError"></div>
+
+                <form id="loginForm">
+                    <div class="form-group">
+                        <label for="username">Username or Email</label>
+                        <div class="input-group">
+                            <i class="fas fa-user"></i>
+                            <input type="text" class="form-control" id="username" name="username"
+                                   placeholder="Enter your username" required autocomplete="username">
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <div class="input-group">
+                            <i class="fas fa-lock"></i>
+                            <input type="password" class="form-control" id="password" name="password"
+                                   placeholder="Enter your password" required autocomplete="current-password">
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn-login" id="loginBtn">
+                        <span class="spinner"></span>
+                        <span class="btn-text">Sign In</span>
+                    </button>
+                </form>
+            </div>
+
+            <!-- MFA Section -->
+            <div class="mfa-section" id="mfaSection">
+                <div class="login-header">
+                    <div class="logo">
+                        <i class="fas fa-shield-halved"></i>
+                    </div>
+                    <h1>Verify Your Identity</h1>
+                    <p>Two-Factor Authentication</p>
+                </div>
+
+                <div class="alert alert-danger" id="mfaError"></div>
+                <div class="alert alert-success" id="mfaSuccess"></div>
+
+                <p class="email-hint">
+                    We sent a verification code to<br>
+                    <strong id="emailHint">***@***.com</strong>
+                </p>
+
+                <form id="mfaForm">
+                    <div class="mfa-code-input">
+                        <input type="text" maxlength="1" class="code-digit" data-index="0" inputmode="numeric">
+                        <input type="text" maxlength="1" class="code-digit" data-index="1" inputmode="numeric">
+                        <input type="text" maxlength="1" class="code-digit" data-index="2" inputmode="numeric">
+                        <input type="text" maxlength="1" class="code-digit" data-index="3" inputmode="numeric">
+                        <input type="text" maxlength="1" class="code-digit" data-index="4" inputmode="numeric">
+                        <input type="text" maxlength="1" class="code-digit" data-index="5" inputmode="numeric">
+                    </div>
+
+                    <button type="submit" class="btn-login" id="mfaBtn">
+                        <span class="spinner"></span>
+                        <span class="btn-text">Verify Code</span>
+                    </button>
+                </form>
+
+                <div class="back-link">
+                    <a href="#" id="backToLogin"><i class="fas fa-arrow-left"></i> Back to login</a>
+                </div>
+            </div>
+
+            <div class="footer-text">
+                Flexible Accounting - AI Voice Platform
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // DOM Elements
+        const loginSection = document.getElementById('loginSection');
+        const mfaSection = document.getElementById('mfaSection');
+        const loginForm = document.getElementById('loginForm');
+        const mfaForm = document.getElementById('mfaForm');
+        const loginBtn = document.getElementById('loginBtn');
+        const mfaBtn = document.getElementById('mfaBtn');
+        const loginError = document.getElementById('loginError');
+        const mfaError = document.getElementById('mfaError');
+        const mfaSuccess = document.getElementById('mfaSuccess');
+        const emailHint = document.getElementById('emailHint');
+        const backToLogin = document.getElementById('backToLogin');
+        const codeDigits = document.querySelectorAll('.code-digit');
+
+        // Handle login form submission
+        loginForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+
+            loginBtn.classList.add('loading');
+            loginBtn.disabled = true;
+            loginError.style.display = 'none';
+
+            try {
+                const response = await fetch('/dashboard/api/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const data = await response.json();
+
+                if (data.success && data.mfa_required) {
+                    // Show MFA section
+                    emailHint.textContent = data.email_hint;
+                    loginSection.classList.add('hidden');
+                    mfaSection.classList.add('active');
+                    codeDigits[0].focus();
+                } else if (!data.success) {
+                    loginError.textContent = data.error || 'Login failed';
+                    loginError.style.display = 'block';
+                }
+            } catch (error) {
+                loginError.textContent = 'Network error. Please try again.';
+                loginError.style.display = 'block';
+            } finally {
+                loginBtn.classList.remove('loading');
+                loginBtn.disabled = false;
+            }
+        });
+
+        // Handle MFA code input
+        codeDigits.forEach((digit, index) => {
+            digit.addEventListener('input', (e) => {
+                const value = e.target.value;
+
+                // Only allow numbers
+                if (!/^\d*$/.test(value)) {
+                    e.target.value = '';
+                    return;
+                }
+
+                // Move to next input
+                if (value && index < codeDigits.length - 1) {
+                    codeDigits[index + 1].focus();
+                }
+
+                // Auto-submit when all digits entered
+                if (index === codeDigits.length - 1 && value) {
+                    const code = Array.from(codeDigits).map(d => d.value).join('');
+                    if (code.length === 6) {
+                        mfaForm.dispatchEvent(new Event('submit'));
+                    }
+                }
+            });
+
+            digit.addEventListener('keydown', (e) => {
+                // Handle backspace
+                if (e.key === 'Backspace' && !e.target.value && index > 0) {
+                    codeDigits[index - 1].focus();
+                }
+            });
+
+            // Handle paste
+            digit.addEventListener('paste', (e) => {
+                e.preventDefault();
+                const pastedData = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, 6);
+
+                pastedData.split('').forEach((char, i) => {
+                    if (codeDigits[i]) {
+                        codeDigits[i].value = char;
+                    }
+                });
+
+                const lastIndex = Math.min(pastedData.length, codeDigits.length) - 1;
+                if (lastIndex >= 0) {
+                    codeDigits[lastIndex].focus();
+                }
+
+                if (pastedData.length === 6) {
+                    mfaForm.dispatchEvent(new Event('submit'));
+                }
+            });
+        });
+
+        // Handle MFA form submission
+        mfaForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const code = Array.from(codeDigits).map(d => d.value).join('');
+
+            if (code.length !== 6) {
+                mfaError.textContent = 'Please enter the complete 6-digit code';
+                mfaError.style.display = 'block';
+                return;
+            }
+
+            mfaBtn.classList.add('loading');
+            mfaBtn.disabled = true;
+            mfaError.style.display = 'none';
+
+            try {
+                const response = await fetch('/dashboard/api/verify-mfa', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ code })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    mfaSuccess.textContent = 'Verification successful! Redirecting...';
+                    mfaSuccess.style.display = 'block';
+                    setTimeout(() => {
+                        window.location.href = data.redirect || '/dashboard';
+                    }, 1000);
+                } else {
+                    mfaError.textContent = data.error || 'Invalid code';
+                    mfaError.style.display = 'block';
+                    // Clear inputs
+                    codeDigits.forEach(d => d.value = '');
+                    codeDigits[0].focus();
+                }
+            } catch (error) {
+                mfaError.textContent = 'Network error. Please try again.';
+                mfaError.style.display = 'block';
+            } finally {
+                mfaBtn.classList.remove('loading');
+                mfaBtn.disabled = false;
+            }
+        });
+
+        // Back to login
+        backToLogin.addEventListener('click', (e) => {
+            e.preventDefault();
+            mfaSection.classList.remove('active');
+            loginSection.classList.remove('hidden');
+            codeDigits.forEach(d => d.value = '');
+            mfaError.style.display = 'none';
+            mfaSuccess.style.display = 'none';
+        });
+    </script>
+</body>
+</html>

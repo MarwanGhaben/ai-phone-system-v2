@@ -73,6 +73,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include dashboard routes
+from services.dashboard.dashboard_routes import router as dashboard_router
+app.include_router(dashboard_router)
+
 
 # =====================================================
 # HEALTH CHECK
