@@ -356,7 +356,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     f"and they prefer {'Arabic' if context.language == 'ar' else 'English'}. "
                     f"Generate a warm, brief greeting (1 sentence max). Introduce yourself as Sarah. "
                     f"Use their name. Speak in their preferred language. Ask how you can help today. "
-                    f"Example Arabic: 'مرحباً مروان! أنا سارة من فليكسبل أكاونتنغ، كيف أقدر أساعدك؟' "
+                    f"Example Arabic: 'مرحباً مروان! أنا سارة من فليكسبل أكاونتنغ، كيف بإمكاني مساعدتك؟' "
                     f"Example English: 'Hey Marwan! It's Sarah from Flexible Accounting. How can I help you today?'"
                 )
             elif context.caller_name:
@@ -393,7 +393,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         # Fallback — simple templates if LLM fails (always include Sarah's name)
         if context.caller_name:
             if context.language == "ar":
-                return f"مرحباً {context.caller_name}! أنا سارة من فليكسبل أكاونتنغ، كيف أقدر أساعدك؟"
+                return f"مرحباً {context.caller_name}! أنا سارة من فليكسبل أكاونتنغ، كيف بإمكاني مساعدتك؟"
             else:
                 return f"Hey {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?"
         else:
