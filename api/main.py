@@ -73,9 +73,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include dashboard routes
-from services.dashboard.dashboard_routes import router as dashboard_router
-app.include_router(dashboard_router)
+# Include dashboard routes (optional - won't break core functionality if dependencies missing)
+try:
+    from services.dashboard.dashboard_routes import router as dashboard_router
+    app.include_router(dashboard_router)
+    logger.info("Dashboard routes loaded successfully")
+except ImportError as e:
+    logger.warning(f"Dashboard not available (missing dependencies): {e}")
 
 
 # =====================================================
