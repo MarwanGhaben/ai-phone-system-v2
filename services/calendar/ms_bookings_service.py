@@ -144,6 +144,10 @@ class MSBookingsService(CalendarServiceBase):
                 response = await client.get(url, headers=headers, params=params)
             elif method == "POST":
                 response = await client.post(url, headers=headers, json=json_data)
+            elif method == "DELETE":
+                response = await client.delete(url, headers=headers)
+                if response.status_code == 204:
+                    return {"deleted": True}
             else:
                 raise ValueError(f"Unsupported method: {method}")
 
@@ -441,6 +445,115 @@ class MSBookingsService(CalendarServiceBase):
                 success=False,
                 error_message=str(e)
             )
+
+    async def get_customer_appointments(self, customer_phone: str) -> List[Dict[str, Any]]:
+        """
+        Get upcoming appointments for a customer by phone number.
+
+        Args:
+            customer_phone: Customer's phone number
+
+        Returns:
+            List of appointment dicts with id, staff_name, start_time, service_name
+        """
+        if not await self.is_available():
+            logger.warning("MS Bookings: Not configured")
+            return []
+
+        try:
+            # Get all appointments and filter by phone number
+            # MS Graph doesn't support direct filtering by customerPhone, so we get recent appointments
+            endpoint = f"/solutions/bookingBusinesses/{self.business_id}/appointments"
+
+            # Filter for future appointments
+            now = datetime.now()
+            params = {
+                "$filter": f"startDateTime/dateTime ge '{now.strftime('%Y-%m-%dT%H:%M:%S')}'",
+                "$orderby": "startDateTime/dateTime",
+                "$top": 50
+            }
+
+            result = await self._make_request("GET", endpoint, params=params)
+
+            if not result or 'value' not in result:
+                logger.info("MS Bookings: No appointments found")
+                return []
+
+            # Normalize phone for comparison
+            normalized_phone = ''.join(c for c in customer_phone if c.isdigit())[-10:]
+
+            appointments = []
+            for appt in result['value']:
+                appt_phone = appt.get('customerPhone', '')
+                normalized_appt_phone = ''.join(c for c in appt_phone if c.isdigit())[-10:]
+
+                if normalized_appt_phone == normalized_phone:
+                    # Parse start time
+                    start_dt_str = appt.get('startDateTime', {}).get('dateTime', '')
+                    start_dt = None
+                    formatted_time = "Unknown time"
+
+                    if start_dt_str:
+                        try:
+                            start_dt = datetime.fromisoformat(start_dt_str.replace('Z', '+00:00'))
+                            start_dt = start_dt.replace(tzinfo=None)
+                            formatted_time = start_dt.strftime('%A, %B %d at %I:%M %p')
+                        except:
+                            pass
+
+                    # Get staff name
+                    staff_ids = appt.get('staffMemberIds', [])
+                    staff_name = "Staff Member"
+                    if staff_ids and self._staff_cache:
+                        for s in self._staff_cache.values():
+                            if s.id in staff_ids:
+                                staff_name = s.name
+                                break
+
+                    appointments.append({
+                        'id': appt.get('id', ''),
+                        'staff_name': staff_name,
+                        'customer_name': appt.get('customerName', ''),
+                        'start_time': start_dt,
+                        'formatted_time': formatted_time,
+                        'service_name': appt.get('serviceName', 'Appointment')
+                    })
+
+            logger.info(f"MS Bookings: Found {len(appointments)} appointments for phone {customer_phone[-4:]}")
+            return appointments
+
+        except Exception as e:
+            logger.error(f"MS Bookings: Failed to get customer appointments: {e}")
+            return []
+
+    async def cancel_appointment(self, appointment_id: str) -> bool:
+        """
+        Cancel an appointment by ID.
+
+        Args:
+            appointment_id: The MS Bookings appointment ID
+
+        Returns:
+            True if cancelled successfully
+        """
+        if not await self.is_available():
+            logger.warning("MS Bookings: Not configured")
+            return False
+
+        try:
+            endpoint = f"/solutions/bookingBusinesses/{self.business_id}/appointments/{appointment_id}"
+            result = await self._make_request("DELETE", endpoint)
+
+            if result and result.get('deleted'):
+                logger.info(f"MS Bookings: Cancelled appointment {appointment_id}")
+                return True
+            else:
+                logger.error(f"MS Bookings: Failed to cancel appointment {appointment_id}")
+                return False
+
+        except Exception as e:
+            logger.error(f"MS Bookings: Failed to cancel appointment: {e}")
+            return False
 
     async def close(self):
         """Close HTTP client"""

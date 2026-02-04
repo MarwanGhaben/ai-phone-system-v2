@@ -73,6 +73,9 @@ class ConversationContext:
     # Pending booking (set by check_appointment, used by confirm_appointment)
     pending_booking: Optional[Dict[str, Any]] = None
 
+    # Found appointments (set by lookup_my_bookings, used by cancel_booking)
+    found_appointments: Optional[list] = None
+
     # =====================================================
     # CONVERSATION HISTORY (Phase 1.2 fix)
     # =====================================================
@@ -276,6 +279,16 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - CRITICAL: After BOOKING_UNAVAILABLE, when the caller picks a new time, you MUST call check_appointment AGAIN with the new date_time. NEVER call confirm_appointment directly after UNAVAILABLE — always re-check the new time first.
 - IMPORTANT: Do NOT tell the caller "I've booked it" unless you received BOOKING_SUCCESS from confirm_appointment.
 - If booking fails, apologize and offer to transfer to a human
+
+MODIFYING/CANCELLING EXISTING APPOINTMENTS:
+- If a caller says they have an existing appointment they want to change, cancel, or check on:
+  1. Call lookup_my_bookings to find their appointments (uses their phone number automatically)
+  2. If appointments found, tell them what you found: "I found your appointment with [accountant] on [date/time]."
+  3. Ask if they want to cancel it and book a new time
+  4. If they confirm cancellation, call cancel_booking with the appointment_id and confirm_cancel=true
+  5. After cancellation, offer to book a new appointment at a different time
+- If no appointments found, let them know and offer to book a new one
+- Example phrases that trigger this: "I need to change my appointment", "أبي أغير موعدي", "I want to reschedule", "cancel my booking"
 
 WHEN TO TRANSFER:
 - Caller EXPLICITLY asks to speak with a specific person by name (e.g. "أبي أكلم حسام" / "I want to speak to Hussam")
@@ -1070,6 +1083,33 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                     },
                     "required": ["reason"]
                 }
+            },
+            {
+                "name": "lookup_my_bookings",
+                "description": "Look up the caller's existing upcoming appointments. Call this when the caller says they have an existing booking they want to change, cancel, or check on. Uses the caller's phone number to find their appointments.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "cancel_booking",
+                "description": "Cancel an existing appointment. Call this ONLY after lookup_my_bookings found the caller's appointment AND the caller explicitly confirmed they want to cancel it. After cancellation, offer to book a new appointment.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "appointment_id": {
+                            "type": "string",
+                            "description": "The appointment ID returned from lookup_my_bookings"
+                        },
+                        "confirm_cancel": {
+                            "type": "boolean",
+                            "description": "Must be true to confirm cancellation"
+                        }
+                    },
+                    "required": ["appointment_id", "confirm_cancel"]
+                }
             }
         ]
 
@@ -1460,6 +1500,106 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         except Exception as e:
             logger.error(f"Orchestrator: Reminder scheduling error: {e}")
 
+    async def _lookup_my_bookings(self, call_sid: str, arguments: dict) -> str:
+        """
+        Look up existing appointments for the caller by their phone number.
+
+        Args:
+            call_sid: Call identifier
+            arguments: Function call arguments (not used, phone comes from context)
+
+        Returns:
+            Result message with appointment details or "no appointments found"
+        """
+        from services.calendar.ms_bookings_service import get_calendar_service
+
+        context = self._conversations.get(call_sid)
+        if not context or not context.phone_number:
+            return "LOOKUP_ERROR: Cannot identify caller's phone number. Ask for their phone number or offer to transfer to a human."
+
+        phone = context.phone_number
+        calendar = get_calendar_service()
+
+        try:
+            appointments = await calendar.get_customer_appointments(phone)
+
+            if not appointments:
+                logger.info(f"Orchestrator: No appointments found for {phone[-4:]}")
+                return "NO_APPOINTMENTS_FOUND: The caller has no upcoming appointments. Ask if they would like to book a new appointment."
+
+            # Store appointments in context for later cancellation
+            context.found_appointments = appointments
+
+            # Format for LLM
+            appt_list = []
+            for i, appt in enumerate(appointments, 1):
+                appt_list.append(
+                    f"Appointment {i}: ID={appt['id']}, with {appt['staff_name']} on {appt['formatted_time']}"
+                )
+
+            appointments_text = "\n".join(appt_list)
+            logger.info(f"Orchestrator: Found {len(appointments)} appointments for {phone[-4:]}")
+
+            return f"APPOINTMENTS_FOUND: Found {len(appointments)} upcoming appointment(s):\n{appointments_text}\n\nTell the caller about their appointment(s) and ask if they want to cancel and reschedule. If they confirm cancellation, call cancel_booking with the appointment ID."
+
+        except Exception as e:
+            logger.error(f"Orchestrator: Error looking up appointments: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return f"LOOKUP_ERROR: Could not look up appointments: {str(e)}. Offer to transfer to a human."
+
+    async def _cancel_booking(self, call_sid: str, arguments: dict) -> str:
+        """
+        Cancel an existing appointment.
+
+        Args:
+            call_sid: Call identifier
+            arguments: Must include appointment_id and confirm_cancel=True
+
+        Returns:
+            Result message
+        """
+        from services.calendar.ms_bookings_service import get_calendar_service
+        from services.database import get_db_pool
+
+        context = self._conversations.get(call_sid)
+        appointment_id = arguments.get("appointment_id", "")
+        confirm_cancel = arguments.get("confirm_cancel", False)
+
+        if not confirm_cancel:
+            return "CANCEL_ABORTED: Cancellation not confirmed. Ask if they still want to cancel or if they'd like to keep the appointment."
+
+        if not appointment_id:
+            return "CANCEL_ERROR: No appointment ID provided. Call lookup_my_bookings first to get the appointment ID."
+
+        calendar = get_calendar_service()
+
+        try:
+            success = await calendar.cancel_appointment(appointment_id)
+
+            if success:
+                logger.info(f"Orchestrator: Cancelled appointment {appointment_id}")
+
+                # Update local database if we have the booking
+                try:
+                    pool = await get_db_pool()
+                    await pool.execute(
+                        "UPDATE bookings SET status = 'cancelled' WHERE ms_booking_id = $1",
+                        appointment_id
+                    )
+                except Exception as db_err:
+                    logger.warning(f"Orchestrator: Failed to update local booking status: {db_err}")
+
+                return "BOOKING_CANCELLED: The appointment has been cancelled successfully. Ask if they would like to book a new appointment at a different time."
+            else:
+                return "CANCEL_ERROR: Failed to cancel the appointment. Offer to transfer to a human for assistance."
+
+        except Exception as e:
+            logger.error(f"Orchestrator: Error cancelling appointment: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return f"CANCEL_ERROR: System error while cancelling: {str(e)}. Offer to transfer to a human."
+
     async def _get_ai_response(self, call_sid: str, user_input: str) -> str:
         """
         Get AI response for user input, with function calling support for bookings.
@@ -1607,12 +1747,16 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                         return "__TRANSFER_HANDLED__"  # Reuse marker to skip outer speaking
 
                     # --- Booking tools ---
-                    if tool_name in ("check_appointment", "confirm_appointment"):
+                    if tool_name in ("check_appointment", "confirm_appointment", "lookup_my_bookings", "cancel_booking"):
                         # Execute the appropriate booking step
                         if tool_name == "check_appointment":
                             booking_result = await self._check_booking(call_sid, arguments)
-                        else:
+                        elif tool_name == "confirm_appointment":
                             booking_result = await self._confirm_booking(call_sid, arguments)
+                        elif tool_name == "lookup_my_bookings":
+                            booking_result = await self._lookup_my_bookings(call_sid, arguments)
+                        elif tool_name == "cancel_booking":
+                            booking_result = await self._cancel_booking(call_sid, arguments)
 
                         # Feed result back to LLM for a natural response
                         messages.append(Message(role=LLMRole.ASSISTANT, content=llm_response.content or ""))
