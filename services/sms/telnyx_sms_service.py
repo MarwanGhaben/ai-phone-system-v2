@@ -181,6 +181,35 @@ class TelnyxSMSService:
         logger.info(f"Telnyx SMS: Sending reminder to {to_number}")
         return await self.send_sms(to_number, message)
 
+    async def send_cancellation_confirmation(
+        self,
+        to_number: str,
+        customer_name: str,
+        staff_name: str,
+        appointment_time: str,
+        language: str = "en",
+    ) -> bool:
+        """
+        Send appointment cancellation confirmation SMS.
+        """
+        if language == "ar":
+            message = (
+                f"مرحباً {customer_name}،\n"
+                f"تم إلغاء موعدك مع {staff_name} في {appointment_time}.\n"
+                f"شركة فليكسبل أكاونتنغ\n"
+                f"لحجز موعد جديد، يرجى الاتصال بنا."
+            )
+        else:
+            message = (
+                f"Hi {customer_name},\n"
+                f"Your appointment with {staff_name} on {appointment_time} has been cancelled.\n"
+                f"Flexible Accounting\n"
+                f"To book a new appointment, please call us."
+            )
+
+        logger.info(f"Telnyx SMS: Sending cancellation confirmation to {to_number}")
+        return await self.send_sms(to_number, message)
+
 
 # Global instance
 _sms_service: Optional[TelnyxSMSService] = None

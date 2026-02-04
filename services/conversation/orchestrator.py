@@ -1597,6 +1597,33 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
                 except Exception as db_err:
                     logger.warning(f"Orchestrator: Failed to update local booking status: {db_err}")
 
+                # Send cancellation confirmation SMS
+                if context and context.phone_number and context.found_appointments:
+                    try:
+                        from services.sms.telnyx_sms_service import get_sms_service
+                        sms = get_sms_service()
+                        if sms.is_available():
+                            appt = context.found_appointments[0]
+                            customer_name = context.caller_name or appt.get('customer_name', 'there')
+                            staff_name = appt.get('staff_name', 'your accountant')
+                            appt_time = appt.get('formatted_time', 'your scheduled time')
+                            caller_lang = context.language or 'en'
+
+                            import asyncio
+                            asyncio.create_task(sms.send_cancellation_confirmation(
+                                to_number=context.phone_number,
+                                customer_name=customer_name,
+                                staff_name=staff_name,
+                                appointment_time=appt_time,
+                                language=caller_lang,
+                            ))
+                            logger.info(f"Orchestrator: Cancellation SMS queued for {context.phone_number}")
+                    except Exception as sms_err:
+                        logger.warning(f"Orchestrator: Failed to send cancellation SMS: {sms_err}")
+
+                # Clear found appointments from context
+                context.found_appointments = None
+
                 return "BOOKING_CANCELLED: The appointment has been cancelled successfully. Ask if they would like to book a new appointment at a different time."
             else:
                 return "CANCEL_ERROR: Failed to cancel the appointment. Offer to transfer to a human for assistance."
