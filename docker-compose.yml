@@ -91,6 +91,12 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # Public domain for external access (Twilio webhooks, WebSocket URLs)
       PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-}
+
+      # Microsoft Graph Email (Dashboard MFA)
+      MSGRAPH_TENANT_ID: ${MSGRAPH_TENANT_ID:-}
+      MSGRAPH_CLIENT_ID: ${MSGRAPH_CLIENT_ID:-}
+      MSGRAPH_CLIENT_SECRET: ${MSGRAPH_CLIENT_SECRET:-}
+      MSGRAPH_SENDER_EMAIL: ${MSGRAPH_SENDER_EMAIL:-}
     ports:
       - "8000:8000"
       - "8001:8001"  # WebSocket port
