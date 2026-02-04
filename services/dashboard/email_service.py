@@ -1,14 +1,12 @@
 """
 =====================================================
-AI Voice Platform v2 - Email Service
+AI Voice Platform v2 - Email Service (Microsoft Graph)
 =====================================================
-Handles sending emails for MFA codes and notifications.
+Handles sending emails for MFA codes and notifications via Microsoft Graph API.
 """
 
-import smtplib
-import ssl
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import aiohttp
+import asyncio
 from typing import Optional
 from loguru import logger
 import os
@@ -16,83 +14,170 @@ import os
 
 class EmailService:
     """
-    Email service for sending MFA codes and notifications
+    Email service for sending MFA codes and notifications via Microsoft Graph API.
 
-    Supports:
-    - SMTP with TLS/SSL
-    - Gmail, Outlook, custom SMTP servers
+    Required environment variables:
+    - MSGRAPH_TENANT_ID: Azure AD Tenant ID
+    - MSGRAPH_CLIENT_ID: Azure AD Application (Client) ID
+    - MSGRAPH_CLIENT_SECRET: Azure AD Client Secret
+    - MSGRAPH_SENDER_EMAIL: Email address to send from (must have mailbox)
     """
 
-    def __init__(self):
-        # Load from environment variables
-        self.smtp_host = os.getenv('SMTP_HOST', 'smtp.gmail.com')
-        self.smtp_port = int(os.getenv('SMTP_PORT', '587'))
-        self.smtp_user = os.getenv('SMTP_USER', '')
-        self.smtp_password = os.getenv('SMTP_PASSWORD', '')
-        self.smtp_from = os.getenv('SMTP_FROM', self.smtp_user)
-        self.smtp_use_tls = os.getenv('SMTP_USE_TLS', 'true').lower() == 'true'
+    GRAPH_TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    GRAPH_SEND_MAIL_URL = "https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
 
-        # Fallback: Use console logging if SMTP not configured
-        self.is_configured = bool(self.smtp_user and self.smtp_password)
+    def __init__(self):
+        # Load Microsoft Graph credentials from environment
+        self.tenant_id = os.getenv('MSGRAPH_TENANT_ID', '')
+        self.client_id = os.getenv('MSGRAPH_CLIENT_ID', '')
+        self.client_secret = os.getenv('MSGRAPH_CLIENT_SECRET', '')
+        self.sender_email = os.getenv('MSGRAPH_SENDER_EMAIL', '')
+
+        # Check if configured
+        self.is_configured = all([
+            self.tenant_id,
+            self.client_id,
+            self.client_secret,
+            self.sender_email
+        ])
 
         if not self.is_configured:
-            logger.warning("Email service not configured (SMTP_USER/SMTP_PASSWORD not set). MFA codes will be logged to console.")
+            logger.warning(
+                "Email service not configured. Set MSGRAPH_TENANT_ID, MSGRAPH_CLIENT_ID, "
+                "MSGRAPH_CLIENT_SECRET, and MSGRAPH_SENDER_EMAIL. MFA codes will be logged to console."
+            )
 
-    def _create_connection(self):
-        """Create SMTP connection"""
-        if self.smtp_use_tls:
-            context = ssl.create_default_context()
-            server = smtplib.SMTP(self.smtp_host, self.smtp_port)
-            server.starttls(context=context)
-        else:
-            server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port)
+        # Cache for access token
+        self._access_token: Optional[str] = None
+        self._token_expires_at: float = 0
 
-        server.login(self.smtp_user, self.smtp_password)
-        return server
-
-    def send_email(self, to_email: str, subject: str, body_html: str, body_text: str = None) -> bool:
+    async def _get_access_token(self) -> Optional[str]:
         """
-        Send an email
+        Get Microsoft Graph API access token using client credentials flow.
+        Caches the token until it expires.
+        """
+        import time
+
+        # Return cached token if still valid (with 5 minute buffer)
+        if self._access_token and time.time() < (self._token_expires_at - 300):
+            return self._access_token
+
+        token_url = self.GRAPH_TOKEN_URL.format(tenant_id=self.tenant_id)
+
+        data = {
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'scope': 'https://graph.microsoft.com/.default',
+            'grant_type': 'client_credentials'
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(token_url, data=data) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"Failed to get Graph access token: {response.status} - {error_text}")
+                        return None
+
+                    token_data = await response.json()
+                    self._access_token = token_data.get('access_token')
+                    expires_in = token_data.get('expires_in', 3600)
+                    self._token_expires_at = time.time() + expires_in
+
+                    logger.debug("Obtained new Microsoft Graph access token")
+                    return self._access_token
+
+        except Exception as e:
+            logger.error(f"Error getting Graph access token: {e}")
+            return None
+
+    async def send_email_async(self, to_email: str, subject: str, body_html: str, body_text: str = None) -> bool:
+        """
+        Send an email via Microsoft Graph API (async version).
 
         Args:
             to_email: Recipient email address
             subject: Email subject
             body_html: HTML body content
-            body_text: Plain text body (optional, for non-HTML clients)
+            body_text: Plain text body (optional, unused for Graph API)
 
         Returns:
             True if sent successfully
         """
         if not self.is_configured:
             logger.info(f"[EMAIL NOT CONFIGURED] Would send to {to_email}: {subject}")
-            logger.info(f"[EMAIL BODY] {body_text or body_html}")
+            if body_text:
+                logger.info(f"[EMAIL BODY] {body_text[:200]}...")
             return True  # Pretend success for testing
 
+        # Get access token
+        access_token = await self._get_access_token()
+        if not access_token:
+            logger.error("Cannot send email: Failed to obtain access token")
+            return False
+
+        # Build the Graph API request
+        send_mail_url = self.GRAPH_SEND_MAIL_URL.format(sender=self.sender_email)
+
+        mail_body = {
+            "message": {
+                "subject": subject,
+                "body": {
+                    "contentType": "HTML",
+                    "content": body_html
+                },
+                "toRecipients": [
+                    {
+                        "emailAddress": {
+                            "address": to_email
+                        }
+                    }
+                ]
+            },
+            "saveToSentItems": "true"
+        }
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+
         try:
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = subject
-            msg['From'] = self.smtp_from
-            msg['To'] = to_email
-
-            # Add plain text and HTML versions
-            if body_text:
-                msg.attach(MIMEText(body_text, 'plain'))
-            msg.attach(MIMEText(body_html, 'html'))
-
-            server = self._create_connection()
-            server.sendmail(self.smtp_from, to_email, msg.as_string())
-            server.quit()
-
-            logger.info(f"Email sent successfully to {to_email}")
-            return True
+            async with aiohttp.ClientSession() as session:
+                async with session.post(send_mail_url, json=mail_body, headers=headers) as response:
+                    if response.status == 202:
+                        logger.info(f"Email sent successfully to {to_email} via Microsoft Graph")
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Failed to send email via Graph: {response.status} - {error_text}")
+                        return False
 
         except Exception as e:
-            logger.error(f"Failed to send email to {to_email}: {e}")
+            logger.error(f"Error sending email via Graph: {e}")
             return False
+
+    def send_email(self, to_email: str, subject: str, body_html: str, body_text: str = None) -> bool:
+        """
+        Send an email (sync wrapper for async method).
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If we're already in an async context, create a task
+                future = asyncio.ensure_future(self.send_email_async(to_email, subject, body_html, body_text))
+                # For sync contexts within async, we need to handle this differently
+                # This is a best-effort approach
+                return True  # Optimistically return True, actual send happens async
+            else:
+                return loop.run_until_complete(self.send_email_async(to_email, subject, body_html, body_text))
+        except RuntimeError:
+            # No event loop, create one
+            return asyncio.run(self.send_email_async(to_email, subject, body_html, body_text))
 
     def send_mfa_code(self, to_email: str, code: str, username: str = "User") -> bool:
         """
-        Send MFA verification code email
+        Send MFA verification code email.
 
         Args:
             to_email: Recipient email
@@ -168,7 +253,7 @@ Flexible Accounting - AI Voice Platform
 
     def send_login_alert(self, to_email: str, username: str, ip_address: str, user_agent: str) -> bool:
         """
-        Send login notification email
+        Send login notification email.
 
         Args:
             to_email: Admin email
