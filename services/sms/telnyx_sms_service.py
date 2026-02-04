@@ -75,14 +75,46 @@ class TelnyxSMSService:
                 data = response.json().get("data", {})
                 msg_id = data.get("id", "unknown")
                 logger.info(f"Telnyx SMS: Sent to {to_number} (id={msg_id})")
+                # Log to database for dashboard
+                await self._log_sms_to_db(to_number, message, "sent", None)
                 return True
             else:
                 logger.error(f"Telnyx SMS: Failed {response.status_code} - {response.text}")
+                await self._log_sms_to_db(to_number, message, "failed", response.text)
                 return False
 
         except Exception as e:
             logger.error(f"Telnyx SMS: Exception sending to {to_number}: {e}")
+            await self._log_sms_to_db(to_number, message, "failed", str(e))
             return False
+
+    async def _log_sms_to_db(
+        self,
+        phone_number: str,
+        message: str,
+        status: str,
+        error_message: Optional[str] = None,
+        client_name: str = ""
+    ) -> None:
+        """Log SMS to database for dashboard tracking."""
+        try:
+            from services.database import get_db_pool
+            pool = await get_db_pool()
+            await pool.execute(
+                """
+                INSERT INTO sms_logs (phone_number, client_name, message, provider, status, error_message)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                phone_number,
+                client_name,
+                message[:500] if message else "",  # Truncate long messages
+                "Telnyx",
+                status,
+                error_message
+            )
+            logger.debug(f"Telnyx SMS: Logged to database ({status})")
+        except Exception as db_err:
+            logger.warning(f"Telnyx SMS: Failed to log to database: {db_err}")
 
     async def send_booking_confirmation(
         self,

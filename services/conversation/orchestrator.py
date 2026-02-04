@@ -1349,6 +1349,34 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             if result.success:
                 logger.info(f"Orchestrator: BOOKING CREATED - id={result.appointment_id}, time={result.start_time}, staff={result.staff_name}")
 
+                # Save booking to local database for dashboard
+                try:
+                    from services.database import get_db_pool
+                    pool = await get_db_pool()
+                    await pool.execute(
+                        """
+                        INSERT INTO bookings (
+                            call_sid, phone_number, client_name, client_email,
+                            accountant_name, appointment_time, client_type,
+                            language, status, ms_booking_id
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        call_sid,
+                        context.phone_number or "",
+                        customer_name,
+                        "",  # email
+                        result.staff_name or pending.get("staff_name", ""),
+                        pending["appointment_time"],
+                        pending.get("client_type", "unknown"),
+                        context.language or "en",
+                        "confirmed",
+                        result.appointment_id or ""
+                    )
+                    logger.info(f"Orchestrator: Booking saved to dashboard database")
+                except Exception as db_err:
+                    logger.warning(f"Orchestrator: Failed to save booking to dashboard DB: {db_err}")
+
                 # Send SMS confirmation + schedule 24hr reminder
                 display_staff = result.staff_name or pending["staff_name"] or "your accountant"
                 display_time = pending["appointment_time"].strftime('%A, %B %d at %I:%M %p')
