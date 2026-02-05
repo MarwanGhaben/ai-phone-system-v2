@@ -205,21 +205,12 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Referrer policy
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
 
-        # Skip restrictive headers for dashboard (it needs inline scripts, fonts, etc.)
+        # Skip ALL restrictive headers for dashboard (it needs inline scripts, fonts, etc.)
         if request.url.path.startswith("/dashboard"):
-            # Allow dashboard to be framed (for embedding)
-            response.headers["X-Frame-Options"] = "SAMEORIGIN"
-            # Permissive CSP for dashboard
-            response.headers["Content-Security-Policy"] = (
-                "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://unpkg.com; "
-                "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; "
-                "font-src 'self' https://fonts.gstatic.com data:; "
-                "img-src 'self' data: blob: https:; "
-                "connect-src 'self' wss: ws: https:;"
-            )
+            # No CSP or X-Frame-Options for dashboard - let it load freely
+            pass
         else:
-            # Strict headers for API endpoints
+            # Strict headers for API endpoints only
             response.headers["X-Frame-Options"] = "DENY"
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
