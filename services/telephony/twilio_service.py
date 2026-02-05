@@ -552,15 +552,23 @@ class TwilioService:
         Returns:
             TwiML as string
         """
+        from xml.sax.saxutils import escape as xml_escape
+
         # Pass caller number as a custom parameter so the WebSocket handler can access it
+        # SECURITY: Escape all values to prevent XML injection attacks
         param_tag = ""
         if caller_number:
-            param_tag = f'\n            <Parameter name="callerNumber" value="{caller_number}" />'
+            # Escape special XML characters: &, <, >, ", '
+            safe_caller = xml_escape(caller_number, {'"': '&quot;', "'": '&apos;'})
+            param_tag = f'\n            <Parameter name="callerNumber" value="{safe_caller}" />'
+
+        # Also escape the websocket URL in case it contains special characters
+        safe_ws_url = xml_escape(websocket_url, {'"': '&quot;', "'": '&apos;'})
 
         twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="{websocket_url}">{param_tag}
+        <Stream url="{safe_ws_url}">{param_tag}
         </Stream>
     </Connect>
 </Response>'''
