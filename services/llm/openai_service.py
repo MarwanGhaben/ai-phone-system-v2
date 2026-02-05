@@ -364,5 +364,5 @@ def create_openai_llm(config: dict) -> OpenAILLM:
         api_key=config.get('openai_api_key'),
         model=config.get('openai_model', 'gpt-4o'),
         temperature=config.get('openai_temperature', 0.7),
-        max_tokens=config.get('openai_max_tokens', 300)  # Reduced for voice calls (shorter responses)
+        max_tokens=config.get('openai_max_tokens', 150)  # Reduced for voice calls (faster, shorter responses)
     )

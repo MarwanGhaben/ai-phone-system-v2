@@ -251,12 +251,13 @@ SERVICES OFFERED:
 - Corporate tax planning
 
 CRITICAL - RESPONSE STYLE:
-- Keep responses BRIEF but NATURAL — like a real receptionist, not a robot
-- This is a VOICE call — be efficient but friendly
-- For simple Q&A: Keep it short (1-2 sentences max)
-- If asked about services: "We handle taxes, bookkeeping, and payroll. Would you like to book an appointment?"
-- Ask ONE question at a time
-- In Arabic, be concise — Arabic speech takes longer to say aloud
+- ALWAYS speak in COMPLETE SENTENCES that the caller can clearly understand
+- This is a VOICE call — be clear, natural, and conversational like a real receptionist
+- Keep responses efficient (2-3 sentences) but NEVER cut off mid-thought or give incomplete answers
+- For simple Q&A: Give a complete answer with context
+- If asked about services: "We provide tax services, bookkeeping, and payroll processing. Would you like me to help you book an appointment with one of our accountants?"
+- Ask ONE question at a time and wait for the answer
+- In Arabic, speak clearly and completely — the caller needs to understand you fully
 
 AFTER COMPLETING A TASK (booking confirmed, appointment cancelled, question answered):
 - Be warm and professional: "Is there anything else I can help you with?" / "هل هناك شيء آخر أقدر أساعدك فيه؟"
@@ -274,6 +275,7 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - CLOSED DAYS: ONLY Saturday (السبت) and Sunday (الأحد) are closed. These are the ONLY days the office is closed.
 - CRITICAL: Friday (الجمعة/يوم الجمعة) is a WORKDAY - the office IS OPEN on Friday. Do NOT confuse this with Middle Eastern weekend schedules.
 - If a caller requests Saturday or Sunday, politely let them know those are the only closed days and suggest Friday or Monday instead.
+- BOOKING WINDOW: We can only book appointments up to 2 business days in advance (excluding weekends). If a caller asks for a date further out, politely explain: "We can only schedule appointments up to 2 business days ahead. Would you like to book for [nearest available date]?" In Arabic: "نقدر نحجز مواعيد لمدة يومين عمل فقط. هل تحب نحجز لـ [التاريخ المتاح]؟"
 - Ask: Individual or corporate client?
 - Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
@@ -359,7 +361,7 @@ HANDLING UNCLEAR/GARBLED SPEECH:
 - NEVER guess what the caller meant from garbled text
 - If the text contains characters from unexpected scripts (Bengali, Hindi, etc.) while the conversation is in Arabic or English, treat it as garbled audio and ask to repeat
 
-Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
+Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and helpful. Be human and natural."""
 
     async def _generate_greeting(self, context: ConversationContext) -> str:
         """
@@ -1257,10 +1259,29 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             logger.info(f"Orchestrator: Final appointment time: {appointment_time} (from input: '{date_time_str}')")
 
             # =====================================================
-            # CHECK AVAILABILITY
+            # VALIDATE: Maximum 2 business days ahead
             # =====================================================
             staff_display = matched_staff_name or accountant_name or "the accountant"
             full_fmt = '%A, %B %d at %I:%M %p'
+
+            # Calculate max booking date (2 business days from today)
+            today = datetime.now().date()
+            max_date = today
+            business_days_added = 0
+            while business_days_added < 2:
+                max_date += timedelta(days=1)
+                # Skip weekends (Saturday=5, Sunday=6)
+                if max_date.weekday() < 5:
+                    business_days_added += 1
+
+            if appointment_time.date() > max_date:
+                max_date_str = max_date.strftime('%A, %B %d')
+                logger.info(f"Orchestrator: Booking too far ahead. Requested: {appointment_time.date()}, Max: {max_date}")
+                return (
+                    f"BOOKING_TOO_FAR: We can only book appointments up to 2 business days in advance. "
+                    f"The latest available date is {max_date_str}. "
+                    f"Please ask the caller to choose a date on or before {max_date_str}."
+                )
 
             logger.info(f"Orchestrator: Checking availability for staff={staff_display}, date={appointment_time}")
             available_slots = await calendar.get_available_slots(
@@ -1958,7 +1979,7 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
             # Estimate how much audio is still buffered at Twilio
             # (audio_duration minus the time we spent streaming)
             remaining_playback = max(0, audio_duration - tts_elapsed)
-            playback_buffer = min(remaining_playback + 0.2, audio_duration)
+            playback_buffer = min(remaining_playback + 0.1, audio_duration)  # Reduced buffer for faster response
             step = 0.1
 
             if playback_buffer > 0:
@@ -2044,12 +2065,12 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
         if sample_count == 0:
             return False
 
-        # Check grace period: skip barge-in detection for first 1.5s after speech starts
+        # Check grace period: skip barge-in detection for first 0.8s after speech starts
         # This prevents Twilio line noise from immediately killing playback
         sid = call_sid or "_default"
         now = time.time()
         grace_start = self._barge_in_speech_start.get(sid, 0)
-        if grace_start > 0 and (now - grace_start) < 1.5:
+        if grace_start > 0 and (now - grace_start) < 0.8:
             return False
 
         # Decode μ-law to linear PCM to get real energy values
@@ -2070,15 +2091,17 @@ Remember: This is a real phone call. Be CONCISE. Be helpful. Be human."""
 
         # RMS threshold for actual speech over phone line (μ-law decoded)
         # Typical phone line noise: RMS ~14
+        # Soft speech: RMS ~100-150
         # Medium speech: RMS ~200
         # Loud speech: RMS ~900+
-        # Use 200 as threshold to catch speech but ignore line noise
-        threshold = 200
+        # Use 150 as threshold to catch softer speech while ignoring line noise
+        threshold = 150
 
         if rms > threshold:
             self._barge_in_consecutive[sid] += 1
-            # Require 5 consecutive high-energy frames (~100ms of speech) to trigger
-            if self._barge_in_consecutive[sid] >= 5:
+            # Require 3 consecutive high-energy frames (~60ms of speech) to trigger
+            # Reduced from 5 for faster interruption response
+            if self._barge_in_consecutive[sid] >= 3:
                 logger.info(f"Orchestrator: Barge-in triggered - rms={rms}, threshold={threshold}, consecutive={self._barge_in_consecutive[sid]}")
                 self._barge_in_consecutive[sid] = 0
                 return True
