@@ -15,6 +15,7 @@ The orchestrator is the brain of the AI voice platform. It coordinates:
 
 import asyncio
 import json
+import time
 from typing import Optional, Dict, Any, AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -62,7 +63,7 @@ class ConversationContext:
     intent_history: list = field(default_factory=list)
     user_transcript: str = ""
     ai_response: str = ""
-    start_time: float = field(default_factory=asyncio.get_event_loop().time)
+    start_time: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Caller recognition
@@ -2457,7 +2458,6 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
     def get_active_calls(self) -> list:
         """Get list of active calls with details for dashboard"""
-        import time
         active_calls = []
         current_time = time.time()
         stale_calls = []  # Track stale calls to remove
