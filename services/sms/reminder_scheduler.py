@@ -96,9 +96,43 @@ class ReminderScheduler:
             "created_at": datetime.now().isoformat(),
         }
 
+        # Cancel any existing unsent reminders for this phone number first
+        # This ensures rebooking replaces old reminders instead of duplicating
+        self.cancel_reminders_for_phone(phone_number)
+
         self._reminders.append(reminder)
         self._save()
         logger.info(f"Reminder scheduler: Scheduled for {phone_number} at {remind_at.isoformat()} (appointment: {appointment_time_str})")
+
+    def cancel_reminders_for_phone(self, phone_number: str) -> int:
+        """
+        Cancel all pending (unsent) reminders for a specific phone number.
+
+        This is called when:
+        - An appointment is cancelled
+        - A new appointment is booked (replaces old reminder)
+
+        Args:
+            phone_number: The phone number to cancel reminders for
+
+        Returns:
+            Number of reminders cancelled
+        """
+        original_count = len(self._reminders)
+
+        # Remove all unsent reminders for this phone number
+        self._reminders = [
+            r for r in self._reminders
+            if r.get("sent") or r.get("phone_number") != phone_number
+        ]
+
+        cancelled_count = original_count - len(self._reminders)
+
+        if cancelled_count > 0:
+            self._save()
+            logger.info(f"Reminder scheduler: Cancelled {cancelled_count} pending reminder(s) for {phone_number}")
+
+        return cancelled_count
 
     def start(self) -> None:
         """Start the background checker loop"""

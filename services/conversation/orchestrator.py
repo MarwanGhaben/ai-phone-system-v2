@@ -1738,6 +1738,17 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 except Exception as db_err:
                     logger.warning(f"Orchestrator: Failed to update local booking status: {db_err}")
 
+                # Cancel any scheduled reminders for this phone number
+                if context and context.phone_number:
+                    try:
+                        from services.sms.reminder_scheduler import get_reminder_scheduler
+                        scheduler = get_reminder_scheduler()
+                        cancelled = scheduler.cancel_reminders_for_phone(context.phone_number)
+                        if cancelled > 0:
+                            logger.info(f"Orchestrator: Cancelled {cancelled} pending reminder(s) for cancelled appointment")
+                    except Exception as rem_err:
+                        logger.warning(f"Orchestrator: Failed to cancel reminders: {rem_err}")
+
                 # Send cancellation confirmation SMS
                 if context and context.phone_number and context.found_appointments:
                     try:
