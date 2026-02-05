@@ -211,6 +211,37 @@ class ConversationOrchestrator:
         # Track which calls have greeted
         self._greeted_calls: set = set()
 
+    def _format_date_arabic(self, date) -> str:
+        """Format a date in Arabic for voice output"""
+        arabic_days = {
+            0: "الاثنين",
+            1: "الثلاثاء",
+            2: "الأربعاء",
+            3: "الخميس",
+            4: "الجمعة",
+            5: "السبت",
+            6: "الأحد"
+        }
+        arabic_months = {
+            1: "يناير", 2: "فبراير", 3: "مارس", 4: "أبريل",
+            5: "مايو", 6: "يونيو", 7: "يوليو", 8: "أغسطس",
+            9: "سبتمبر", 10: "أكتوبر", 11: "نوفمبر", 12: "ديسمبر"
+        }
+        arabic_numbers = {
+            1: "الأول", 2: "الثاني", 3: "الثالث", 4: "الرابع", 5: "الخامس",
+            6: "السادس", 7: "السابع", 8: "الثامن", 9: "التاسع", 10: "العاشر",
+            11: "الحادي عشر", 12: "الثاني عشر", 13: "الثالث عشر", 14: "الرابع عشر",
+            15: "الخامس عشر", 16: "السادس عشر", 17: "السابع عشر", 18: "الثامن عشر",
+            19: "التاسع عشر", 20: "العشرين", 21: "الحادي والعشرين", 22: "الثاني والعشرين",
+            23: "الثالث والعشرين", 24: "الرابع والعشرين", 25: "الخامس والعشرين",
+            26: "السادس والعشرين", 27: "السابع والعشرين", 28: "الثامن والعشرين",
+            29: "التاسع والعشرين", 30: "الثلاثين", 31: "الحادي والثلاثين"
+        }
+        day_name = arabic_days.get(date.weekday(), "")
+        day_num = arabic_numbers.get(date.day, str(date.day))
+        month_name = arabic_months.get(date.month, "")
+        return f"{day_name} {day_num} من {month_name}"
+
     def _get_system_prompt(self) -> str:
         """Get system prompt for LLM"""
         # Get accountant names from service
@@ -1296,8 +1327,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             staff_display = matched_staff_name or accountant_name or "the accountant"
             full_fmt = '%A, %B %d at %I:%M %p'
 
-            # Calculate max booking date (2 business days from today)
-            today = datetime.now().date()
+            # Calculate max booking date (2 business days from today) using Toronto timezone
+            from pytz import timezone as pytz_timezone
+            toronto_tz = pytz_timezone("America/Toronto")
+            today = datetime.now(toronto_tz).date()
             max_date = today
             business_days_added = 0
             while business_days_added < 2:
@@ -1306,13 +1339,18 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 if max_date.weekday() < 5:
                     business_days_added += 1
 
+            logger.info(f"Orchestrator: Date validation - today={today}, max_date={max_date}, requested={appointment_time.date()}")
+
             if appointment_time.date() > max_date:
                 max_date_str = max_date.strftime('%A, %B %d')
-                logger.info(f"Orchestrator: Booking too far ahead. Requested: {appointment_time.date()}, Max: {max_date}")
+                max_date_ar = self._format_date_arabic(max_date)
+                logger.warning(f"Orchestrator: BOOKING_TOO_FAR - Requested: {appointment_time.date()}, Max allowed: {max_date}")
                 return (
-                    f"BOOKING_TOO_FAR: We can only book appointments up to 2 business days in advance. "
-                    f"The latest available date is {max_date_str}. "
-                    f"Please ask the caller to choose a date on or before {max_date_str}."
+                    f"BOOKING_TOO_FAR: The requested date is too far in advance. "
+                    f"We can ONLY book appointments up to 2 business days ahead. "
+                    f"Today is {today.strftime('%A, %B %d')}. The latest available date is {max_date_str}. "
+                    f"Tell the caller: 'We can only book up to 2 business days in advance. Would you like to book for {max_date_str} instead?' "
+                    f"In Arabic: 'نقدر نحجز لمدة يومين عمل فقط. تحب نحجز ليوم {max_date_ar} بدلاً من ذلك؟'"
                 )
 
             logger.info(f"Orchestrator: Checking availability for staff={staff_display}, date={appointment_time}")
