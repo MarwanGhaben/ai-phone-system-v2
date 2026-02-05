@@ -763,48 +763,99 @@ async def delete_caller(phone_number: str, user: dict = Depends(require_auth)):
 
 @router.get("/api/api-usage")
 async def get_api_usage(user: dict = Depends(require_auth)):
-    """Get API usage and cost tracking"""
-    # TODO: Implement actual API usage tracking
-    # For now, return placeholder data
+    """Get API usage and cost tracking with real balance fetching"""
+    import httpx
+    from config.settings import get_settings
+
+    settings = get_settings()
+
+    # Fetch real Telnyx balance
+    telnyx_balance = None
+    telnyx_status = "unknown"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.telnyx.com/v2/balance",
+                headers={"Authorization": f"Bearer {settings.telnyx_api_key}"},
+                timeout=5.0
+            )
+            if response.status_code == 200:
+                data = response.json()
+                telnyx_balance = float(data.get("data", {}).get("balance", 0))
+                telnyx_status = "healthy" if telnyx_balance > 5 else "warning" if telnyx_balance > 1 else "critical"
+    except Exception as e:
+        logger.warning(f"Failed to fetch Telnyx balance: {e}")
+        telnyx_balance = None
+        telnyx_status = "error"
+
+    # Fetch real ElevenLabs usage
+    elevenlabs_chars_used = None
+    elevenlabs_chars_limit = None
+    elevenlabs_status = "unknown"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.elevenlabs.io/v1/user/subscription",
+                headers={"xi-api-key": settings.elevenlabs_api_key},
+                timeout=5.0
+            )
+            if response.status_code == 200:
+                data = response.json()
+                elevenlabs_chars_used = data.get("character_count", 0)
+                elevenlabs_chars_limit = data.get("character_limit", 0)
+                usage_pct = (elevenlabs_chars_used / elevenlabs_chars_limit * 100) if elevenlabs_chars_limit > 0 else 0
+                elevenlabs_status = "healthy" if usage_pct < 70 else "warning" if usage_pct < 90 else "critical"
+    except Exception as e:
+        logger.warning(f"Failed to fetch ElevenLabs usage: {e}")
+        elevenlabs_status = "error"
+
+    # Fetch real Twilio balance
+    twilio_balance = None
+    twilio_status = "unknown"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Balance.json",
+                auth=(settings.twilio_account_sid, settings.twilio_auth_token),
+                timeout=5.0
+            )
+            if response.status_code == 200:
+                data = response.json()
+                twilio_balance = float(data.get("balance", 0))
+                twilio_status = "healthy" if twilio_balance > 10 else "warning" if twilio_balance > 5 else "critical"
+    except Exception as e:
+        logger.warning(f"Failed to fetch Twilio balance: {e}")
+        twilio_status = "error"
+
+    # Build response with real data where available
+    services = [
+        {
+            "name": "OpenAI GPT-4o",
+            "note": "Usage tracking not available via API",
+            "status": "healthy"
+        },
+        {
+            "name": "ElevenLabs",
+            "characters_used": elevenlabs_chars_used,
+            "characters_limit": elevenlabs_chars_limit,
+            "status": elevenlabs_status
+        },
+        {
+            "name": "Twilio",
+            "balance": twilio_balance,
+            "status": twilio_status
+        },
+        {
+            "name": "Telnyx SMS",
+            "balance": telnyx_balance,
+            "cost_per_msg": 0.004,
+            "status": telnyx_status
+        }
+    ]
 
     return {
-        "services": [
-            {
-                "name": "OpenAI GPT-4o",
-                "budget": 5.00,
-                "spent": 0.01,
-                "tokens": 77332,
-                "requests": 92,
-                "status": "healthy"
-            },
-            {
-                "name": "ElevenLabs TTS",
-                "budget": 50.00,
-                "spent": 8.30,
-                "characters": 64056,
-                "status": "healthy"
-            },
-            {
-                "name": "ElevenLabs STT",
-                "budget": 50.00,
-                "spent": 7.27,
-                "minutes": 54.8,
-                "status": "healthy"
-            },
-            {
-                "name": "Twilio",
-                "budget": 50.00,
-                "spent": 0.62,
-                "status": "healthy"
-            },
-            {
-                "name": "Telnyx SMS",
-                "balance": 1.58,
-                "cost_per_msg": 0.004,
-                "status": "warning"
-            }
-        ],
-        "total_monthly_cost": 16.20
+        "services": services,
+        "last_updated": datetime.now().isoformat()
     }
 
 

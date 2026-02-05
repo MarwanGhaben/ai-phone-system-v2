@@ -972,11 +972,12 @@
                 <div class="card">
                     <div class="card-header">
                         <div class="icon success"><i class="fas fa-wallet"></i></div>
-                        <h3>Monthly Summary</h3>
+                        <h3>Account Summary</h3>
                     </div>
                     <div class="metric-item" style="text-align: center; padding: 30px;">
-                        <div class="label">Total Monthly Cost</div>
+                        <div class="label">Total Available Balance</div>
                         <div class="value" style="font-size: 36px; color: #28a745;">$<span id="totalMonthlyCost">--</span></div>
+                        <div class="sub" style="margin-top: 10px;">Twilio + Telnyx combined</div>
                     </div>
                 </div>
             </div>
@@ -1324,41 +1325,77 @@
                 const response = await fetch(`${API_BASE}/api-usage`);
                 const data = await response.json();
 
-                document.getElementById('totalMonthlyCost').textContent = data.total_monthly_cost.toFixed(2);
+                // Calculate total balance from services that have balance
+                let totalBalance = 0;
+                data.services.forEach(s => {
+                    if (s.balance !== null && s.balance !== undefined) {
+                        totalBalance += s.balance;
+                    }
+                });
+                document.getElementById('totalMonthlyCost').textContent = totalBalance.toFixed(2);
 
                 const div = document.getElementById('apiCosts');
                 div.innerHTML = data.services.map(service => {
-                    const percent = service.budget ? (service.spent / service.budget * 100) : 0;
-                    const barClass = percent < 50 ? 'success' : percent < 80 ? 'warning' : 'danger';
+                    // Status badge styling
+                    const statusClass = service.status === 'healthy' ? 'operational' :
+                                       service.status === 'warning' ? 'warning' :
+                                       service.status === 'critical' ? 'critical' : 'info';
+                    const statusText = service.status === 'healthy' ? 'Healthy' :
+                                      service.status === 'warning' ? 'Low Balance' :
+                                      service.status === 'critical' ? 'Critical' :
+                                      service.status === 'error' ? 'Error' : 'OK';
+
+                    // For ElevenLabs, show character usage progress bar
+                    let progressBar = '';
+                    if (service.characters_limit && service.characters_used !== null) {
+                        const percent = (service.characters_used / service.characters_limit * 100);
+                        const barClass = percent < 70 ? 'success' : percent < 90 ? 'warning' : 'danger';
+                        progressBar = `
+                            <div class="progress-bar-container">
+                                <div class="progress-bar ${barClass}" style="width: ${Math.min(percent, 100)}%"></div>
+                            </div>
+                        `;
+                    }
+
+                    // Main value display
+                    let mainValue = '';
+                    let subInfo = '';
+
+                    if (service.balance !== null && service.balance !== undefined) {
+                        mainValue = `$${service.balance.toFixed(2)}`;
+                        subInfo = 'Account Balance';
+                        if (service.cost_per_msg) {
+                            subInfo += ` (~${Math.floor(service.balance / service.cost_per_msg)} SMS remaining)`;
+                        }
+                    } else if (service.characters_used !== null && service.characters_used !== undefined) {
+                        mainValue = service.characters_used.toLocaleString();
+                        subInfo = service.characters_limit ?
+                            `/ ${service.characters_limit.toLocaleString()} characters` :
+                            'characters used';
+                    } else if (service.note) {
+                        mainValue = '--';
+                        subInfo = service.note;
+                    }
 
                     return `
                         <div class="cost-card">
                             <div class="service-name">
                                 <strong>${service.name}</strong>
-                                <span class="status-badge ${service.status === 'healthy' ? 'operational' : 'warning'}" style="margin-left: auto;">
-                                    ${service.status === 'healthy' ? '✅ Under Budget' : '⚠️ Warning'}
+                                <span class="status-badge ${statusClass}" style="margin-left: auto;">
+                                    ${statusText}
                                 </span>
                             </div>
                             <div class="amounts">
-                                <span class="spent">$${service.spent?.toFixed(2) || service.balance?.toFixed(2) || '0.00'}</span>
-                                <span class="budget">${service.budget ? '/ $' + service.budget.toFixed(2) : 'Balance'}</span>
+                                <span class="spent">${mainValue}</span>
+                                <span class="budget">${subInfo}</span>
                             </div>
-                            ${service.budget ? `
-                                <div class="progress-bar-container">
-                                    <div class="progress-bar ${barClass}" style="width: ${percent}%"></div>
-                                </div>
-                            ` : ''}
-                            <div class="sub" style="margin-top: 8px; font-size: 12px; color: var(--text-secondary);">
-                                ${service.tokens ? service.tokens.toLocaleString() + ' tokens' : ''}
-                                ${service.characters ? service.characters.toLocaleString() + ' chars' : ''}
-                                ${service.minutes ? service.minutes + ' min' : ''}
-                                ${service.requests ? ', ' + service.requests + ' requests' : ''}
-                            </div>
+                            ${progressBar}
                         </div>
                     `;
                 }).join('');
             } catch (error) {
                 console.error('Error loading API costs:', error);
+                document.getElementById('apiCosts').innerHTML = '<p style="color: var(--text-secondary);">Error loading API usage data</p>';
             }
         }
 
