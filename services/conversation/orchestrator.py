@@ -664,10 +664,11 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                     if twilio_handler:
                         await twilio_handler.clear_audio()
 
+                    # Mark that barge-in will do the reset BEFORE starting it
+                    # (prevents race condition where _speak_to_caller checks flag mid-reset)
+                    self._barge_in_reset_done[call_sid] = True
                     # Reset STT for clean listening after barge-in
                     await call_stt.reset_for_listening()
-                    # Mark that barge-in already did the reset (prevent double reset in _speak_to_caller)
-                    self._barge_in_reset_done[call_sid] = True
                 else:
                     # SPEAKING and no barge-in: Do NOT feed audio to STT.
                     # The AI's voice comes back through the phone mic as echo.
