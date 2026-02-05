@@ -101,6 +101,8 @@ services:
 
       # Security - REQUIRED (generate with openssl rand -hex 32)
       SECRET_KEY: "${SECRET_KEY:?SECRET_KEY is required}"
+      # Skip Twilio signature validation (development only!)
+      SKIP_TWILIO_SIGNATURE_VALIDATION: ${SKIP_TWILIO_SIGNATURE_VALIDATION:-false}
 
       # Environment
       ENVIRONMENT: ${ENVIRONMENT:-development}
