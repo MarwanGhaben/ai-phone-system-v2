@@ -15,8 +15,8 @@ services:
     image: postgres:16-alpine
     container_name: ai-voice-db
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required - use a strong password}
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER is required}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
       POSTGRES_DB: ${POSTGRES_DB:-ai_voice_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -99,8 +99,8 @@ services:
       # Call Transfer
       TRANSFER_PHONE_NUMBER: ${TRANSFER_PHONE_NUMBER:-}
 
-      # Security - REQUIRED: No default value for secrets
-      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required - generate with: openssl rand -hex 32}
+      # Security - REQUIRED (generate with openssl rand -hex 32)
+      SECRET_KEY: "${SECRET_KEY:?SECRET_KEY is required}"
 
       # Environment
       ENVIRONMENT: ${ENVIRONMENT:-development}
