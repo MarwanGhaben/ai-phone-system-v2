@@ -400,7 +400,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             else:
                 # New caller — use hardcoded short greeting (LLM greetings are too wordy)
                 # Name will be asked naturally by LLM after caller picks a language
-                return "Hi, I'm Sarah from Flexible Accounting. English or Arabic?"
+                return "Hello, thank you for calling Flexible Accounting. My name is Sarah. I can assist you in English or Arabic — which would you prefer?"
 
             request = LLMRequest(
                 messages=[Message(role=LLMRole.USER, content=greeting_prompt)],
@@ -426,7 +426,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             else:
                 return f"Hey {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?"
         else:
-            return "Hi, I'm Sarah from Flexible Accounting. English or Arabic?"
+            return "Hello, thank you for calling Flexible Accounting. My name is Sarah. I can assist you in English or Arabic — which would you prefer?"
 
     async def handle_call(self, call_sid: str, phone_number: str, websocket, stream_sid: str = "") -> None:
         """
