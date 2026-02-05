@@ -253,8 +253,21 @@ class ConversationOrchestrator:
         accountant_names_ar = acc_service.get_names_formatted("ar")
 
         # Inject today's date so the LLM can calculate correct dates
-        today = datetime.now()
+        from pytz import timezone as pytz_timezone
+        toronto_tz = pytz_timezone("America/Toronto")
+        today = datetime.now(toronto_tz)
         today_str = today.strftime('%A, %B %d, %Y')  # e.g. "Friday, January 30, 2026"
+
+        # Calculate max booking date (2 business days from today)
+        from datetime import timedelta
+        max_date = today.date()
+        business_days_added = 0
+        while business_days_added < 2:
+            max_date += timedelta(days=1)
+            if max_date.weekday() < 5:  # Monday=0 to Friday=4
+                business_days_added += 1
+        max_booking_date_str = max_date.strftime('%A, %B %d')  # e.g. "Monday, February 09"
+        max_booking_date_ar = self._format_date_arabic(max_date)
 
         return f"""You are Sarah, a friendly and professional phone receptionist for Flexible Accounting (also known as iFlex Tax), a Canadian accounting firm.
 
@@ -318,7 +331,11 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - ⚠️ FRIDAY IS A WORKDAY ⚠️: The office IS OPEN on Friday (الجمعة). This is a Canadian business following North American schedule, NOT Middle Eastern schedule. NEVER tell a caller that Friday is closed or a weekend day.
 - If caller asks for Friday: ACCEPT IT - Friday is a normal workday!
 - If caller asks for Saturday or Sunday: ONLY THEN say those are the closed days and suggest Friday or Monday instead.
-- BOOKING WINDOW: We can only book appointments up to 2 business days in advance (excluding weekends). If a caller asks for a date further out, politely explain: "We can only schedule appointments up to 2 business days ahead. Would you like to book for [nearest available date]?" In Arabic: "نقدر نحجز مواعيد لمدة يومين عمل فقط. هل تحب نحجز لـ [التاريخ المتاح]؟"
+- ⚠️ CRITICAL - 2 BUSINESS DAY LIMIT ⚠️: We can ONLY book appointments up to 2 BUSINESS DAYS in advance. Today is {today_str}, so the MAXIMUM booking date is {max_booking_date_str}.
+  * If caller requests ANY date after {max_booking_date_str}, you MUST IMMEDIATELY reject it BEFORE calling check_appointment.
+  * Say: "We can only book up to 2 business days ahead. The latest I can book is {max_booking_date_str}. Would you like that instead?"
+  * In Arabic: "نقدر نحجز لمدة يومين عمل فقط. أقصى تاريخ متاح هو {max_booking_date_ar}. تحب أحجز لك هذا اليوم؟"
+  * Do NOT say "I'll check" for dates beyond {max_booking_date_str} - just reject immediately.
 - Ask: Individual or corporate client?
 - Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
