@@ -7,13 +7,18 @@ AI Voice Platform v2 - Main FastAPI Application
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from config.settings import get_settings
 from services.conversation.orchestrator import get_orchestrator
+from services.security.middleware import (
+    SecurityHeadersMiddleware,
+    RateLimitMiddleware,
+    validate_twilio_signature,
+)
 
 
 # Get settings
@@ -64,13 +69,24 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware
+# Security middleware - add before CORS
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Rate limiting middleware
+app.add_middleware(
+    RateLimitMiddleware,
+    requests_per_minute=120,  # 120 requests per minute per IP
+    burst_limit=20,  # Max 20 requests per second
+    exclude_paths=["/health", "/ws/calls"]  # Exclude health checks and WebSocket
+)
+
+# CORS middleware - restrict to configured origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Twilio-Signature"],
 )
 
 # Include dashboard routes (optional - won't break core functionality if dependencies missing)
@@ -184,18 +200,17 @@ async def diagnostics():
 # TWILIO WEBHOOK (TwiML)
 # =====================================================
 
-@app.get("/api/incoming-call")
-async def incoming_call(request: Request):
+@app.api_route("/api/incoming-call", methods=["GET", "POST"])
+async def incoming_call(
+    request: Request,
+    _: bool = Depends(validate_twilio_signature)
+):
     """
-    Handle incoming call from Twilio
-    Returns TwiML to connect to Media Stream
-    """
-    # Debug: Print all settings and headers
-    print(f"DEBUG: public_domain from settings = '{getattr(settings, 'public_domain', 'NOT_FOUND')}'")
-    print(f"DEBUG: host header = '{request.headers.get('host')}'")
-    print(f"DEBUG: X-Forwarded-Host = '{request.headers.get('X-Forwarded-Host')}'")
-    print(f"DEBUG: X-Forwarded-Proto = '{request.headers.get('X-Forwarded-Proto')}'")
+    Handle incoming call from Twilio.
+    Returns TwiML to connect to Media Stream.
 
+    This endpoint validates the Twilio signature to prevent unauthorized access.
+    """
     # Get WebSocket URL for this server
     # Use the domain from settings or fall back to host header
     domain = getattr(settings, 'public_domain', None)
@@ -203,9 +218,9 @@ async def incoming_call(request: Request):
     # Check if domain is set and not empty
     if domain and domain.strip():
         # Use configured public domain with secure WebSocket
-        # IMPORTANT: Port 8443 bypasses Sophos for WebSocket
+        # Port 8443 bypasses Sophos for WebSocket
         ws_url = f"wss://{domain.strip()}:8443/ws/calls"
-        print(f"DEBUG: Using PUBLIC_DOMAIN: {ws_url}")
+        logger.debug(f"Using PUBLIC_DOMAIN for WebSocket: {ws_url}")
     else:
         # Try to get domain from X-Forwarded-Host header (set by reverse proxy)
         forwarded_host = request.headers.get('X-Forwarded-Host', '')
@@ -216,27 +231,20 @@ async def incoming_call(request: Request):
             if ':' in forwarded_host:
                 forwarded_host = forwarded_host.split(':')[0]
             ws_url = f"wss://{forwarded_host}/ws/calls"
-            print(f"DEBUG: Using X-Forwarded-Host (SSL): {ws_url}")
         elif forwarded_host and forwarded_proto == 'http':
             # Reverse proxy without SSL - use ws://
             if ':' in forwarded_host:
                 forwarded_host = forwarded_host.split(':')[0]
             ws_url = f"ws://{forwarded_host}/ws/calls"
-            print(f"DEBUG: Using X-Forwarded-Host (non-SSL): {ws_url}")
         else:
             # Direct access (no reverse proxy) - use ws:// with actual host and port
             host = request.headers.get('host', 'localhost:8000')
-            print(f"DEBUG: Direct access mode, using host header: {host}")
 
             # Build WebSocket URL based on the actual host
-            # If host contains a port, use it; otherwise default to 8000 for ws://
             if ':' not in host:
-                # No port in host - add default port based on protocol
                 host = f"{host}:8000"
 
-            # For direct IP access, always use ws:// (not wss://) since we don't have SSL
             ws_url = f"ws://{host}/ws/calls"
-            print(f"DEBUG: Direct WebSocket URL: {ws_url}")
 
     from services.telephony.twilio_service import TwilioService
     twilio = TwilioService(
@@ -246,14 +254,19 @@ async def incoming_call(request: Request):
     )
 
     # Extract caller's phone number from Twilio webhook params
-    caller_number = request.query_params.get("From", request.query_params.get("Caller", ""))
+    # Check both query params and form data (POST requests)
+    if request.method == "POST":
+        try:
+            form_data = await request.form()
+            caller_number = form_data.get("From", form_data.get("Caller", ""))
+        except Exception:
+            caller_number = ""
+    else:
+        caller_number = request.query_params.get("From", request.query_params.get("Caller", ""))
+
     logger.info(f"Incoming call from: {caller_number}")
 
     twiml = await twilio.generate_twiml(ws_url, caller_number=caller_number)
-
-    # Log the WebSocket URL being sent to Twilio
-    print(f"DEBUG: FINAL WebSocket URL: {ws_url}")
-    print(f"DEBUG: Full TwiML:\n{twiml}")
 
     return HTMLResponse(content=twiml, media_type="application/xml")
 
@@ -525,11 +538,22 @@ async def get_calendar_availability(service_id: str, staff_id: str = None, days_
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler"""
-    logger.error(f"Unhandled exception: {exc}")
+    """
+    Global exception handler.
+
+    Logs the full exception for debugging but returns a generic error
+    to clients to prevent information disclosure.
+    """
+    import traceback
+
+    # Log full details for debugging (server-side only)
+    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
+    logger.error(f"Traceback:\n{traceback.format_exc()}")
+
+    # Return generic error to client (no internal details)
     return JSONResponse(
         status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)}
+        content={"error": "Internal server error"}
     )
 
 

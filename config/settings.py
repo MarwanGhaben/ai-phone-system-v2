@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     # =====================================================
     secret_key: str = Field(..., alias="SECRET_KEY")
     access_token_expire_minutes: int = 60 * 24 * 7  # 7 days
+    # WARNING: Only set to True in development with local Twilio testing
+    # In production, always validate Twilio signatures
+    skip_twilio_signature_validation: bool = Field(
+        default=False,
+        alias="SKIP_TWILIO_SIGNATURE_VALIDATION"
+    )
 
     # =====================================================
     # DATABASE

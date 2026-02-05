@@ -248,9 +248,27 @@ INSERT INTO tenants (name, slug, industry) VALUES
 ('iFlex Tax', 'iflextax', 'accounting')
 ON CONFLICT (slug) DO NOTHING;
 
--- Insert default admin user (password: admin123 - CHANGE THIS!)
-INSERT INTO users (username, password_hash, email, role) VALUES
-('admin', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYkWqC5fXL6', 'admin@example.com', 'admin')
-ON CONFLICT (username) DO NOTHING;
+-- =====================================================
+-- SECURITY: Admin User Setup
+-- =====================================================
+-- DO NOT insert a default admin user with a known password!
+-- Instead, create the admin user after deployment using the CLI tool
+-- or by running the following SQL with a secure password hash:
+--
+-- To generate a bcrypt hash in Python:
+--   python -c "import bcrypt; print(bcrypt.hashpw(b'YOUR_SECURE_PASSWORD', bcrypt.gensalt()).decode())"
+--
+-- Then run:
+--   INSERT INTO users (username, password_hash, email, role)
+--   VALUES ('admin', '$2b$12$YOUR_HASH_HERE', 'admin@yourdomain.com', 'admin');
+--
+-- Or use the provided admin setup script:
+--   python scripts/create_admin.py
+-- =====================================================
 
 \echo 'Database schema created successfully!'
+\echo ''
+\echo 'IMPORTANT: No default admin user was created for security.'
+\echo 'Please create an admin user with a secure password:'
+\echo '  python scripts/create_admin.py'
+\echo ''
