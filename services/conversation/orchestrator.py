@@ -2216,16 +2216,17 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         # RMS threshold for actual speech over phone line (μ-law decoded)
         # Typical phone line noise: RMS ~14
         # Soft speech: RMS ~100-150
-        # Medium speech: RMS ~200
+        # Medium speech: RMS ~200-400
         # Loud speech: RMS ~900+
-        # Use 150 as threshold to catch softer speech while ignoring line noise
-        threshold = 150
+        # Background noise in public: RMS ~300-400
+        # Use 400 as threshold to filter background noise while catching intentional speech
+        threshold = 400
 
         if rms > threshold:
             self._barge_in_consecutive[sid] += 1
-            # Require 3 consecutive high-energy frames (~60ms of speech) to trigger
-            # Reduced from 5 for faster interruption response
-            if self._barge_in_consecutive[sid] >= 3:
+            # Require 4 consecutive high-energy frames (~80ms of speech) to trigger
+            # This filters brief noise bursts while catching sustained speech
+            if self._barge_in_consecutive[sid] >= 4:
                 logger.info(f"Orchestrator: Barge-in triggered - rms={rms}, threshold={threshold}, consecutive={self._barge_in_consecutive[sid]}")
                 self._barge_in_consecutive[sid] = 0
                 return True
