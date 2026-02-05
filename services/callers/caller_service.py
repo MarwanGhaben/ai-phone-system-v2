@@ -142,6 +142,48 @@ class CallerRecognitionService:
         )
         return self._row_to_dict(row)
 
+    async def update_caller_language(self, phone_number: str, language: str) -> bool:
+        """
+        Update caller's preferred language.
+
+        This is called when:
+        - Caller explicitly asks to save a language preference
+        - Call ends (saves the final language used in the conversation)
+
+        Args:
+            phone_number: Caller's phone number
+            language: Language code ('en' or 'ar')
+
+        Returns:
+            True if updated successfully, False if caller not found or private
+        """
+        if self._is_private_number(phone_number):
+            return False
+
+        # Validate language code
+        if language not in ("en", "ar"):
+            logger.warning(f"Invalid language code: {language}, defaulting to 'en'")
+            language = "en"
+
+        pool = await get_db_pool()
+        result = await pool.execute(
+            """
+            UPDATE callers
+            SET language = $2
+            WHERE phone_number = $1
+            """,
+            phone_number, language,
+        )
+
+        # Check if a row was updated
+        updated = result.endswith("UPDATE 1")
+        if updated:
+            logger.info(f"Updated language preference for {phone_number} to '{language}'")
+        else:
+            logger.warning(f"No caller found for {phone_number} to update language")
+
+        return updated
+
     def get_greeting_for_caller(self, caller_name: Optional[str], caller_language: Optional[str] = None) -> str:
         """
         Get personalized greeting for caller.

@@ -328,6 +328,11 @@ LANGUAGE DETECTION:
 - Keep Arabic responses brief and natural
 - Use simple, conversational Arabic
 
+LANGUAGE PREFERENCE:
+- If a caller explicitly asks to always be responded to in a specific language (e.g., "always speak to me in Arabic", "I want you to remember English for next time", "save Arabic as my language", "احفظ العربي", "دايماً كلمني بالعربي"), call the save_language_preference tool
+- After saving, confirm warmly: "Done, I will remember your preference for next time." / "تم، سأتذكر تفضيلك للمرة القادمة."
+- The caller's final language preference is automatically saved at the end of each call, so the next call will start in their preferred language
+
 CRITICAL - ARABIC NUMBER/TIME PRONUNCIATION:
 - When speaking Arabic, ALWAYS write times and dates using Arabic words, NOT digits
 - NEVER use "02:30 PM" or "10:00 AM" in Arabic responses — the voice system cannot pronounce them
@@ -1092,6 +1097,21 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 }
             },
             {
+                "name": "save_language_preference",
+                "description": "Save the caller's preferred language for future calls. Call this when the caller explicitly asks to always be responded to in a specific language (e.g., 'always speak to me in Arabic', 'remember I prefer English', 'save Arabic as my language').",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "language": {
+                            "type": "string",
+                            "enum": ["en", "ar"],
+                            "description": "The caller's preferred language: 'en' for English, 'ar' for Arabic"
+                        }
+                    },
+                    "required": ["language"]
+                }
+            },
+            {
                 "name": "transfer_to_human",
                 "description": "Transfer the call to a human staff member. ONLY call this when the caller EXPLICITLY asks to speak with a person by name or explicitly requests a transfer. Do NOT call this for vague or unclear requests — ask a clarifying question instead.",
                 "parameters": {
@@ -1788,6 +1808,42 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                         context.add_assistant_message(response)
                         return response
 
+                    # --- Save language preference ---
+                    if tool_name == "save_language_preference":
+                        language = arguments.get("language", "").strip().lower()
+                        if language in ("en", "ar") and context:
+                            # Update context
+                            context.language = language
+                            # Persist to database
+                            await self.caller_service.update_caller_language(
+                                context.phone_number,
+                                language
+                            )
+                            lang_name = "Arabic" if language == "ar" else "English"
+                            lang_name_ar = "العربية" if language == "ar" else "الإنجليزية"
+                            logger.info(f"Orchestrator: Saved language preference '{language}' for {context.phone_number}")
+
+                            # Let the LLM generate a natural confirmation
+                            messages.append(Message(role=LLMRole.ASSISTANT, content=llm_response.content or ""))
+                            if language == "ar":
+                                messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: Language preference has been saved as {lang_name_ar}. Confirm to the caller in Arabic that you'll always respond in Arabic from now on. Keep it brief and warm.]"))
+                            else:
+                                messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: Language preference has been saved as {lang_name}. Confirm to the caller that you'll always respond in English from now on. Keep it brief and warm.]"))
+
+                            follow_up_request = LLMRequest(
+                                messages=messages,
+                                temperature=0.7,
+                                max_tokens=60,
+                                stream=True
+                            )
+                            full_response = ""
+                            async for chunk in self.llm.chat_stream(follow_up_request):
+                                full_response += chunk.delta
+
+                            response = full_response.strip()
+                            context.add_assistant_message(response)
+                            return response
+
                     # --- Transfer to human ---
                     if tool_name == "transfer_to_human":
                         reason = arguments.get("reason", "caller request")
@@ -2293,6 +2349,21 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             logger.info(f"Orchestrator: Call end logged to database (duration calculated, booking={booking_made}, transfer={transfer_requested})")
         except Exception as db_err:
             logger.warning(f"Orchestrator: Failed to log call end to DB: {db_err}")
+
+        # =====================================================
+        # Persist caller's language preference for future calls
+        # =====================================================
+        # This ensures that if the caller switched languages during the call,
+        # the final language is saved and used for their next call greeting.
+        if context and context.phone_number and language and language != "auto":
+            try:
+                await self.caller_service.update_caller_language(
+                    context.phone_number,
+                    language
+                )
+                logger.info(f"Orchestrator: Persisted language preference '{language}' for {context.phone_number}")
+            except Exception as lang_err:
+                logger.warning(f"Orchestrator: Failed to persist language preference: {lang_err}")
 
         # =====================================================
         # CRITICAL: Disconnect and cleanup this call's STT instance
