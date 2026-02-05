@@ -2460,10 +2460,21 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         import time
         active_calls = []
         current_time = time.time()
+        stale_calls = []  # Track stale calls to remove
 
         for call_sid, context in self._conversations.items():
+            # Skip ended calls (they may still be in cleanup)
+            if context.state == ConversationState.ENDED:
+                continue
+
             # Calculate duration in seconds
             duration = int(current_time - context.start_time)
+
+            # Mark calls older than 2 hours as stale (likely orphaned)
+            if duration > 7200:  # 2 hours
+                stale_calls.append(call_sid)
+                logger.warning(f"Orchestrator: Stale call detected and removed: {call_sid} (duration: {duration}s)")
+                continue
 
             active_calls.append({
                 "call_sid": call_sid,
@@ -2474,6 +2485,11 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 "duration_seconds": duration,
                 "turn_count": context.turn_count
             })
+
+        # Clean up stale calls
+        for call_sid in stale_calls:
+            if call_sid in self._conversations:
+                del self._conversations[call_sid]
 
         return active_calls
 
