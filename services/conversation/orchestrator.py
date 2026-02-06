@@ -428,6 +428,32 @@ HANDLING UNCLEAR/GARBLED SPEECH:
 
 Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and helpful. Be human and natural."""
 
+    def _get_time_greeting(self, language: str = "en") -> str:
+        """
+        Get appropriate time-based greeting based on current Toronto time.
+
+        Args:
+            language: 'en' for English, 'ar' for Arabic
+
+        Returns:
+            Time-appropriate greeting string
+        """
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        toronto_tz = ZoneInfo("America/Toronto")
+        current_hour = datetime.now(toronto_tz).hour
+
+        if 5 <= current_hour < 12:
+            # Morning: 5 AM - 12 PM
+            return "صباح الخير" if language == "ar" else "Good morning"
+        elif 12 <= current_hour < 17:
+            # Afternoon: 12 PM - 5 PM
+            return "مساء الخير" if language == "ar" else "Good afternoon"
+        else:
+            # Evening/Night: 5 PM - 5 AM
+            return "مساء الخير" if language == "ar" else "Good evening"
+
     async def _generate_greeting(self, context: ConversationContext) -> str:
         """
         Generate greeting via LLM based on caller context.
@@ -437,30 +463,38 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         from services.llm.llm_base import LLMRequest
 
         try:
+            # Get time-based greeting
+            caller_lang = context.language if context.language and context.language != "auto" else "en"
+            time_greeting = self._get_time_greeting(caller_lang)
+            time_greeting_en = self._get_time_greeting("en")
+            time_greeting_ar = self._get_time_greeting("ar")
+
             if context.caller_name and context.language and context.language != "auto":
                 # Known caller with language preference
                 greeting_prompt = (
                     f"You are Sarah, phone receptionist at Flexible Accounting. "
                     f"A returning caller just picked up the phone. Their name is {context.caller_name} "
                     f"and they prefer {'Arabic' if context.language == 'ar' else 'English'}. "
-                    f"Generate a warm, brief greeting (1 sentence max). Introduce yourself as Sarah. "
+                    f"The current time greeting is '{time_greeting}'. "
+                    f"Generate a warm, brief greeting (1 sentence max). START with the time greeting, then introduce yourself as Sarah. "
                     f"Use their name. Speak in their preferred language. Ask how you can help today. "
-                    f"Example Arabic: 'مرحباً مروان! أنا سارة من فليكسبل أكاونتنغ، كيف بإمكاني مساعدتك؟' "
-                    f"Example English: 'Hey Marwan! It's Sarah from Flexible Accounting. How can I help you today?'"
+                    f"Example Arabic: '{time_greeting_ar} مروان! أنا سارة من فليكسبل أكاونتنغ، كيف بإمكاني مساعدتك؟' "
+                    f"Example English: '{time_greeting_en} Marwan! It's Sarah from Flexible Accounting. How can I help you today?'"
                 )
             elif context.caller_name:
                 # Known caller, unknown language
                 greeting_prompt = (
                     f"You are Sarah, phone receptionist at Flexible Accounting. "
                     f"A returning caller just picked up the phone. Their name is {context.caller_name}. "
-                    f"Generate a warm, brief greeting (1 sentence max) in English. Introduce yourself as Sarah. "
+                    f"The current time greeting is '{time_greeting_en}'. "
+                    f"Generate a warm, brief greeting (1 sentence max) in English. START with the time greeting, then introduce yourself as Sarah. "
                     f"Use their name. Ask how you can help today. "
-                    f"Example: 'Hey {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?'"
+                    f"Example: '{time_greeting_en} {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?'"
                 )
             else:
-                # New caller — use hardcoded short greeting (LLM greetings are too wordy)
+                # New caller — use hardcoded short greeting with time-based greeting
                 # Name will be asked naturally by LLM after caller picks a language
-                return "Hello, thank you for calling Flexible Accounting. My name is Sarah. I can assist you in English or Arabic — which would you prefer?"
+                return f"{time_greeting_en}, thank you for calling Flexible Accounting. My name is Sarah. I can assist you in English or Arabic — which would you prefer?"
 
             request = LLMRequest(
                 messages=[Message(role=LLMRole.USER, content=greeting_prompt)],
@@ -479,14 +513,17 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         except Exception as e:
             logger.warning(f"Orchestrator: LLM greeting failed, using fallback: {e}")
 
-        # Fallback — simple templates if LLM fails (always include Sarah's name)
+        # Fallback — simple templates if LLM fails (always include Sarah's name and time greeting)
+        time_greeting_en = self._get_time_greeting("en")
+        time_greeting_ar = self._get_time_greeting("ar")
+
         if context.caller_name:
             if context.language == "ar":
-                return f"مرحباً {context.caller_name}! أنا سارة من فليكسبل أكاونتنغ، كيف بإمكاني مساعدتك؟"
+                return f"{time_greeting_ar} {context.caller_name}! أنا سارة من فليكسبل أكاونتنغ، كيف بإمكاني مساعدتك؟"
             else:
-                return f"Hey {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?"
+                return f"{time_greeting_en} {context.caller_name}! It's Sarah from Flexible Accounting. How can I help you today?"
         else:
-            return "Hello, thank you for calling Flexible Accounting. My name is Sarah. I can assist you in English or Arabic — which would you prefer?"
+            return f"{time_greeting_en}, thank you for calling Flexible Accounting. My name is Sarah. I can assist you in English or Arabic — which would you prefer?"
 
     async def handle_call(self, call_sid: str, phone_number: str, websocket, stream_sid: str = "") -> None:
         """
