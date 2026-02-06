@@ -254,12 +254,18 @@ class ConversationOrchestrator:
 
         # Inject today's date so the LLM can calculate correct dates
         from pytz import timezone as pytz_timezone
+        from datetime import timedelta
         toronto_tz = pytz_timezone("America/Toronto")
         today = datetime.now(toronto_tz)
         today_str = today.strftime('%A, %B %d, %Y')  # e.g. "Friday, January 30, 2026"
+        today_weekday = today.strftime('%A')  # e.g. "Friday"
+
+        # Calculate tomorrow for weekend validation
+        tomorrow = today + timedelta(days=1)
+        tomorrow_str = tomorrow.strftime('%A, %B %d')  # e.g. "Saturday, January 31"
+        tomorrow_weekday = tomorrow.strftime('%A')  # e.g. "Saturday"
 
         # Calculate max booking date (2 business days from today)
-        from datetime import timedelta
         max_date = today.date()
         business_days_added = 0
         while business_days_added < 2:
@@ -291,6 +297,17 @@ You MUST validate that dates and days-of-week match. Callers often make mistakes
 - ALWAYS count the days from today to verify: today + 1 = tomorrow, today + 2 = day after, etc.
 - If the caller's day-of-week doesn't match their date, ASK for clarification before proceeding
 - Be helpful, not condescending - mistakes happen!
+
+⚠️⚠️⚠️ CRITICAL - WEEKEND VALIDATION ⚠️⚠️⚠️
+BEFORE calling check_appointment, YOU MUST verify the requested day is NOT a weekend:
+- Today is {today_str} ({today_weekday})
+- Tomorrow is {tomorrow_str} ({tomorrow_weekday})
+- OFFICE CLOSED: Saturday and Sunday ONLY
+- If caller asks for Saturday or Sunday (including "tomorrow" when tomorrow is a weekend):
+  * Do NOT say "yes I can book" or "let me check"
+  * IMMEDIATELY tell them: "I'm sorry, the office is closed on [Saturday/Sunday]. We're open Monday through Friday. Would you like to book for Monday instead?"
+  * In Arabic: "عذراً، المكتب مغلق يوم [السبت/الأحد]. نحن مفتوحين من الاثنين إلى الجمعة. تحب أحجز لك يوم الاثنين؟"
+- Example: If today is Friday and caller says "tomorrow", tomorrow is SATURDAY = CLOSED. Reject immediately!
 
 YOUR ROLE:
 - Be the first point of contact for callers
@@ -1375,6 +1392,29 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 logger.warning(f"Orchestrator: Using default appointment time: {appointment_time}")
 
             logger.info(f"Orchestrator: Final appointment time: {appointment_time} (from input: '{date_time_str}')")
+
+            # =====================================================
+            # VALIDATE: Weekend check - Office closed Sat/Sun
+            # =====================================================
+            requested_weekday = appointment_time.weekday()  # 0=Monday, 5=Saturday, 6=Sunday
+            if requested_weekday >= 5:  # Saturday or Sunday
+                day_name = "Saturday" if requested_weekday == 5 else "Sunday"
+                day_name_ar = "السبت" if requested_weekday == 5 else "الأحد"
+                # Suggest next Monday
+                days_until_monday = (7 - requested_weekday) % 7
+                if days_until_monday == 0:
+                    days_until_monday = 1  # If somehow on Monday, suggest tomorrow
+                next_monday = appointment_time.date() + timedelta(days=days_until_monday)
+                next_monday_str = next_monday.strftime('%A, %B %d')
+                next_monday_ar = self._format_date_arabic(next_monday)
+
+                logger.warning(f"Orchestrator: WEEKEND_CLOSED - Requested {day_name}, office closed")
+                return (
+                    f"WEEKEND_CLOSED: The office is CLOSED on {day_name}. "
+                    f"We are only open Monday through Friday. "
+                    f"Tell the caller: 'I'm sorry, but our office is closed on {day_name}. We're open Monday through Friday. Would you like to book for {next_monday_str} instead?' "
+                    f"In Arabic: 'عذراً، المكتب مغلق يوم {day_name_ar}. نحن مفتوحين من الاثنين إلى الجمعة. تحب أحجز لك يوم {next_monday_ar}؟'"
+                )
 
             # =====================================================
             # VALIDATE: Maximum 2 business days ahead
