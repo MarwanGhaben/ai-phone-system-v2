@@ -1885,9 +1885,9 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         # REAL-TIME DATE INJECTION - Computed fresh for EVERY call
         # =====================================================
         from pytz import timezone as pytz_timezone
-        from datetime import timedelta
+        from datetime import datetime as dt, timedelta
         toronto_tz = pytz_timezone("America/Toronto")
-        now_toronto = datetime.now(toronto_tz)
+        now_toronto = dt.now(toronto_tz)
         today_str = now_toronto.strftime('%A, %B %d, %Y')
         today_weekday = now_toronto.strftime('%A')
         tomorrow = now_toronto + timedelta(days=1)
