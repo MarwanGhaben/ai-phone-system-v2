@@ -265,6 +265,9 @@ class ConversationOrchestrator:
         tomorrow_str = tomorrow.strftime('%A, %B %d')  # e.g. "Saturday, January 31"
         tomorrow_weekday = tomorrow.strftime('%A')  # e.g. "Saturday"
 
+        # LOG the computed dates for debugging stale date issues
+        logger.info(f"Orchestrator: _system_prompt computing dates - Today={today_str}, Tomorrow={tomorrow_str} ({tomorrow_weekday})")
+
         # Calculate max booking date (2 business days from today)
         max_date = today.date()
         business_days_added = 0
@@ -1878,8 +1881,35 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         if not context:
             return "I apologize, I'm having technical difficulties."
 
+        # =====================================================
+        # REAL-TIME DATE INJECTION - Computed fresh for EVERY call
+        # =====================================================
+        from pytz import timezone as pytz_timezone
+        from datetime import timedelta
+        toronto_tz = pytz_timezone("America/Toronto")
+        now_toronto = datetime.now(toronto_tz)
+        today_str = now_toronto.strftime('%A, %B %d, %Y')
+        today_weekday = now_toronto.strftime('%A')
+        tomorrow = now_toronto + timedelta(days=1)
+        tomorrow_str = tomorrow.strftime('%A, %B %d')
+        tomorrow_weekday = tomorrow.strftime('%A')
+
+        # Log the computed dates for debugging
+        logger.info(f"Orchestrator: REAL-TIME DATE CHECK - Today={today_str} ({today_weekday}), Tomorrow={tomorrow_str} ({tomorrow_weekday})")
+
+        # Build real-time date context to prepend to system prompt
+        realtime_date_context = f"""
+⏰ REAL-TIME DATE CHECK (computed right now):
+- RIGHT NOW it is: {now_toronto.strftime('%I:%M %p')} on {today_str}
+- TODAY is: {today_weekday}, {now_toronto.strftime('%B %d, %Y')}
+- TOMORROW is: {tomorrow_weekday}, {tomorrow_str}
+- If tomorrow is Saturday or Sunday, the office is CLOSED. Otherwise it's OPEN.
+- IMPORTANT: If caller says "tomorrow" or "بكرة", that means {tomorrow_weekday} {tomorrow_str}.
+- You MUST use these dates - do NOT guess or use old information!
+"""
+
         # Build system prompt with caller context
-        system_prompt = self._system_prompt
+        system_prompt = self._system_prompt + realtime_date_context
 
         # Add caller context to prompt
         if context.caller_name:
