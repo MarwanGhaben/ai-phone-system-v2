@@ -252,31 +252,8 @@ class ConversationOrchestrator:
         accountant_names_en = acc_service.get_names_formatted("en")
         accountant_names_ar = acc_service.get_names_formatted("ar")
 
-        # Inject today's date so the LLM can calculate correct dates
-        from pytz import timezone as pytz_timezone
-        from datetime import timedelta
-        toronto_tz = pytz_timezone("America/Toronto")
-        today = datetime.now(toronto_tz)
-        today_str = today.strftime('%A, %B %d, %Y')  # e.g. "Friday, January 30, 2026"
-        today_weekday = today.strftime('%A')  # e.g. "Friday"
-
-        # Calculate tomorrow for weekend validation
-        tomorrow = today + timedelta(days=1)
-        tomorrow_str = tomorrow.strftime('%A, %B %d')  # e.g. "Saturday, January 31"
-        tomorrow_weekday = tomorrow.strftime('%A')  # e.g. "Saturday"
-
-        # LOG the computed dates for debugging stale date issues
-        logger.info(f"Orchestrator: _system_prompt computing dates - Today={today_str}, Tomorrow={tomorrow_str} ({tomorrow_weekday})")
-
-        # Calculate max booking date (2 business days from today)
-        max_date = today.date()
-        business_days_added = 0
-        while business_days_added < 2:
-            max_date += timedelta(days=1)
-            if max_date.weekday() < 5:  # Monday=0 to Friday=4
-                business_days_added += 1
-        max_booking_date_str = max_date.strftime('%A, %B %d')  # e.g. "Monday, February 09"
-        max_booking_date_ar = self._format_date_arabic(max_date)
+        # NOTE: ALL date information is injected in _get_ai_response() in real-time
+        # DO NOT put any date variables here - they will become stale!
 
         return f"""You are Sarah, a friendly and professional phone receptionist for Flexible Accounting (also known as iFlex Tax), a Canadian accounting firm.
 
@@ -285,32 +262,6 @@ YOUR IDENTITY:
 - You work at Flexible Accounting
 - Be warm, natural, and human - like a real person, not a robot
 - Use casual but professional tone
-
-TODAY'S DATE: {today_str}
-Use this to calculate correct dates. For example if today is Friday January 30, then:
-- "tomorrow" = Saturday, January 31
-- "Monday" or "next Monday" = Monday, February 02
-- "next week Tuesday" = Tuesday, February 03
-
-CRITICAL - DATE VALIDATION:
-You MUST validate that dates and days-of-week match. Callers often make mistakes. Use today's date ({today_str}) to calculate:
-- If caller says "Friday, February 17" but February 17 is actually a Tuesday, CORRECT them politely:
-  "I just want to confirm - February 17th is actually a Tuesday, not Friday. Would you like to book for Tuesday the 17th, or did you mean Friday the 14th?"
-  In Arabic: "بس حبيت أتأكد - السابع عشر من فبراير هو يوم الثلاثاء مش الجمعة. تحب تحجز الثلاثاء 17، ولا قصدك الجمعة 14؟"
-- ALWAYS count the days from today to verify: today + 1 = tomorrow, today + 2 = day after, etc.
-- If the caller's day-of-week doesn't match their date, ASK for clarification before proceeding
-- Be helpful, not condescending - mistakes happen!
-
-⚠️⚠️⚠️ CRITICAL - WEEKEND VALIDATION ⚠️⚠️⚠️
-BEFORE calling check_appointment, YOU MUST verify the requested day is NOT a weekend:
-- Today is {today_str} ({today_weekday})
-- Tomorrow is {tomorrow_str} ({tomorrow_weekday})
-- OFFICE CLOSED: Saturday and Sunday ONLY
-- If caller asks for Saturday or Sunday (including "tomorrow" when tomorrow is a weekend):
-  * Do NOT say "yes I can book" or "let me check"
-  * IMMEDIATELY tell them: "I'm sorry, the office is closed on [Saturday/Sunday]. We're open Monday through Friday. Would you like to book for Monday instead?"
-  * In Arabic: "عذراً، المكتب مغلق يوم [السبت/الأحد]. نحن مفتوحين من الاثنين إلى الجمعة. تحب أحجز لك يوم الاثنين؟"
-- Example: If today is Friday and caller says "tomorrow", tomorrow is SATURDAY = CLOSED. Reject immediately!
 
 YOUR ROLE:
 - Be the first point of contact for callers
@@ -351,18 +302,14 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - ⚠️ FRIDAY IS A WORKDAY ⚠️: The office IS OPEN on Friday (الجمعة). This is a Canadian business following North American schedule, NOT Middle Eastern schedule. NEVER tell a caller that Friday is closed or a weekend day.
 - If caller asks for Friday: ACCEPT IT - Friday is a normal workday!
 - If caller asks for Saturday or Sunday: ONLY THEN say those are the closed days and suggest Friday or Monday instead.
-- ⚠️ CRITICAL - 2 BUSINESS DAY LIMIT ⚠️: We can ONLY book appointments up to 2 BUSINESS DAYS in advance. Today is {today_str}, so the MAXIMUM booking date is {max_booking_date_str}.
-  * If caller requests ANY date after {max_booking_date_str}, you MUST IMMEDIATELY reject it BEFORE calling check_appointment.
-  * Say: "We can only book up to 2 business days ahead. The latest I can book is {max_booking_date_str}. Would you like that instead?"
-  * In Arabic: "نقدر نحجز لمدة يومين عمل فقط. أقصى تاريخ متاح هو {max_booking_date_ar}. تحب أحجز لك هذا اليوم؟"
-  * Do NOT say "I'll check" for dates beyond {max_booking_date_str} - just reject immediately.
+- ⚠️ CRITICAL - 2 BUSINESS DAY LIMIT ⚠️: We can ONLY book appointments up to 2 BUSINESS DAYS in advance. Check the REAL-TIME DATE section below for exact dates.
 - Ask: Individual or corporate client?
 - Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
 - STEP 1: Call check_appointment to check availability. NEVER call confirm_appointment without checking first.
-- STEP 2: If SLOT_AVAILABLE, tell the caller the time is available and ASK them to confirm before booking. Example: "The appointment with Rami on Monday, February 02 at 2:00 PM is available. Would you like me to go ahead and book it?"
+- STEP 2: If SLOT_AVAILABLE, tell the caller the time is available and ASK them to confirm before booking.
 - STEP 3: ONLY after the caller says YES/confirms, call confirm_appointment with confirm=true. If they say no, call confirm_appointment with confirm=false.
-- CRITICAL: date_time parameter MUST be in "YYYY-MM-DD HH:MM" format (24-hour). Use today's date ({today_str}) to calculate. NEVER pass Arabic text as date_time.
+- CRITICAL: date_time parameter MUST be in "YYYY-MM-DD HH:MM" format (24-hour). Use the REAL-TIME DATE section below to calculate. NEVER pass Arabic text as date_time.
 - CRITICAL: accountant_name parameter MUST be the English name (e.g. "Hussam Saadaldin", "Rami Kahwaji", "Abdul ElFarra"). NEVER pass Arabic names.
 - IMPORTANT: Callers may mispronounce or approximate accountant names. Match to the closest name: "Husain"/"Hussein"/"Hosam" → "Hussam Saadaldin", "Rami"/"رامي" → "Rami Kahwaji", "Abdul"/"عبدول" → "Abdul ElFarra". NEVER say "we don't have that accountant" if the name is close to one on the list.
 - IMPORTANT: SLOT_BUSY/SCHEDULE_FULL means the ACCOUNTANT is busy, NOT that the office is closed. The office is open Monday through Friday (including Friday!). ONLY Saturday and Sunday are when the office is closed.
@@ -1883,6 +1830,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
         # =====================================================
         # REAL-TIME DATE INJECTION - Computed fresh for EVERY call
+        # This is the ONLY source of truth for dates!
         # =====================================================
         from pytz import timezone as pytz_timezone
         from datetime import datetime as dt, timedelta
@@ -1890,22 +1838,52 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         now_toronto = dt.now(toronto_tz)
         today_str = now_toronto.strftime('%A, %B %d, %Y')
         today_weekday = now_toronto.strftime('%A')
+        today_date_only = now_toronto.strftime('%B %d')
         tomorrow = now_toronto + timedelta(days=1)
         tomorrow_str = tomorrow.strftime('%A, %B %d')
         tomorrow_weekday = tomorrow.strftime('%A')
 
-        # Log the computed dates for debugging
-        logger.info(f"Orchestrator: REAL-TIME DATE CHECK - Today={today_str} ({today_weekday}), Tomorrow={tomorrow_str} ({tomorrow_weekday})")
+        # Calculate max booking date (2 business days from today)
+        max_date = now_toronto.date()
+        business_days_added = 0
+        while business_days_added < 2:
+            max_date += timedelta(days=1)
+            if max_date.weekday() < 5:  # Monday=0 to Friday=4
+                business_days_added += 1
+        max_booking_date_str = max_date.strftime('%A, %B %d')
+        max_booking_date_ar = self._format_date_arabic(max_date)
 
-        # Build real-time date context to prepend to system prompt
+        # Log the computed dates for debugging
+        logger.info(f"Orchestrator: REAL-TIME DATE CHECK - Today={today_str} ({today_weekday}), Tomorrow={tomorrow_str} ({tomorrow_weekday}), MaxBooking={max_booking_date_str}")
+
+        # Build real-time date context - THIS IS THE ONLY DATE INFO THE AI SEES
         realtime_date_context = f"""
-⏰ REAL-TIME DATE CHECK (computed right now):
-- RIGHT NOW it is: {now_toronto.strftime('%I:%M %p')} on {today_str}
-- TODAY is: {today_weekday}, {now_toronto.strftime('%B %d, %Y')}
-- TOMORROW is: {tomorrow_weekday}, {tomorrow_str}
-- If tomorrow is Saturday or Sunday, the office is CLOSED. Otherwise it's OPEN.
-- IMPORTANT: If caller says "tomorrow" or "بكرة", that means {tomorrow_weekday} {tomorrow_str}.
-- You MUST use these dates - do NOT guess or use old information!
+
+═══════════════════════════════════════════════════════════════
+⏰ REAL-TIME DATE (THIS IS THE CURRENT DATE - USE THESE VALUES)
+═══════════════════════════════════════════════════════════════
+RIGHT NOW: {now_toronto.strftime('%I:%M %p')} Toronto time
+TODAY: {today_weekday}, {today_str}
+TOMORROW: {tomorrow_weekday}, {tomorrow_str}
+MAXIMUM BOOKING DATE: {max_booking_date_str} (2 business days limit)
+MAXIMUM BOOKING DATE (Arabic): {max_booking_date_ar}
+
+DATE CALCULATIONS FROM TODAY ({today_date_only}):
+- "tomorrow" / "بكرة" = {tomorrow_weekday}, {tomorrow_str}
+- "day after tomorrow" = {(now_toronto + timedelta(days=2)).strftime('%A, %B %d')}
+
+⚠️ WEEKEND CHECK:
+- Tomorrow ({tomorrow_weekday}) is {"CLOSED (weekend)" if tomorrow.weekday() >= 5 else "OPEN (workday)"}
+- If caller asks for Saturday or Sunday: IMMEDIATELY say office is closed, suggest Monday
+
+⚠️ 2 BUSINESS DAY LIMIT:
+- Latest bookable date: {max_booking_date_str}
+- If caller asks for ANY date after {max_booking_date_str}, IMMEDIATELY reject
+- Say: "We can only book up to 2 business days ahead. The latest I can book is {max_booking_date_str}."
+- Arabic: "نقدر نحجز لمدة يومين عمل فقط. أقصى تاريخ متاح هو {max_booking_date_ar}."
+
+CRITICAL: Use ONLY these dates. Do NOT use any other date information!
+═══════════════════════════════════════════════════════════════
 """
 
         # Build system prompt with caller context
