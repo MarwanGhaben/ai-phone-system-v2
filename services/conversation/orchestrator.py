@@ -1697,6 +1697,11 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         phone = context.phone_number
         calendar = get_calendar_service()
 
+        # Speak a "please hold" message before the API call
+        hold_message = "لحظة من فضلك، جاري البحث عن مواعيدك..." if context.language == "ar" else "One moment please, let me look up your appointments..."
+        await self._speak_to_caller(call_sid, hold_message, context.language or "en")
+        logger.info(f"Orchestrator: Spoke hold message before lookup API call")
+
         try:
             appointments = await calendar.get_customer_appointments(phone)
 
@@ -1761,6 +1766,11 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             return "CANCEL_ERROR: No appointment found. Call lookup_my_bookings first to find the appointment."
 
         calendar = get_calendar_service()
+
+        # Speak a "please hold" message before the API call
+        hold_message = "لحظة من فضلك، جاري إلغاء الموعد..." if (context and context.language == "ar") else "One moment please, I'm cancelling that appointment..."
+        await self._speak_to_caller(call_sid, hold_message, context.language if context else "en")
+        logger.info(f"Orchestrator: Spoke hold message before cancel API call")
 
         try:
             success = await calendar.cancel_appointment(appointment_id)
