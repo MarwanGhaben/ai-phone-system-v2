@@ -277,7 +277,7 @@ class ElevenLabsTTS(TTSServiceBase):
         }
         params = {
             "output_format": self.output_format,
-            "optimize_streaming_latency": "3",  # Max latency optimization for faster TTFB
+            "optimize_streaming_latency": "2",  # Level 2: balanced quality + speed (was 3 = max latency but lower quality)
         }
         body = {
             "text": request.text,
@@ -328,6 +328,37 @@ class ElevenLabsTTS(TTSServiceBase):
         """Stop current synthesis"""
         self._stop_event.set()
         self._status = TTSStatus.IDLE
+
+    async def prewarm(self) -> bool:
+        """
+        Pre-warm the HTTP connection pool to ElevenLabs API.
+
+        Eliminates the "underwater" / cold-start audio quality issue on the
+        first call after app restart by establishing TCP/TLS connections
+        and DNS cache before any real call happens.
+
+        Returns:
+            True if prewarm succeeded, False otherwise
+        """
+        if not HTTPX_AVAILABLE:
+            return False
+        try:
+            logger.info("ElevenLabs: Pre-warming HTTP connection pool...")
+            client = await self._get_http_client()
+            # Lightweight call to /user endpoint - establishes connection without using TTS credits
+            response = await client.get(
+                "https://api.elevenlabs.io/v1/user",
+                headers={"xi-api-key": self.api_key},
+                timeout=10.0,
+            )
+            if response.status_code == 200:
+                logger.info("ElevenLabs: Connection pool warmed up successfully")
+                return True
+            logger.warning(f"ElevenLabs: Prewarm got status {response.status_code}")
+            return False
+        except Exception as e:
+            logger.warning(f"ElevenLabs: Prewarm failed (non-critical): {e}")
+            return False
 
     async def get_available_voices(self, language: str = "all") -> List[dict]:
         """

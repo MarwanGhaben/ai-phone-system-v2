@@ -52,6 +52,16 @@ async def lifespan(app: FastAPI):
     reminder_scheduler.start()
     logger.info("SMS reminder scheduler started")
 
+    # Pre-warm ElevenLabs HTTP connection pool to eliminate cold-start audio issues
+    # Without this, the first call after restart has "underwater" audio for ~5s
+    try:
+        from services.tts.elevenlabs_service import create_elevenlabs_tts
+        tts_service = create_elevenlabs_tts(settings.model_dump())
+        if tts_service:
+            await tts_service.prewarm()
+    except Exception as e:
+        logger.warning(f"TTS prewarm skipped: {e}")
+
     yield
 
     # Stop reminder scheduler

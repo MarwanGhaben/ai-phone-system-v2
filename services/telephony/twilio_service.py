@@ -341,9 +341,14 @@ class TwilioMediaStreamHandler:
 
         CHUNK_SIZE = 160  # 20ms at 8kHz ulaw
         CHUNK_INTERVAL = 0.015  # Send slightly faster than real-time
+        # Pre-buffer 200ms (10 chunks) before starting to send to Twilio.
+        # This prevents buffer underrun at the start (the "underwater" sound)
+        # when ElevenLabs chunks arrive irregularly during cold start.
+        PREBUFFER_BYTES = CHUNK_SIZE * 10  # 200ms at 8kHz ulaw
         buffer = bytearray()
         total_bytes = 0
         chunks_sent = 0
+        prebuffered = False
 
         try:
             async for audio_data in audio_stream:
@@ -353,6 +358,14 @@ class TwilioMediaStreamHandler:
                     break
 
                 buffer.extend(audio_data)
+
+                # Wait until we have enough pre-buffer before sending the first chunk.
+                # After that, stream normally as chunks arrive.
+                if not prebuffered:
+                    if len(buffer) < PREBUFFER_BYTES:
+                        continue
+                    prebuffered = True
+                    logger.info(f"Twilio: Pre-buffer filled ({len(buffer)} bytes), starting playback")
 
                 # Send complete 160-byte chunks as they accumulate
                 while len(buffer) >= CHUNK_SIZE:
