@@ -77,6 +77,11 @@ class ConversationContext:
     # Found appointments (set by lookup_my_bookings, used by cancel_booking)
     found_appointments: Optional[list] = None
 
+    # Booking completion flag - prevents LLM from re-attempting booking after success
+    # Set to True after BOOKING_SUCCESS, checked and cleared on next turn
+    booking_just_completed: bool = False
+    last_booking_summary: Optional[str] = None  # e.g. "Thursday, May 28 at 12:00 PM with Hussam"
+
     # =====================================================
     # CONVERSATION HISTORY (Phase 1.2 fix)
     # =====================================================
@@ -1596,8 +1601,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                     language=caller_lang,
                 ))
 
-                # Clear pending booking
+                # Clear pending booking and set completion flag
                 context.pending_booking = None
+                context.booking_just_completed = True
+                context.last_booking_summary = f"{display_time} with {display_staff}"
 
                 return f"BOOKING_SUCCESS: Appointment booked successfully. Appointment ID: {result.appointment_id}. Time: {result.start_time}. Staff: {result.staff_name or pending['staff_name']}. Customer: {result.customer_name}."
             else:
@@ -1896,6 +1903,31 @@ CRITICAL: Use ONLY these dates. Do NOT use any other date information!
             system_prompt += "\n\nCALLER CONTEXT:\n- The caller's name is NOT yet known.\n- CRITICAL: As soon as the caller says their name, you MUST call the register_caller_name tool IMMEDIATELY. This is required before any booking can use their name.\n- If you already asked for their name and they reply with something that sounds like a name, call register_caller_name right away.\n- Also use their name in the booking (customer_name parameter) when they book an appointment."
 
         # =====================================================
+        # BOOKING COMPLETION GUARD
+        # =====================================================
+        # If a booking was just completed, inject a strong instruction to prevent
+        # the LLM from hallucinating another booking call when caller says "thanks"
+        if context.booking_just_completed:
+            system_prompt += f"""
+
+═══════════════════════════════════════════════════════════════
+✅ BOOKING JUST COMPLETED - DO NOT RE-BOOK
+═══════════════════════════════════════════════════════════════
+You JUST successfully booked an appointment: {context.last_booking_summary}
+The caller's next message is likely "thanks" or "goodbye".
+
+CRITICAL INSTRUCTIONS:
+1. Do NOT call check_appointment or confirm_appointment again
+2. Do NOT ask about booking details or times
+3. Simply respond warmly: "You're welcome! Is there anything else?" / "عفواً! هل هناك شيء آخر؟"
+4. If caller says "no" / "bye" / "شكراً" / "مع السلامة", say goodbye and call end_call
+═══════════════════════════════════════════════════════════════
+"""
+            # Clear the flag after injecting (one-shot guard)
+            context.booking_just_completed = False
+            logger.info(f"Orchestrator: Booking completion guard active for {context.last_booking_summary}")
+
+        # =====================================================
         # BUILD MESSAGES WITH CONVERSATION HISTORY (Phase 1.2)
         # =====================================================
         messages = [
@@ -2076,7 +2108,13 @@ CRITICAL: Use ONLY these dates. Do NOT use any other date information!
                                 f"Do NOT say there was an error. Keep it brief.]"
                             )))
                         else:
-                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Reply in ONE short sentence (max 10 words). For unavailable: just say the time is taken and give ONE alternative. For confirmed: 'تم الحجز.' Do NOT list multiple times. Do NOT add 'anything else?'.]"))
+                            # Differentiate response based on result type
+                            if "BOOKING_SUCCESS" in booking_result:
+                                # Confirmed: short confirmation + warm close
+                                messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Reply briefly: confirm the booking and ask 'Is there anything else I can help with?' / 'هل تحتاج شيء آخر؟']"))
+                            else:
+                                # Unavailable/busy: short + one alternative
+                                messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Reply in ONE short sentence (max 10 words). Just say the time is taken and give ONE alternative. Do NOT list multiple times.]"))
 
                         # Get final response (streaming, no tools)
                         follow_up_request = LLMRequest(

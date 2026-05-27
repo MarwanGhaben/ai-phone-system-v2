@@ -107,6 +107,8 @@ services:
       # Environment
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Timezone - critical for calendar availability checks
+      TZ: America/Toronto
       # Public domain for external access (Twilio webhooks, WebSocket URLs)
       PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-}
 
