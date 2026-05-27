@@ -1544,6 +1544,12 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         # Use the latest caller name from context (may have been registered after check_appointment)
         customer_name = context.caller_name or pending.get("customer_name") or "Phone Caller"
 
+        # Speak a "please hold" message before the slow API call
+        # This prevents awkward silence while MS Bookings processes (can take 30-40s)
+        hold_message = "لحظة من فضلك، جاري الحجز..." if context.language == "ar" else "One moment please, I'm booking that for you..."
+        await self._speak_to_caller(call_sid, hold_message, context.language or "en")
+        logger.info(f"Orchestrator: Spoke hold message before booking API call")
+
         try:
             result = await calendar.create_booking(
                 service_id=pending["service_id"],
