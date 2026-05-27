@@ -248,6 +248,69 @@ class ConversationOrchestrator:
         month_name = arabic_months.get(date.month, "")
         return f"{day_name} {day_num} من {month_name}"
 
+    def _parse_tool_arguments(self, tool_name: str, raw_args: str) -> Optional[dict]:
+        """
+        Parse LLM tool call arguments with error recovery.
+
+        LLMs occasionally emit malformed JSON, especially with Arabic text
+        or special characters in strings. This method tries:
+        1. Standard json.loads
+        2. Repair common issues (unterminated strings, trailing commas)
+        3. Returns None if all attempts fail (caller handles gracefully)
+        """
+        import json as _json
+        import re
+
+        # Attempt 1: Standard parse
+        try:
+            return _json.loads(raw_args)
+        except _json.JSONDecodeError as e:
+            logger.warning(f"Orchestrator: Tool args JSON parse failed for {tool_name}: {e}. Raw: {raw_args!r}")
+
+        # Attempt 2: Repair common issues
+        try:
+            repaired = raw_args.strip()
+            # Strip trailing commas before } or ]
+            repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+            # Close unterminated string if missing final quote before }
+            if repaired.count('"') % 2 == 1:
+                # Odd number of quotes — try adding one before final brace
+                if repaired.endswith('}'):
+                    repaired = repaired[:-1] + '"}'
+                else:
+                    repaired = repaired + '"}'
+            # If no closing brace, add one
+            if not repaired.endswith('}'):
+                repaired = repaired + '}'
+            result = _json.loads(repaired)
+            logger.info(f"Orchestrator: Tool args repaired successfully for {tool_name}")
+            return result
+        except Exception as e:
+            logger.warning(f"Orchestrator: Tool args repair failed for {tool_name}: {e}")
+
+        # Attempt 3: Extract simple key-value pairs with regex (last resort)
+        try:
+            result = {}
+            for match in re.finditer(r'"(\w+)"\s*:\s*"([^"]*)"', raw_args):
+                result[match.group(1)] = match.group(2)
+            for match in re.finditer(r'"(\w+)"\s*:\s*(true|false|null|\d+)', raw_args):
+                val = match.group(2)
+                if val == 'true':
+                    result[match.group(1)] = True
+                elif val == 'false':
+                    result[match.group(1)] = False
+                elif val == 'null':
+                    result[match.group(1)] = None
+                else:
+                    result[match.group(1)] = int(val)
+            if result:
+                logger.info(f"Orchestrator: Tool args extracted via regex for {tool_name}: {result}")
+                return result
+        except Exception as e:
+            logger.warning(f"Orchestrator: Tool args regex extraction failed for {tool_name}: {e}")
+
+        return None
+
     def _get_system_prompt(self) -> str:
         """Get system prompt for LLM"""
         # Get accountant names from service
@@ -1983,8 +2046,18 @@ CRITICAL INSTRUCTIONS:
             if llm_response.tool_calls:
                 for tool_call in llm_response.tool_calls:
                     tool_name = tool_call["name"]
-                    import json as _json
-                    arguments = _json.loads(tool_call["arguments"])
+                    raw_args = tool_call["arguments"]
+                    arguments = self._parse_tool_arguments(tool_name, raw_args)
+                    if arguments is None:
+                        # Parsing failed even after repair attempts - apologize and continue
+                        logger.error(f"Orchestrator: Could not parse tool arguments for {tool_name}, raw={raw_args!r}")
+                        apology = (
+                            "عذراً، ممكن تعيد طلبك مرة ثانية؟"
+                            if context and context.language == "ar"
+                            else "Sorry, could you repeat that please?"
+                        )
+                        context.add_assistant_message(apology)
+                        return apology
                     logger.info(f"Orchestrator: LLM requested {tool_name}: {arguments}")
 
                     # --- Register caller name (LLM extracts it naturally) ---
