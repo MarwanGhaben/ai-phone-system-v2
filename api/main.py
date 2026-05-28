@@ -19,6 +19,7 @@ from services.security.middleware import (
     RateLimitMiddleware,
     validate_twilio_signature,
 )
+from services.dashboard.dashboard_routes import require_auth
 
 
 # Get settings
@@ -124,7 +125,7 @@ async def health_check():
 
 
 @app.get("/api/diagnostics")
-async def diagnostics():
+async def diagnostics(user: dict = Depends(require_auth)):
     """
     Diagnostic endpoint to check all services
     """
@@ -360,7 +361,7 @@ async def websocket_call_handler(websocket: WebSocket):
 # =====================================================
 
 @app.get("/api/stats")
-async def get_stats():
+async def get_stats(user: dict = Depends(require_auth)):
     """Get platform statistics"""
     return {
         "active_calls": len(get_orchestrator()._conversations),
@@ -370,7 +371,7 @@ async def get_stats():
 
 
 @app.get("/api/calls")
-async def list_calls():
+async def list_calls(user: dict = Depends(require_auth)):
     """List recent calls (TODO: implement database query)"""
     return {
         "calls": []  # TODO: Query from database
@@ -384,35 +385,35 @@ async def list_calls():
 from services.dashboard.dashboard_service import get_dashboard_service
 
 @app.get("/api/dashboard/operational")
-async def get_operational_overview():
+async def get_operational_overview(user: dict = Depends(require_auth)):
     """Get operational overview for dashboard"""
     dashboard = get_dashboard_service()
     return await dashboard.get_operational_overview()
 
 
 @app.get("/api/dashboard/calls")
-async def get_dashboard_call_analytics():
+async def get_dashboard_call_analytics(user: dict = Depends(require_auth)):
     """Get call analytics for dashboard"""
     dashboard = get_dashboard_service()
     return await dashboard.get_call_analytics()
 
 
 @app.get("/api/dashboard/api-usage")
-async def get_dashboard_api_monitoring():
+async def get_dashboard_api_monitoring(user: dict = Depends(require_auth)):
     """Get API usage monitoring for dashboard"""
     dashboard = get_dashboard_service()
     return await dashboard.get_api_monitoring()
 
 
 @app.get("/api/dashboard/health")
-async def get_dashboard_system_health():
+async def get_dashboard_system_health(user: dict = Depends(require_auth)):
     """Get system health for dashboard"""
     dashboard = get_dashboard_service()
     return await dashboard.get_system_health()
 
 
 @app.get("/api/dashboard/bookings")
-async def get_dashboard_bookings():
+async def get_dashboard_bookings(user: dict = Depends(require_auth)):
     """Get bookings overview for dashboard"""
     dashboard = get_dashboard_service()
     return await dashboard.get_bookings_overview()
@@ -425,7 +426,7 @@ async def get_dashboard_bookings():
 from services.knowledge.faq_service import get_kb_service
 
 @app.get("/api/accountants")
-async def get_accountants():
+async def get_accountants(user: dict = Depends(require_auth)):
     """Get all accountants from configuration"""
     from services.config.accountants_service import get_accountants_service
     acc_service = get_accountants_service()
@@ -433,7 +434,7 @@ async def get_accountants():
 
 
 @app.get("/api/callers/recent")
-async def get_recent_callers(limit: int = 10):
+async def get_recent_callers(user: dict = Depends(require_auth), limit: int = 10):
     """Get recent callers"""
     from services.callers.caller_service import get_caller_service
     caller_service = get_caller_service()
@@ -441,7 +442,7 @@ async def get_recent_callers(limit: int = 10):
 
 
 @app.get("/api/callers/frequent")
-async def get_frequent_callers(limit: int = 5, min_calls: int = 2):
+async def get_frequent_callers(user: dict = Depends(require_auth), limit: int = 5, min_calls: int = 2):
     """Get frequent callers (VIPs)"""
     from services.callers.caller_service import get_caller_service
     caller_service = get_caller_service()
@@ -449,7 +450,7 @@ async def get_frequent_callers(limit: int = 5, min_calls: int = 2):
 
 
 @app.get("/api/callers/stats")
-async def get_caller_stats():
+async def get_caller_stats(user: dict = Depends(require_auth)):
     """Get caller statistics"""
     from services.callers.caller_service import get_caller_service
     caller_service = get_caller_service()
@@ -466,14 +467,14 @@ async def get_caller_stats():
 
 
 @app.get("/api/kb/categories")
-async def get_kb_categories():
+async def get_kb_categories(user: dict = Depends(require_auth)):
     """Get all FAQ categories"""
     kb = get_kb_service()
     return {"categories": kb.get_all_categories()}
 
 
 @app.get("/api/kb/faqs")
-async def get_kb_faqs(language: str = "en", category: str = None):
+async def get_kb_faqs(user: dict = Depends(require_auth), language: str = "en", category: str = None):
     """Get all FAQs, optionally filtered by category"""
     kb = get_kb_service()
 
@@ -492,7 +493,7 @@ async def get_kb_faqs(language: str = "en", category: str = None):
 from services.calendar.ms_bookings_service import get_calendar_service
 
 @app.get("/api/calendar/staff")
-async def get_calendar_staff():
+async def get_calendar_staff(user: dict = Depends(require_auth)):
     """Get all staff members from calendar"""
     calendar = get_calendar_service()
     staff = await calendar.get_staff_members()
@@ -505,7 +506,7 @@ async def get_calendar_staff():
 
 
 @app.get("/api/calendar/services")
-async def get_calendar_services():
+async def get_calendar_services(user: dict = Depends(require_auth)):
     """Get all services from calendar"""
     calendar = get_calendar_service()
     services = await calendar.get_services()
@@ -524,7 +525,7 @@ async def get_calendar_services():
 
 
 @app.get("/api/calendar/availability")
-async def get_calendar_availability(service_id: str, staff_id: str = None, days_ahead: int = 7):
+async def get_calendar_availability(user: dict = Depends(require_auth), service_id: str = None, staff_id: str = None, days_ahead: int = 7):
     """Get available time slots"""
     calendar = get_calendar_service()
     slots = await calendar.get_available_slots(service_id, staff_id, days_ahead)
