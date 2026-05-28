@@ -5,11 +5,15 @@ AI Voice Platform v2 - Appointment Reminder Scheduler
 
 Schedules and sends SMS reminders 24 hours before appointments.
 Persists pending reminders to disk so they survive restarts.
+
+Uses Redis distributed locking to prevent duplicate sends when
+running with multiple uvicorn workers.
 """
 
 import asyncio
 import json
 import os
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -23,7 +27,11 @@ class ReminderScheduler:
     - Stores reminders in a JSON file (data/reminders.json)
     - Checks every 60 seconds for reminders due
     - Marks reminders as sent so they aren't repeated
+    - Uses Redis locking to prevent duplicates across workers
     """
+
+    LOCK_KEY = "reminder_scheduler:process_lock"
+    LOCK_TTL = 30  # seconds
 
     def __init__(self, storage_path: str = None):
         if storage_path is None:
@@ -36,6 +44,8 @@ class ReminderScheduler:
         self._reminders = []
         self._load()
         self._task: Optional[asyncio.Task] = None
+        self._worker_id = str(uuid.uuid4())[:8]
+        self._redis = None
 
     def _load(self):
         """Load reminders from disk"""
@@ -56,6 +66,46 @@ class ReminderScheduler:
                 json.dump(self._reminders, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"Reminder scheduler: Failed to save: {e}")
+
+    async def _get_redis(self):
+        """Get Redis connection (lazy init)"""
+        if self._redis is None:
+            try:
+                import redis.asyncio as redis
+                redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+                self._redis = redis.from_url(redis_url)
+            except Exception as e:
+                logger.warning(f"Reminder scheduler: Redis not available: {e}")
+        return self._redis
+
+    async def _acquire_lock(self, lock_key: str) -> bool:
+        """Try to acquire a Redis lock (returns True if acquired)"""
+        redis_client = await self._get_redis()
+        if not redis_client:
+            return True  # No Redis = single worker assumed, proceed
+        try:
+            acquired = await redis_client.set(
+                lock_key,
+                self._worker_id,
+                nx=True,  # Only set if not exists
+                ex=self.LOCK_TTL,
+            )
+            return acquired is not None
+        except Exception as e:
+            logger.warning(f"Reminder scheduler: Lock acquire failed: {e}")
+            return True  # On error, proceed (better than never sending)
+
+    async def _release_lock(self, lock_key: str):
+        """Release a Redis lock (only if we own it)"""
+        redis_client = await self._get_redis()
+        if not redis_client:
+            return
+        try:
+            current = await redis_client.get(lock_key)
+            if current and current.decode() == self._worker_id:
+                await redis_client.delete(lock_key)
+        except Exception as e:
+            logger.warning(f"Reminder scheduler: Lock release failed: {e}")
 
     def schedule_reminder(
         self,
@@ -139,7 +189,7 @@ class ReminderScheduler:
         if self._task and not self._task.done():
             return
         self._task = asyncio.create_task(self._check_loop())
-        logger.info("Reminder scheduler: Background loop started")
+        logger.info(f"Reminder scheduler [{self._worker_id}]: Background loop started")
 
     def stop(self) -> None:
         """Stop the background loop"""
@@ -158,32 +208,53 @@ class ReminderScheduler:
             await asyncio.sleep(60)
 
     async def _process_due_reminders(self):
-        """Find and send any reminders that are due"""
-        now = datetime.now()
-        sent_count = 0
+        """Find and send any reminders that are due (with distributed locking)"""
+        # Acquire global process lock - only one worker processes at a time
+        if not await self._acquire_lock(self.LOCK_KEY):
+            return  # Another worker is processing
 
-        for reminder in self._reminders:
-            if reminder.get("sent"):
-                continue
+        try:
+            # Reload from disk in case another worker updated the file
+            self._load()
 
-            remind_at = datetime.fromisoformat(reminder["remind_at"])
-            if remind_at <= now:
-                # This reminder is due — send it
-                success = await self._send_reminder(reminder)
-                if success:
-                    reminder["sent"] = True
-                    reminder["sent_at"] = now.isoformat()
-                    sent_count += 1
+            now = datetime.now()
+            sent_count = 0
 
-        if sent_count > 0:
+            for reminder in self._reminders:
+                if reminder.get("sent"):
+                    continue
+
+                remind_at = datetime.fromisoformat(reminder["remind_at"])
+                if remind_at <= now:
+                    # Create a unique lock for this specific reminder
+                    reminder_lock_key = f"reminder:sent:{reminder['phone_number']}:{reminder['remind_at']}"
+                    if not await self._acquire_lock(reminder_lock_key):
+                        logger.debug(f"Reminder scheduler [{self._worker_id}]: Skipping (another worker handling)")
+                        continue
+
+                    # Double-check not sent (in case file was updated between load and lock)
+                    if reminder.get("sent"):
+                        continue
+
+                    # This reminder is due — send it
+                    success = await self._send_reminder(reminder)
+                    if success:
+                        reminder["sent"] = True
+                        reminder["sent_at"] = now.isoformat()
+                        self._save()  # Save immediately after each send
+                        sent_count += 1
+
+            if sent_count > 0:
+                logger.info(f"Reminder scheduler [{self._worker_id}]: Sent {sent_count} reminder(s)")
+
+            # Clean up old reminders (sent + appointment passed)
+            self._reminders = [
+                r for r in self._reminders
+                if not r.get("sent") or datetime.fromisoformat(r["appointment_dt"]) > now
+            ]
             self._save()
-            logger.info(f"Reminder scheduler: Sent {sent_count} reminder(s)")
-
-        # Clean up old reminders (sent + appointment passed)
-        self._reminders = [
-            r for r in self._reminders
-            if not r.get("sent") or datetime.fromisoformat(r["appointment_dt"]) > now
-        ]
+        finally:
+            await self._release_lock(self.LOCK_KEY)
 
     async def _send_reminder(self, reminder: dict) -> bool:
         """Send a single reminder SMS"""
@@ -203,10 +274,10 @@ class ReminderScheduler:
                 language=reminder.get("language", "en"),
             )
             if sent:
-                logger.info(f"Reminder scheduler: Sent reminder to {reminder['phone_number']}")
+                logger.info(f"Reminder scheduler [{self._worker_id}]: Sent reminder to {reminder['phone_number']}")
             return sent
         except Exception as e:
-            logger.error(f"Reminder scheduler: Failed to send: {e}")
+            logger.error(f"Reminder scheduler [{self._worker_id}]: Failed to send: {e}")
             return False
 
 
