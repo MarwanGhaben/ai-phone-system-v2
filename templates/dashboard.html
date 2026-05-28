@@ -1027,14 +1027,25 @@
         // API Base URL
         const API_BASE = '/dashboard/api';
 
+        // Authenticated fetch wrapper — redirects to login on 401
+        async function authFetch(url, options = {}) {
+            const response = await fetch(url, {
+                credentials: 'same-origin',
+                ...options,
+                headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
+            });
+            if (response.status === 401) {
+                window.location.href = '/dashboard/login';
+                return null;
+            }
+            return response;
+        }
+
         // Load user info
         async function loadUserInfo() {
             try {
-                const response = await fetch(`${API_BASE}/me`);
-                if (response.status === 401) {
-                    window.location.href = '/dashboard/login';
-                    return;
-                }
+                const response = await authFetch(`${API_BASE}/me`);
+                if (!response) return;
                 const data = await response.json();
                 document.getElementById('userName').textContent = data.username;
                 document.getElementById('userAvatar').textContent = data.username.charAt(0).toUpperCase();
@@ -1046,7 +1057,7 @@
         // Logout
         async function logout() {
             try {
-                await fetch(`${API_BASE}/logout`, { method: 'POST' });
+                await authFetch(`${API_BASE}/logout`, { method: 'POST' });
                 window.location.href = '/dashboard/login';
             } catch (error) {
                 console.error('Error logging out:', error);
@@ -1056,7 +1067,8 @@
         // Load system status
         async function loadSystemStatus() {
             try {
-                const response = await fetch(`${API_BASE}/system-status`);
+                const response = await authFetch(`${API_BASE}/system-status`);
+                if (!response) return;
                 const data = await response.json();
 
                 document.getElementById('uptime').textContent = data.uptime;
@@ -1073,7 +1085,8 @@
         // Load AI models
         async function loadAIModels() {
             try {
-                const response = await fetch(`${API_BASE}/ai-models`);
+                const response = await authFetch(`${API_BASE}/ai-models`);
+                if (!response) return;
                 const data = await response.json();
 
                 document.getElementById('llmModel').textContent = data.language_model;
@@ -1087,7 +1100,8 @@
         // Load CPU usage
         async function loadCPUUsage() {
             try {
-                const response = await fetch(`${API_BASE}/cpu-usage`);
+                const response = await authFetch(`${API_BASE}/cpu-usage`);
+                if (!response) return;
                 const data = await response.json();
 
                 document.getElementById('cpuPercent').textContent = data.current_percent;
@@ -1104,7 +1118,8 @@
         // Load memory usage
         async function loadMemoryUsage() {
             try {
-                const response = await fetch(`${API_BASE}/memory-usage`);
+                const response = await authFetch(`${API_BASE}/memory-usage`);
+                if (!response) return;
                 const data = await response.json();
 
                 document.getElementById('memoryUsed').textContent = data.used_gb;
@@ -1119,7 +1134,8 @@
         // Load disk usage
         async function loadDiskUsage() {
             try {
-                const response = await fetch(`${API_BASE}/disk-usage`);
+                const response = await authFetch(`${API_BASE}/disk-usage`);
+                if (!response) return;
                 const data = await response.json();
 
                 document.getElementById('diskUsed').textContent = data.used_gb;
@@ -1134,7 +1150,8 @@
         // Load active calls (live)
         async function loadActiveCalls() {
             try {
-                const response = await fetch(`${API_BASE}/active-calls`);
+                const response = await authFetch(`${API_BASE}/active-calls`);
+                if (!response) return;
                 const data = await response.json();
 
                 // Update count badge
@@ -1165,7 +1182,8 @@
         // Load recent calls
         async function loadRecentCalls() {
             try {
-                const response = await fetch(`${API_BASE}/recent-calls?limit=20`);
+                const response = await authFetch(`${API_BASE}/recent-calls?limit=20`);
+                if (!response) return;
                 const data = await response.json();
 
                 const tbody = document.getElementById('recentCallsBody');
@@ -1190,7 +1208,8 @@
         // Load call statistics
         async function loadCallStatistics() {
             try {
-                const response = await fetch(`${API_BASE}/call-statistics`);
+                const response = await authFetch(`${API_BASE}/call-statistics`);
+                if (!response) return;
                 const data = await response.json();
 
                 document.getElementById('totalCalls').textContent = data.total_calls;
@@ -1219,7 +1238,8 @@
         // Load frequent callers
         async function loadFrequentCallers() {
             try {
-                const response = await fetch(`${API_BASE}/frequent-callers?limit=5`);
+                const response = await authFetch(`${API_BASE}/frequent-callers?limit=5`);
+                if (!response) return;
                 const data = await response.json();
 
                 const div = document.getElementById('frequentCallers');
@@ -1247,7 +1267,8 @@
         // Load bookings
         async function loadBookings() {
             try {
-                const response = await fetch(`${API_BASE}/bookings?limit=20`);
+                const response = await authFetch(`${API_BASE}/bookings?limit=20`);
+                if (!response) return;
                 const data = await response.json();
 
                 document.getElementById('totalBookings').textContent = data.total;
@@ -1282,7 +1303,7 @@
         async function deleteBooking(id) {
             if (!confirm('Delete this booking?')) return;
             try {
-                await fetch(`${API_BASE}/bookings/${id}`, { method: 'DELETE' });
+                await authFetch(`${API_BASE}/bookings/${id}`, { method: 'DELETE' });
                 loadBookings();
             } catch (error) {
                 console.error('Error deleting booking:', error);
@@ -1292,7 +1313,8 @@
         // Load SMS logs
         async function loadSmsLogs() {
             try {
-                const response = await fetch(`${API_BASE}/sms-logs?limit=20`);
+                const response = await authFetch(`${API_BASE}/sms-logs?limit=20`);
+                if (!response) return;
                 const data = await response.json();
 
                 document.getElementById('totalSms').textContent = data.total;
@@ -1322,7 +1344,8 @@
         // Load API costs
         async function loadApiCosts() {
             try {
-                const response = await fetch(`${API_BASE}/api-usage`);
+                const response = await authFetch(`${API_BASE}/api-usage`);
+                if (!response) return;
                 const data = await response.json();
 
                 // Calculate total balance from services that have balance
@@ -1402,7 +1425,8 @@
         // Load callers for management
         async function loadCallers() {
             try {
-                const response = await fetch(`${API_BASE}/callers`);
+                const response = await authFetch(`${API_BASE}/callers`);
+                if (!response) return;
                 const data = await response.json();
 
                 const tbody = document.getElementById('callersBody');
@@ -1434,18 +1458,17 @@
             const newName = prompt('Enter new name:', currentName);
             if (newName === null) return;
 
-            fetch(`${API_BASE}/callers/${encodeURIComponent(phone)}`, {
+            authFetch(`${API_BASE}/callers/${encodeURIComponent(phone)}`, {
                 method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: newName })
-            }).then(() => loadCallers());
+            }).then(r => r && loadCallers());
         }
 
         // Delete caller
         async function deleteCaller(phone) {
             if (!confirm(`Delete caller ${phone}?`)) return;
             try {
-                await fetch(`${API_BASE}/callers/${encodeURIComponent(phone)}`, { method: 'DELETE' });
+                await authFetch(`${API_BASE}/callers/${encodeURIComponent(phone)}`, { method: 'DELETE' });
                 loadCallers();
             } catch (error) {
                 console.error('Error deleting caller:', error);

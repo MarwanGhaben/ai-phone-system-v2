@@ -19,7 +19,6 @@ from services.security.middleware import (
     RateLimitMiddleware,
     validate_twilio_signature,
 )
-from services.dashboard.dashboard_routes import require_auth
 
 
 # Get settings
@@ -102,11 +101,14 @@ app.add_middleware(
 
 # Include dashboard routes (optional - won't break core functionality if dependencies missing)
 try:
-    from services.dashboard.dashboard_routes import router as dashboard_router
+    from services.dashboard.dashboard_routes import router as dashboard_router, require_auth
     app.include_router(dashboard_router)
     logger.info("Dashboard routes loaded successfully")
 except ImportError as e:
     logger.warning(f"Dashboard not available (missing dependencies): {e}")
+
+    async def require_auth(request: Request) -> dict:
+        raise HTTPException(status_code=503, detail="Dashboard service unavailable")
 
 
 # =====================================================
@@ -526,6 +528,8 @@ async def get_calendar_services(user: dict = Depends(require_auth)):
 
 @app.get("/api/calendar/availability")
 async def get_calendar_availability(user: dict = Depends(require_auth), service_id: str = None, staff_id: str = None, days_ahead: int = 7):
+    if not service_id:
+        return {"slots": []}
     """Get available time slots"""
     calendar = get_calendar_service()
     slots = await calendar.get_available_slots(service_id, staff_id, days_ahead)
