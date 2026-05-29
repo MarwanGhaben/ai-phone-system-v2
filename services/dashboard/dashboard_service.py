@@ -97,8 +97,8 @@ class DashboardService:
         try:
             import psutil
 
-            # CPU health
-            cpu_percent = psutil.cpu_percent(interval=None)
+            # CPU health (interval=0.1 blocks briefly but gives accurate reading)
+            cpu_percent = psutil.cpu_percent(interval=0.1)
             cpu_status = 'healthy' if cpu_percent < 70 else 'warning' if cpu_percent < 90 else 'danger'
 
             # Memory health
