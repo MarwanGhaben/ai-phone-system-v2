@@ -1973,6 +1973,10 @@ TOMORROW: {tomorrow_weekday}, {tomorrow_str}
 MAXIMUM BOOKING DATE: {max_booking_date_str} (2 business days limit)
 MAXIMUM BOOKING DATE (Arabic): {max_booking_date_ar}
 
+✅ SAME-DAY BOOKING IS ALLOWED:
+- TODAY ({today_str}) {"IS bookable — it is a workday." if now_toronto.weekday() < 5 else "is a WEEKEND (office closed) — same-day booking is not possible today."}
+- If the caller asks for "today" / "اليوم"{" and it is a workday" if now_toronto.weekday() < 5 else ""}, do NOT refuse. Call check_appointment for today and let the system tell you which times are free. There is NO minimum-notice rule — the next free slot can be very soon.
+
 DATE CALCULATIONS FROM TODAY ({today_date_only}):
 - "tomorrow" / "بكرة" = {tomorrow_weekday}, {tomorrow_str}
 - "day after tomorrow" = {(now_toronto + timedelta(days=2)).strftime('%A, %B %d')}
