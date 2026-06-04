@@ -205,7 +205,12 @@ class ConversationOrchestrator:
         # Garbled transcript counter: tracks consecutive garbled drops per call
         # After N garbled drops, auto-reconnect STT with Arabic (the most common cause)
         self._garbled_drop_count: Dict[str, int] = {}
-        self._GARBLED_AUTO_SWITCH_THRESHOLD = 1  # After 1 garbled drop, try Arabic immediately
+        # Require 3 consecutive garbled drops before flipping the whole call to
+        # Arabic. A single imperfect STT result on 8kHz phone audio is normal and
+        # must NOT derail the call — flipping on the first stumble caused the AI
+        # to answer English-speaking callers in Arabic and re-prompt them, which
+        # reads as "the system doesn't understand me."
+        self._GARBLED_AUTO_SWITCH_THRESHOLD = 3
 
         # System prompt for the AI
         self._system_prompt = self._get_system_prompt()
