@@ -282,9 +282,18 @@ class MSBookingsService(CalendarServiceBase):
             # This ensures slot times returned match local business hours
             windows_timezone = "Eastern Standard Time"
 
-            # Use current time in a reasonable local approximation
-            # We send local date range; MSGraph interprets in the specified timezone
-            start_date = datetime.now() + timedelta(hours=1)
+            # CRITICAL: The server runs in UTC. We MUST compute the availability
+            # window using Eastern wall-clock time, because we label the window as
+            # "Eastern Standard Time" to MS Graph. Using a naive datetime.now()
+            # (UTC) here labeled as Eastern shifted the window ~4-5 hours into the
+            # future, which excluded same-day morning/noon slots — callers could
+            # not book "today" even when slots were free.
+            from zoneinfo import ZoneInfo
+            eastern_tz = ZoneInfo("America/Toronto")
+            now_eastern = datetime.now(eastern_tz)
+            # Small lead buffer so we don't offer a slot that is essentially "now".
+            # Kept short (10 min) so near-term same-day bookings still work.
+            start_date = now_eastern + timedelta(minutes=10)
             end_date = start_date + timedelta(days=days_ahead)
 
             payload = {

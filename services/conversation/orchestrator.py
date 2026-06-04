@@ -2459,15 +2459,21 @@ CRITICAL INSTRUCTIONS:
         # Soft speech: RMS ~100-150
         # Medium speech: RMS ~200-400
         # Loud speech: RMS ~900+
+        # Breathing into the handset: RMS ~300-550 (broadband, sustained)
         # Background noise in public: RMS ~300-400
-        # Use 400 as threshold to filter background noise while catching intentional speech
-        threshold = 400
+        #
+        # The old threshold of 400 over 4 frames (~80ms) was too sensitive: a
+        # caller simply breathing into the phone would clear it and kill the AI's
+        # playback. Raise the energy bar to 650 (clearly above breath/background
+        # but still below normal intentional speech) AND require 8 consecutive
+        # frames (~160ms of sustained sound) so a real word — not a breath — is
+        # needed to interrupt.
+        threshold = 650
+        required_consecutive = 8
 
         if rms > threshold:
             self._barge_in_consecutive[sid] += 1
-            # Require 4 consecutive high-energy frames (~80ms of speech) to trigger
-            # This filters brief noise bursts while catching sustained speech
-            if self._barge_in_consecutive[sid] >= 4:
+            if self._barge_in_consecutive[sid] >= required_consecutive:
                 logger.info(f"Orchestrator: Barge-in triggered - rms={rms}, threshold={threshold}, consecutive={self._barge_in_consecutive[sid]}")
                 self._barge_in_consecutive[sid] = 0
                 return True
