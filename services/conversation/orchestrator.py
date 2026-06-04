@@ -380,8 +380,9 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
 - STEP 1: Call check_appointment to check availability. NEVER call confirm_appointment without checking first.
-- STEP 2: If SLOT_AVAILABLE, tell the caller the time is available and ASK them to confirm before booking.
+- STEP 2: If SLOT_AVAILABLE, tell the caller the time IS available and ASK them to confirm before booking. NEVER tell the caller an available time is taken.
 - STEP 3: ONLY after the caller says YES/confirms, call confirm_appointment with confirm=true. If they say no, call confirm_appointment with confirm=false.
+- ⚠️ CRITICAL: After you offered a SLOT_AVAILABLE time and the caller agrees (says "yes", "نعم", "تمام", "أيوة", "okay"), call confirm_appointment with confirm=true. Do NOT call check_appointment again for the SAME time — re-checking a time you already offered will loop and confuse the caller.
 - CRITICAL: date_time parameter MUST be in "YYYY-MM-DD HH:MM" format (24-hour). Use the REAL-TIME DATE section below to calculate. NEVER pass Arabic text as date_time.
 - CRITICAL: accountant_name parameter MUST be the English name (e.g. "Hussam Saadaldin", "Rami Kahwaji", "Abdul ElFarra"). NEVER pass Arabic names.
 - IMPORTANT: Callers may mispronounce or approximate accountant names. Match to the closest name: "Husain"/"Hussein"/"Hosam" → "Hussam Saadaldin", "Rami"/"رامي" → "Rami Kahwaji", "Abdul"/"عبدول" → "Abdul ElFarra". NEVER say "we don't have that accountant" if the name is close to one on the list.
@@ -2207,6 +2208,12 @@ CRITICAL INSTRUCTIONS:
                         # Feed result back to LLM for a natural response
                         messages.append(Message(role=LLMRole.ASSISTANT, content=llm_response.content or ""))
 
+                        # IMPORTANT: Branch on the SPECIFIC result type. The old
+                        # code had only "BOOKING_SUCCESS" vs. a catch-all "else"
+                        # that told the LLM to "say the time is taken" — which
+                        # fired for SLOT_AVAILABLE too, making the AI tell callers
+                        # an open slot was unavailable. Each result now gets its
+                        # own, correct instruction.
                         if "BOOKING_NEEDS_RECHECK" in booking_result:
                             # LLM skipped re-checking after unavailable — tell caller we need to verify
                             messages.append(Message(role=LLMRole.USER, content=(
@@ -2214,14 +2221,27 @@ CRITICAL INSTRUCTIONS:
                                 f"Tell the caller: 'Let me check that time for you' or similar. "
                                 f"Do NOT say there was an error. Keep it brief.]"
                             )))
+                        elif "BOOKING_SUCCESS" in booking_result:
+                            # Confirmed: short confirmation + warm close
+                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Reply briefly: confirm the booking and ask 'Is there anything else I can help with?' / 'هل تحتاج شيء آخر؟']"))
+                        elif "SLOT_AVAILABLE" in booking_result:
+                            # The requested time IS free — tell the caller it is
+                            # available and ask them to confirm. NEVER say it is taken.
+                            messages.append(Message(role=LLMRole.USER, content=(
+                                f"[SYSTEM: {booking_result}. The time IS AVAILABLE. "
+                                f"In ONE short sentence, tell the caller this time is available and ask them to confirm they want to book it. "
+                                f"Do NOT say it is taken or unavailable. Do NOT offer a different time.]"
+                            )))
+                        elif "BOOKING_CANCELLED" in booking_result:
+                            # Caller declined the booking
+                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. In ONE short sentence, acknowledge and ask if they'd like a different time or anything else.]"))
+                        elif ("SLOT_BUSY" in booking_result) or ("SCHEDULE_FULL" in booking_result):
+                            # Requested time taken — offer ONE alternative
+                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Reply in ONE short sentence (max 10 words). Just say the time is taken and give ONE alternative. Do NOT list multiple times.]"))
                         else:
-                            # Differentiate response based on result type
-                            if "BOOKING_SUCCESS" in booking_result:
-                                # Confirmed: short confirmation + warm close
-                                messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Reply briefly: confirm the booking and ask 'Is there anything else I can help with?' / 'هل تحتاج شيء آخر؟']"))
-                            else:
-                                # Unavailable/busy: short + one alternative
-                                messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Reply in ONE short sentence (max 10 words). Just say the time is taken and give ONE alternative. Do NOT list multiple times.]"))
+                            # NO_AVAILABILITY, BOOKING_ERROR, lookup/cancel results, etc.
+                            # Relay the outcome naturally rather than assuming "taken".
+                            messages.append(Message(role=LLMRole.USER, content=f"[SYSTEM: {booking_result}. Relay this outcome to the caller naturally in ONE short sentence. Do NOT invent availability you were not told about.]"))
 
                         # Get final response (streaming, no tools)
                         follow_up_request = LLMRequest(
