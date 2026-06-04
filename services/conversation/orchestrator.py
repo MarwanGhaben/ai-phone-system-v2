@@ -1495,27 +1495,37 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                             break
 
                 if not slot_match:
-                    # Not available — store partial booking so confirm_appointment
-                    # can still work if LLM skips re-checking
+                    same_day_slots = [s for s in available_slots if s.start_time.date() == requested_date]
+
+                    # Store the FIRST offered alternative as a real, bookable
+                    # pending time. The alternatives come straight from
+                    # get_available_slots, so they are already validated as free.
+                    # This is critical: if the caller says a bare "yes" to the
+                    # offered alternative, confirm_appointment can book it
+                    # immediately instead of bouncing back a "go re-check"
+                    # instruction that causes the LLM to stall in dead air.
+                    if same_day_slots:
+                        primary_alt = same_day_slots[0]
+                    else:
+                        primary_alt = available_slots[0] if available_slots else None
+
                     context.pending_booking = {
                         "service_id": service_id,
                         "staff_id": staff_id,
                         "staff_name": matched_staff_name or accountant_name,
-                        "appointment_time": None,  # No confirmed time yet
+                        "appointment_time": primary_alt.start_time if primary_alt else None,
                         "customer_name": customer_name,
                         "client_type": client_type,
-                        "awaiting_recheck": True,
                     }
-
-                    same_day_slots = [s for s in available_slots if s.start_time.date() == requested_date]
 
                     if same_day_slots:
                         alt_times = ", ".join([s.start_time.strftime(full_fmt) for s in same_day_slots[:2]])
-                        logger.info(f"Orchestrator: Requested time not available. Alternatives: {alt_times}")
+                        logger.info(f"Orchestrator: Requested time not available. Offering (primary={primary_alt.start_time.strftime(full_fmt)}): {alt_times}")
                         return (
                             f"SLOT_BUSY: {staff_display} is busy at that exact time (the office IS open, just that time slot is taken). "
                             f"Same-day alternatives: {alt_times}. "
-                            f"Ask which works. Call check_appointment AGAIN with new time."
+                            f"Ask which works. If the caller says yes / agrees to the FIRST alternative ({primary_alt.start_time.strftime(full_fmt)}), call confirm_appointment with confirm=true directly. "
+                            f"If they pick a DIFFERENT time, call check_appointment AGAIN with that time."
                         )
                     else:
                         next_slots = []
@@ -1530,13 +1540,16 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
                         if next_slots:
                             alt_info = ", ".join(next_slots)
+                            primary_alt_str = primary_alt.strftime(full_fmt) if primary_alt else next_slots[0]
                             logger.info(f"Orchestrator: No slots on requested day. Next available: {alt_info}")
                             return (
                                 f"SCHEDULE_FULL: {staff_display}'s schedule is full that day (office IS open Monday-Friday, but this accountant is booked). "
                                 f"Next available: {alt_info}. "
-                                f"Ask which works. Call check_appointment AGAIN with new time."
+                                f"Ask which works. If the caller agrees to the FIRST option ({primary_alt_str}), call confirm_appointment with confirm=true directly. "
+                                f"If they pick a DIFFERENT time, call check_appointment AGAIN with that time."
                             )
                         else:
+                            context.pending_booking = None
                             return (
                                 f"NO_AVAILABILITY: {staff_display} has no available slots in the next 7 days. "
                                 f"Apologize and offer to transfer or suggest a different accountant."
