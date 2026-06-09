@@ -376,9 +376,12 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - If caller asks for Friday: ACCEPT IT - Friday is a normal workday!
 - If caller asks for Saturday or Sunday: ONLY THEN say those are the closed days and suggest Friday or Monday instead.
 - ⚠️ CRITICAL - 2 BUSINESS DAY LIMIT ⚠️: We can ONLY book appointments up to 2 BUSINESS DAYS in advance. Check the REAL-TIME DATE section below for exact dates.
-- Ask: Individual or corporate client?
+- Ask: Individual or corporate client? (Both types CAN be booked — do NOT transfer corporate clients just because they are corporate!)
+- CORPORATE CLIENTS: For corporate/business appointments, proceed with the booking exactly like individual appointments. Ask for their preferred accountant and date/time. Do NOT redirect or transfer unless they specifically ask for it.
 - Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
+- Ask: Email address? (Required for booking confirmation. Ask: "What's the best email to send the confirmation to?" / "ما هو بريدك الإلكتروني لإرسال التأكيد؟")
+- Pass the email to check_appointment in the customer_email parameter
 - STEP 1: Call check_appointment to check availability. NEVER call confirm_appointment without checking first.
 - STEP 2: If SLOT_AVAILABLE, tell the caller the time IS available and ASK them to confirm before booking. NEVER tell the caller an available time is taken.
 - STEP 3: ONLY after the caller says YES/confirms, call confirm_appointment with confirm=true. If they say no, call confirm_appointment with confirm=false.
@@ -1201,6 +1204,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                         "customer_name": {
                             "type": "string",
                             "description": "Customer name for the booking"
+                        },
+                        "customer_email": {
+                            "type": "string",
+                            "description": "Customer email address for booking confirmation. Ask the caller for their email before booking."
                         }
                     },
                     "required": ["client_type"]
@@ -1327,8 +1334,9 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         accountant_name = arguments.get("accountant_name", "")
         date_time_str = arguments.get("date_time", "")
         customer_name = arguments.get("customer_name", context.caller_name if context else "")
+        customer_email = arguments.get("customer_email", "")
 
-        logger.info(f"Orchestrator: Checking booking - type={client_type}, accountant={accountant_name}, date={date_time_str}, customer={customer_name}")
+        logger.info(f"Orchestrator: Checking booking - type={client_type}, accountant={accountant_name}, date={date_time_str}, customer={customer_name}, email={customer_email}")
 
         # Check if MSGraph is configured
         if not await calendar.is_available():
@@ -1472,6 +1480,32 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                     f"In Arabic: 'نقدر نحجز لمدة يومين عمل فقط. تحب نحجز ليوم {max_date_ar} بدلاً من ذلك؟'"
                 )
 
+            # =====================================================
+            # DUPLICATE BOOKING CHECK: Warn if caller already has upcoming appointments
+            # =====================================================
+            existing_appointments = []
+            try:
+                if context and context.phone_number:
+                    existing_appointments = await calendar.get_customer_appointments(context.phone_number)
+                    if existing_appointments:
+                        # Check for duplicate on same day or with same accountant
+                        for appt in existing_appointments:
+                            appt_start = appt.get("start_time")
+                            appt_staff = appt.get("staff_name", "")
+                            if appt_start:
+                                appt_date = appt_start.date() if hasattr(appt_start, 'date') else None
+                                if appt_date == appointment_time.date():
+                                    logger.warning(f"Orchestrator: DUPLICATE_BOOKING_WARNING - Caller already has appointment on {appt_date}")
+                                    return (
+                                        f"DUPLICATE_WARNING: The caller already has an appointment on {appt_date.strftime('%A, %B %d')} "
+                                        f"with {appt_staff}. Ask if they want to: 1) Keep existing and book another, "
+                                        f"2) Cancel existing and book new one, or 3) Choose a different day. "
+                                        f"In Arabic: 'عندك موعد موجود يوم {self._format_date_arabic(appt_date)} مع {appt_staff}. "
+                                        f"تحب تحجز موعد إضافي، أو تلغي الموجود وتحجز جديد، أو تختار يوم ثاني؟'"
+                                    )
+            except Exception as e:
+                logger.warning(f"Orchestrator: Could not check for duplicate bookings: {e}")
+
             logger.info(f"Orchestrator: Checking availability for staff={staff_display}, date={appointment_time}")
             available_slots = await calendar.get_available_slots(
                 service_id=service_id,
@@ -1484,15 +1518,19 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 requested_hour = appointment_time.hour
                 requested_minute = appointment_time.minute
 
+                # STRICT slot matching: the requested time must match an EXACT
+                # slot start time (not just fall within a slot's range). This
+                # prevents booking times like 4:30 PM when the portal only
+                # offers 4:00 PM or 5:00 PM slots.
                 slot_match = False
+                matched_slot = None
                 for slot in available_slots:
                     slot_date = slot.start_time.date()
                     if slot_date == requested_date:
-                        req_minutes = requested_hour * 60 + requested_minute
-                        slot_start_minutes = slot.start_time.hour * 60 + slot.start_time.minute
-                        slot_end_minutes = slot.end_time.hour * 60 + slot.end_time.minute
-                        if slot_start_minutes <= req_minutes < slot_end_minutes:
+                        if (slot.start_time.hour == requested_hour and
+                            slot.start_time.minute == requested_minute):
                             slot_match = True
+                            matched_slot = slot
                             break
 
                 if not slot_match:
@@ -1516,6 +1554,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                         "staff_name": matched_staff_name or accountant_name,
                         "appointment_time": primary_alt.start_time if primary_alt else None,
                         "customer_name": customer_name,
+                        "customer_email": customer_email,
                         "client_type": client_type,
                     }
 
@@ -1565,6 +1604,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 "staff_name": matched_staff_name or accountant_name,
                 "appointment_time": appointment_time,
                 "customer_name": customer_name,
+                "customer_email": customer_email,
                 "client_type": client_type,
             }
             display_time = appointment_time.strftime(full_fmt)
@@ -1633,12 +1673,13 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         logger.info(f"Orchestrator: Spoke hold message before booking API call")
 
         try:
+            customer_email = pending.get("customer_email", "")
             result = await calendar.create_booking(
                 service_id=pending["service_id"],
                 staff_id=pending["staff_id"],
                 start_time=pending["appointment_time"],
                 customer_name=customer_name,
-                customer_email="",
+                customer_email=customer_email,
                 customer_phone=context.phone_number or "",
                 notes=f"Booked via AI phone system. Client type: {pending['client_type']}"
             )
@@ -1662,7 +1703,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                         call_sid,
                         context.phone_number or "",
                         customer_name,
-                        "",  # email
+                        customer_email,  # email
                         result.staff_name or pending.get("staff_name", ""),
                         pending["appointment_time"],
                         pending.get("client_type", "unknown"),
@@ -1997,6 +2038,34 @@ CRITICAL: Use ONLY these dates. Do NOT use any other date information!
 
         # Build system prompt with caller context
         system_prompt = self._system_prompt + realtime_date_context
+
+        # =====================================================
+        # CURRENT LANGUAGE INSTRUCTION
+        # =====================================================
+        # CRITICAL: Tell the LLM exactly what language to use based on
+        # the detected language. This prevents the LLM from continuing
+        # in English after switching to Arabic or vice versa.
+        current_lang = context.language if context.language and context.language != "auto" else "ar"
+        if current_lang == "ar":
+            system_prompt += """
+
+═══════════════════════════════════════════════════════════════
+🗣️ CURRENT LANGUAGE: ARABIC
+═══════════════════════════════════════════════════════════════
+The caller is currently speaking Arabic. You MUST respond in Arabic.
+Do NOT respond in English unless the caller explicitly switches to English.
+═══════════════════════════════════════════════════════════════
+"""
+        else:
+            system_prompt += """
+
+═══════════════════════════════════════════════════════════════
+🗣️ CURRENT LANGUAGE: ENGLISH
+═══════════════════════════════════════════════════════════════
+The caller is currently speaking English. Respond in English.
+If the caller switches to Arabic, switch your response to Arabic.
+═══════════════════════════════════════════════════════════════
+"""
 
         # Add caller context to prompt
         if context.caller_name:
