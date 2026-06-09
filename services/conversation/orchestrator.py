@@ -82,6 +82,11 @@ class ConversationContext:
     booking_just_completed: bool = False
     last_booking_summary: Optional[str] = None  # e.g. "Thursday, May 28 at 12:00 PM with Hussam"
 
+    # Duplicate-booking warning flag - set True after we warn once, so the caller
+    # can choose to proceed with a second same-day booking without being blocked
+    # in an infinite warning loop on every re-check.
+    duplicate_warned: bool = False
+
     # =====================================================
     # CONVERSATION HISTORY (Phase 1.2 fix)
     # =====================================================
@@ -1078,8 +1083,11 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             # Skip reconnect if prev was "auto" and STT already started in Arabic
             if prev_language not in ("ar", "auto"):
                 await self._reconnect_stt_with_language(call_sid, "ar", force=True)
-        elif context.language == "auto":
-            # Check for romanized Arabic (STT auto-detect often romanizes Arabic speech)
+        elif context.language in ("auto", "en"):
+            # Check for romanized Arabic (STT romanizes Arabic speech when it is
+            # NOT in Arabic mode — both in auto-detect AND when stuck in English).
+            # Running this for "en" too is what lets a caller switch BACK to
+            # Arabic after an English turn instead of being stuck in English.
             romanized_arabic_patterns = [
                 "allah", "inshallah", "yalla", "habibi", "habibti", "shukran",
                 "marhaba", "ahlan", "salam", "wallah", "khalas", "mashallah",
@@ -1101,11 +1109,14 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 # Re-prompt in Arabic
                 await self._speak_to_caller(call_sid, "عذراً، ممكن تعيد من فضلك؟", "ar")
                 return
-            elif language and language != "auto" and language == "en":
-                # STT explicitly detected English — trust it
+            elif context.language == "auto" and language and language != "auto" and language == "en":
+                # STT explicitly detected English from auto-detect — trust it
                 context.language = "en"
                 logger.info(f"Orchestrator: Auto-detected English from STT")
                 await self._reconnect_stt_with_language(call_sid, "en")
+            elif context.language == "en":
+                # Already in English and no Arabic signal — stay in English
+                pass
             else:
                 # Unknown or unclear language — default to Arabic (primary business language)
                 # If they're speaking English, next transcript will be clearly English
@@ -1481,20 +1492,23 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 )
 
             # =====================================================
-            # DUPLICATE BOOKING CHECK: Warn if caller already has upcoming appointments
+            # DUPLICATE BOOKING CHECK: Warn ONCE if caller already has an
+            # appointment on the requested day. After warning once, we set a
+            # per-call flag so a caller who chooses to proceed with a second
+            # booking is NOT blocked in an infinite warning loop on re-check.
             # =====================================================
-            existing_appointments = []
-            try:
-                if context and context.phone_number:
+            if context and context.phone_number and not context.duplicate_warned:
+                try:
                     existing_appointments = await calendar.get_customer_appointments(context.phone_number)
                     if existing_appointments:
-                        # Check for duplicate on same day or with same accountant
                         for appt in existing_appointments:
                             appt_start = appt.get("start_time")
                             appt_staff = appt.get("staff_name", "")
-                            if appt_start:
-                                appt_date = appt_start.date() if hasattr(appt_start, 'date') else None
-                                if appt_date == appointment_time.date():
+                            if appt_start and hasattr(appt_start, 'date'):
+                                if appt_start.date() == appointment_time.date():
+                                    # Mark as warned so subsequent checks proceed
+                                    context.duplicate_warned = True
+                                    appt_date = appt_start.date()
                                     logger.warning(f"Orchestrator: DUPLICATE_BOOKING_WARNING - Caller already has appointment on {appt_date}")
                                     return (
                                         f"DUPLICATE_WARNING: The caller already has an appointment on {appt_date.strftime('%A, %B %d')} "
@@ -1503,8 +1517,8 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                                         f"In Arabic: 'عندك موعد موجود يوم {self._format_date_arabic(appt_date)} مع {appt_staff}. "
                                         f"تحب تحجز موعد إضافي، أو تلغي الموجود وتحجز جديد، أو تختار يوم ثاني؟'"
                                     )
-            except Exception as e:
-                logger.warning(f"Orchestrator: Could not check for duplicate bookings: {e}")
+                except Exception as e:
+                    logger.warning(f"Orchestrator: Could not check for duplicate bookings: {e}")
 
             logger.info(f"Orchestrator: Checking availability for staff={staff_display}, date={appointment_time}")
             available_slots = await calendar.get_available_slots(
@@ -1673,7 +1687,17 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         logger.info(f"Orchestrator: Spoke hold message before booking API call")
 
         try:
-            customer_email = pending.get("customer_email", "")
+            # Validate email before sending to MS Bookings. Email captured over
+            # voice STT is often garbled; a malformed value can make MS Graph
+            # reject the whole booking. If it doesn't look like a valid email,
+            # fall back to empty (MS Bookings accepts an empty email).
+            import re as _re
+            customer_email = pending.get("customer_email", "") or ""
+            if customer_email and not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", customer_email.strip()):
+                logger.warning(f"Orchestrator: Discarding malformed email '{customer_email}' before booking")
+                customer_email = ""
+            else:
+                customer_email = customer_email.strip()
             result = await calendar.create_booking(
                 service_id=pending["service_id"],
                 staff_id=pending["staff_id"],
