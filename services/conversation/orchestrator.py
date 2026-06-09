@@ -405,7 +405,7 @@ MODIFYING/CANCELLING EXISTING APPOINTMENTS:
   1. Call lookup_my_bookings to find their appointments (uses their phone number automatically)
   2. If appointments found, tell them what you found: "I found your appointment with [accountant] on [date/time]."
   3. Ask if they want to cancel it and book a new time
-  4. If they confirm cancellation, call cancel_booking with the appointment_id and confirm_cancel=true
+  4. If they confirm cancellation, call cancel_booking with confirm_cancel=true. If the caller has MORE THAN ONE appointment, first ask WHICH one they mean, then pass appointment_number (1, 2, ...) matching the lookup list. NEVER cancel without knowing which appointment the caller means.
   5. After cancellation, offer to book a new appointment at a different time
 - If no appointments found, let them know and offer to book a new one
 - Example phrases that trigger this: "I need to change my appointment", "أبي أغير موعدي", "I want to reschedule", "cancel my booking"
@@ -1306,13 +1306,17 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             },
             {
                 "name": "cancel_booking",
-                "description": "Cancel an existing appointment. Call this ONLY after lookup_my_bookings found the caller's appointment AND the caller explicitly confirmed they want to cancel it. The system automatically uses the appointment found by lookup_my_bookings. After cancellation, offer to book a new appointment.",
+                "description": "Cancel an existing appointment. Call this ONLY after lookup_my_bookings found the caller's appointment AND the caller explicitly confirmed they want to cancel it. If the caller has MORE THAN ONE appointment, you MUST pass appointment_number to say which one (matching the numbered list from lookup_my_bookings). After cancellation, offer to book a new appointment.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "confirm_cancel": {
                             "type": "boolean",
                             "description": "Must be true to confirm cancellation"
+                        },
+                        "appointment_number": {
+                            "type": "integer",
+                            "description": "Which appointment to cancel, as the number from the lookup_my_bookings list (1 for 'Appointment 1', 2 for 'Appointment 2', etc.). REQUIRED when the caller has more than one appointment."
                         }
                     },
                     "required": ["confirm_cancel"]
@@ -1869,7 +1873,13 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             appointments_text = "\n".join(appt_list)
             logger.info(f"Orchestrator: Found {len(appointments)} appointments for {phone[-4:]}")
 
-            return f"APPOINTMENTS_FOUND: Found {len(appointments)} upcoming appointment(s):\n{appointments_text}\n\nTell the caller about their appointment(s) and ask if they want to cancel and reschedule. If they confirm cancellation, call cancel_booking with the appointment ID."
+            return (
+                f"APPOINTMENTS_FOUND: Found {len(appointments)} upcoming appointment(s):\n{appointments_text}\n\n"
+                f"Tell the caller about their appointment(s) and ask if they want to cancel and reschedule. "
+                f"If there are MULTIPLE appointments, ask WHICH one they mean before cancelling. "
+                f"When they confirm, call cancel_booking with confirm_cancel=true and appointment_number "
+                f"set to the number from the list above (1, 2, ...)."
+            )
 
         except Exception as e:
             logger.error(f"Orchestrator: Error looking up appointments: {e}")
@@ -1897,12 +1907,38 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         if not confirm_cancel:
             return "CANCEL_ABORTED: Cancellation not confirmed. Ask if they still want to cancel or if they'd like to keep the appointment."
 
-        # Get appointment ID from stored context (not from LLM arguments - LLM often hallucinates IDs)
+        # Select the appointment to cancel from stored context (not from raw LLM
+        # IDs - the LLM often hallucinates those). With ONE appointment we use
+        # it directly. With SEVERAL, the LLM must pass appointment_number
+        # (1-based, matching the lookup list) — otherwise we used to silently
+        # cancel the FIRST one, which could be the wrong appointment entirely.
         appointment_id = None
-        if context and context.found_appointments and len(context.found_appointments) > 0:
-            # Use the first found appointment (most common case: single appointment)
-            appointment_id = context.found_appointments[0].get('id', '')
-            logger.info(f"Orchestrator: Using appointment ID from context: {appointment_id[:30]}...")
+        selected_appt = None
+        found = context.found_appointments if context else None
+        if found:
+            if len(found) == 1:
+                selected_appt = found[0]
+            else:
+                appt_number = arguments.get("appointment_number")
+                try:
+                    appt_number = int(appt_number)
+                except (TypeError, ValueError):
+                    appt_number = None
+                if appt_number is not None and 1 <= appt_number <= len(found):
+                    selected_appt = found[appt_number - 1]
+                else:
+                    options = "; ".join(
+                        f"Appointment {i}: with {a.get('staff_name', 'staff')} on {a.get('formatted_time', 'unknown time')}"
+                        for i, a in enumerate(found, 1)
+                    )
+                    logger.warning(f"Orchestrator: cancel_booking with {len(found)} appointments but no valid appointment_number (got {arguments.get('appointment_number')!r})")
+                    return (
+                        f"CANCEL_NEEDS_SELECTION: The caller has {len(found)} appointments: {options}. "
+                        f"Ask the caller WHICH one they want to cancel, then call cancel_booking again "
+                        f"with confirm_cancel=true AND appointment_number set to their choice. Do NOT guess."
+                    )
+            appointment_id = selected_appt.get('id', '')
+            logger.info(f"Orchestrator: Cancelling appointment: {selected_appt.get('formatted_time', '?')} with {selected_appt.get('staff_name', '?')} (ID: {appointment_id[:30]}...)")
 
         # Fallback to LLM argument only if context doesn't have it
         if not appointment_id:
@@ -1946,13 +1982,14 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                     except Exception as rem_err:
                         logger.warning(f"Orchestrator: Failed to cancel reminders: {rem_err}")
 
-                # Send cancellation confirmation SMS
-                if context and context.phone_number and context.found_appointments:
+                # Send cancellation confirmation SMS (describing the appointment
+                # that was ACTUALLY cancelled, not just the first in the list)
+                if context and context.phone_number and selected_appt:
                     try:
                         from services.sms.telnyx_sms_service import get_sms_service
                         sms = get_sms_service()
                         if sms.is_available():
-                            appt = context.found_appointments[0]
+                            appt = selected_appt
                             customer_name = context.caller_name or appt.get('customer_name', 'there')
                             staff_name = appt.get('staff_name', 'your accountant')
                             appt_time = appt.get('formatted_time', 'your scheduled time')
@@ -1973,7 +2010,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 # Clear found appointments from context
                 context.found_appointments = None
 
-                return "BOOKING_CANCELLED: The appointment has been cancelled successfully. Ask if they would like to book a new appointment at a different time."
+                cancelled_desc = ""
+                if selected_appt:
+                    cancelled_desc = f" Cancelled: {selected_appt.get('formatted_time', '')} with {selected_appt.get('staff_name', '')}."
+                return f"BOOKING_CANCELLED: The appointment has been cancelled successfully.{cancelled_desc} Confirm to the caller WHICH appointment was cancelled, and ask if they would like to book a new appointment at a different time."
             else:
                 return "CANCEL_ERROR: Failed to cancel the appointment. Offer to transfer to a human for assistance."
 
