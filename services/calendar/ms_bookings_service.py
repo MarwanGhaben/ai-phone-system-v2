@@ -505,15 +505,20 @@ class MSBookingsService(CalendarServiceBase):
 
                     if start_dt_str:
                         try:
-                            # Parse the datetime - MS Graph returns in the business timezone
-                            # which we set as Eastern Standard Time when creating appointments
-                            if start_dt_str.endswith('Z'):
-                                # UTC format - convert to Eastern (UTC-5)
-                                start_dt = datetime.fromisoformat(start_dt_str.replace('Z', ''))
-                                start_dt = start_dt - timedelta(hours=5)  # Convert UTC to Eastern
-                            else:
-                                # Already in local time format
-                                start_dt = datetime.fromisoformat(start_dt_str.split('+')[0].split('-')[0] if '+' in start_dt_str or start_dt_str.count('-') > 2 else start_dt_str)
+                            # Parse ISO timestamp from MS Graph. It may arrive as:
+                            #   - UTC with Z suffix:      2026-06-05T14:00:00Z
+                            #   - With explicit offset:   2026-06-05T10:00:00-04:00
+                            #   - Naive local (Eastern):  2026-06-05T10:00:00
+                            # The old code subtracted a hardcoded 5 hours for the
+                            # Z case — wrong during daylight saving (Eastern is
+                            # UTC-4 in summer), shifting appointments by an hour
+                            # and breaking the duplicate-day comparison. Use a
+                            # DST-aware conversion instead.
+                            from zoneinfo import ZoneInfo
+                            parsed = datetime.fromisoformat(start_dt_str.replace('Z', '+00:00'))
+                            if parsed.tzinfo is not None:
+                                parsed = parsed.astimezone(ZoneInfo("America/Toronto")).replace(tzinfo=None)
+                            start_dt = parsed
                             formatted_time = start_dt.strftime('%A, %B %d at %I:%M %p')
                         except Exception as e:
                             logger.warning(f"MS Bookings: Failed to parse time {start_dt_str}: {e}")
