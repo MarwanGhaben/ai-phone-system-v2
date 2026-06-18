@@ -12,7 +12,7 @@ Stop inserting API values into HTML strings. Render attacker-reachable caller, b
 
 ### Dashboard administrator initialization
 
-Remove the seeded administrator from `services/dashboard/db_init.sql`. Direct operators to `scripts/create_admin.py`, matching the secure initialization policy already used by `scripts/init_db.sql`. Existing database users are unaffected because this changes initialization only.
+Remove the seeded administrator from `services/dashboard/db_init.sql`. Direct trusted deployment tooling to `AuthService.create_user`, which writes the dashboard's `admin_users` table. Existing database users are unaffected because this changes initialization only.
 
 ### Booking date parsing
 

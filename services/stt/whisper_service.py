@@ -8,9 +8,9 @@ Supports 50+ languages including Arabic
 
 import asyncio
 import io
-import tempfile
 import wave
 from typing import AsyncIterator, Optional, List
+import numpy as np
 from loguru import logger
 
 try:
@@ -20,13 +20,35 @@ except ImportError:
     OPENAI_AVAILABLE = False
     AsyncOpenAI = None
 
-try:
-    import numpy as np
-    NUMPY_AVAILABLE = True
-except ImportError:
-    NUMPY_AVAILABLE = False
-
 from .stt_base import STTServiceBase, STTResult, STTStatus, AudioChunk
+
+
+def _build_mulaw_energy_table() -> np.ndarray:
+    decoded_samples = []
+    for encoded_sample in range(256):
+        mu = 255 - encoded_sample
+        magnitude = ((mu & 0x0F) << 3) + 0x84
+        exponent = (mu & 0x70) >> 4
+        if exponent > 0:
+            magnitude <<= exponent - 1
+        decoded_samples.append(-magnitude if mu & 0x80 else magnitude)
+    return np.asarray(decoded_samples, dtype=np.int32)
+
+
+def _build_mulaw_pcm_table() -> np.ndarray:
+    decoded_samples = []
+    for encoded_sample in range(256):
+        mu = 255 - encoded_sample
+        magnitude = (mu & 0x0F) << 3
+        exponent = (mu & 0x70) >> 4
+        if exponent > 0:
+            magnitude = (magnitude + 0x84) << (exponent - 1)
+        decoded_samples.append(-magnitude if mu & 0x80 else magnitude)
+    return np.asarray(decoded_samples, dtype="<i2")
+
+
+MULAW_ENERGY_TABLE = _build_mulaw_energy_table()
+MULAW_PCM_TABLE = _build_mulaw_pcm_table()
 
 
 class WhisperSTT(STTServiceBase):
@@ -241,38 +263,20 @@ class WhisperSTT(STTServiceBase):
         if threshold is None:
             threshold = self.silence_threshold
 
-        try:
-            # Decode μ-law to get actual sample values
-            # Use a simpler decode table for performance
-            energy = 0
-            sample_count = len(audio_data)
+        encoded_samples = np.frombuffer(audio_data, dtype=np.uint8)
+        if encoded_samples.size:
+            decoded_samples = MULAW_ENERGY_TABLE[encoded_samples]
+            average_energy = float(np.abs(decoded_samples).mean() / 32000.0)
+        else:
+            average_energy = 0.0
 
-            for byte in audio_data:
-                # Proper μ-law decode (simplified)
-                mu = 255 - byte
-                magnitude = ((mu & 0x0F) << 3) + 0x84
-                exponent = (mu & 0x70) >> 4
-                if exponent > 0:
-                    magnitude = magnitude << (exponent - 1)
-                if mu & 0x80:
-                    magnitude = -magnitude
-                # Normalize to 0-1 range (max is ~32000)
-                energy += abs(magnitude) / 32000.0
+        if not hasattr(self, '_energy_log_count'):
+            self._energy_log_count = 0
+        self._energy_log_count += 1
+        if self._energy_log_count == 1 or self._energy_log_count % 200 == 0:
+            logger.info(f"Whisper: Energy={average_energy:.4f}, threshold={threshold}, has_speech={average_energy > threshold}")
 
-            avg_energy = energy / sample_count if sample_count > 0 else 0
-
-            # Log periodically for debugging
-            if not hasattr(self, '_energy_log_count'):
-                self._energy_log_count = 0
-            self._energy_log_count += 1
-            if self._energy_log_count == 1 or self._energy_log_count % 200 == 0:
-                logger.info(f"Whisper: Energy={avg_energy:.4f}, threshold={threshold}, has_speech={avg_energy > threshold}")
-
-            return avg_energy > threshold
-
-        except Exception:
-            # If energy detection fails, assume speech
-            return True
+        return average_energy > threshold
 
     async def _silence_detector(self):
         """
@@ -418,38 +422,8 @@ class WhisperSTT(STTServiceBase):
         Returns:
             16-bit PCM bytes
         """
-        # μ-law decoding table (simplified)
-        BIAS = 0x84
-        CLIP = 32635
-
-        # Build decode table
-        mu_law_decode_table = []
-        for i in range(256):
-            mu = 255 - i
-            magnitude = (mu & 0x0F) << 3
-            exponent = (mu & 0x70) >> 4
-            sign = (mu & 0x80) >> 7
-
-            if exponent > 0:
-                magnitude += 0x84
-                magnitude <<= (exponent - 1)
-
-            if sign == 1:
-                magnitude = -magnitude
-
-            mu_law_decode_table.append(magnitude)
-
-        # Convert each byte
-        pcm_samples = []
-        for byte in mulaw_data:
-            sample = mu_law_decode_table[byte]
-            # Clamp to 16-bit range
-            sample = max(-32768, min(32767, sample))
-            # Convert to little-endian bytes
-            pcm_samples.append(sample & 0xFF)
-            pcm_samples.append((sample >> 8) & 0xFF)
-
-        return bytes(pcm_samples)
+        encoded_samples = np.frombuffer(mulaw_data, dtype=np.uint8)
+        return MULAW_PCM_TABLE[encoded_samples].tobytes()
 
     def _calculate_confidence(self, transcription) -> float:
         """

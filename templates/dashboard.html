@@ -1041,6 +1041,37 @@
             return response;
         }
 
+        function createTextElement(tagName, text, className = '') {
+            const element = document.createElement(tagName);
+            element.textContent = text ?? '';
+            if (className) element.className = className;
+            return element;
+        }
+
+        function appendTextCell(row, text) {
+            const cell = createTextElement('td', text);
+            row.appendChild(cell);
+            return cell;
+        }
+
+        function renderEmptyTable(body, columnCount, message) {
+            const row = document.createElement('tr');
+            const cell = createTextElement('td', message);
+            cell.colSpan = columnCount;
+            cell.style.textAlign = 'center';
+            cell.style.color = 'var(--text-secondary)';
+            row.appendChild(cell);
+            body.replaceChildren(row);
+        }
+
+        function languageFlag(language) {
+            return language === 'ar' ? '🇸🇦' : '🇺🇸';
+        }
+
+        function languageNameWithFlag(language) {
+            return `${language === 'ar' ? 'Arabic' : 'English'} ${languageFlag(language)}`;
+        }
+
         // Load user info
         async function loadUserInfo() {
             try {
@@ -1161,19 +1192,31 @@
 
                 const tbody = document.getElementById('activeCallsBody');
                 if (data.count === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-secondary);">No active calls</td></tr>';
+                    renderEmptyTable(tbody, 5, 'No active calls');
                     return;
                 }
 
-                tbody.innerHTML = data.calls.map(call => `
-                    <tr>
-                        <td><strong style="color: #ffffff;">${call.caller_name}</strong></td>
-                        <td style="color: #ffffff;">${call.phone_number}</td>
-                        <td><span class="lang-badge ${call.language}">${call.language === 'ar' ? 'Arabic 🇸🇦' : 'English 🇺🇸'}</span></td>
-                        <td><span class="status-badge ${call.state === 'speaking' ? 'success' : call.state === 'listening' ? 'info' : 'warning'}">${call.state_display}</span></td>
-                        <td style="color: #ffffff; font-family: monospace;">${call.duration_formatted}</td>
-                    </tr>
-                `).join('');
+                const rows = data.calls.map(call => {
+                    const row = document.createElement('tr');
+                    const callerCell = document.createElement('td');
+                    const callerName = createTextElement('strong', call.caller_name);
+                    callerName.style.color = '#ffffff';
+                    callerCell.appendChild(callerName);
+                    row.appendChild(callerCell);
+                    appendTextCell(row, call.phone_number).style.color = '#ffffff';
+                    const languageCell = document.createElement('td');
+                    languageCell.appendChild(createTextElement('span', languageNameWithFlag(call.language), `lang-badge ${call.language}`));
+                    row.appendChild(languageCell);
+                    const stateClass = call.state === 'speaking' ? 'success' : call.state === 'listening' ? 'info' : 'warning';
+                    const stateCell = document.createElement('td');
+                    stateCell.appendChild(createTextElement('span', call.state_display, `status-badge ${stateClass}`));
+                    row.appendChild(stateCell);
+                    const durationCell = appendTextCell(row, call.duration_formatted);
+                    durationCell.style.color = '#ffffff';
+                    durationCell.style.fontFamily = 'monospace';
+                    return row;
+                });
+                tbody.replaceChildren(...rows);
             } catch (error) {
                 console.error('Error loading active calls:', error);
             }
@@ -1188,18 +1231,23 @@
 
                 const tbody = document.getElementById('recentCallsBody');
                 if (data.calls.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-secondary);">No calls yet</td></tr>';
+                    renderEmptyTable(tbody, 4, 'No calls yet');
                     return;
                 }
 
-                tbody.innerHTML = data.calls.map(call => `
-                    <tr>
-                        <td><strong>${call.name}</strong></td>
-                        <td><span class="lang-badge ${call.language}">${call.language === 'ar' ? 'Arabic' : 'English'} ${call.language === 'ar' ? '🇸🇦' : '🇺🇸'}</span></td>
-                        <td>${call.date}</td>
-                        <td>${call.duration ? call.duration + 's' : (call.call_count ? call.call_count + ' calls' : '--')}</td>
-                    </tr>
-                `).join('');
+                const rows = data.calls.map(call => {
+                    const row = document.createElement('tr');
+                    const nameCell = document.createElement('td');
+                    nameCell.appendChild(createTextElement('strong', call.name));
+                    row.appendChild(nameCell);
+                    const languageCell = document.createElement('td');
+                    languageCell.appendChild(createTextElement('span', languageNameWithFlag(call.language), `lang-badge ${call.language}`));
+                    row.appendChild(languageCell);
+                    appendTextCell(row, call.date);
+                    appendTextCell(row, call.duration ? `${call.duration}s` : (call.call_count ? `${call.call_count} calls` : '--'));
+                    return row;
+                });
+                tbody.replaceChildren(...rows);
             } catch (error) {
                 console.error('Error loading recent calls:', error);
             }
@@ -1219,17 +1267,26 @@
 
                 // Language distribution
                 const langDiv = document.getElementById('languageDistribution');
-                langDiv.innerHTML = data.language_distribution.map(lang => `
-                    <div class="metric-item" style="margin-bottom: 10px;">
-                        <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
-                            <span style="color: var(--text-primary); font-weight: 500;">${lang.language} ${lang.code === 'ar' ? '🇸🇦' : '🇺🇸'}</span>
-                            <span style="color: var(--text-primary); font-weight: 600;">${lang.count} (${lang.percentage}%)</span>
-                        </div>
-                        <div class="progress-bar-container" style="margin-top: 5px;">
-                            <div class="progress-bar ${lang.code === 'ar' ? 'success' : 'info'}" style="width: ${lang.percentage}%"></div>
-                        </div>
-                    </div>
-                `).join('');
+                const languageMetrics = data.language_distribution.map(language => {
+                    const metric = document.createElement('div');
+                    metric.className = 'metric-item';
+                    metric.style.marginBottom = '10px';
+                    const summary = document.createElement('div');
+                    summary.style.cssText = 'display: flex; justify-content: space-between; margin-bottom: 5px;';
+                    summary.appendChild(createTextElement('span', `${language.language} ${languageFlag(language.code)}`));
+                    summary.appendChild(createTextElement('span', `${language.count} (${language.percentage}%)`));
+                    metric.appendChild(summary);
+                    const progressContainer = document.createElement('div');
+                    progressContainer.className = 'progress-bar-container';
+                    progressContainer.style.marginTop = '5px';
+                    const progress = document.createElement('div');
+                    progress.className = `progress-bar ${language.code === 'ar' ? 'success' : 'info'}`;
+                    progress.style.width = `${Math.max(0, Math.min(Number(language.percentage) || 0, 100))}%`;
+                    progressContainer.appendChild(progress);
+                    metric.appendChild(progressContainer);
+                    return metric;
+                });
+                langDiv.replaceChildren(...languageMetrics);
             } catch (error) {
                 console.error('Error loading call statistics:', error);
             }
@@ -1244,21 +1301,26 @@
 
                 const div = document.getElementById('frequentCallers');
                 if (data.callers.length === 0) {
-                    div.innerHTML = '<p style="color: var(--text-secondary);">No frequent callers yet</p>';
+                    const emptyMessage = createTextElement('p', 'No frequent callers yet');
+                    emptyMessage.style.color = 'var(--text-secondary)';
+                    div.replaceChildren(emptyMessage);
                     return;
                 }
 
-                div.innerHTML = data.callers.map((caller, i) => `
-                    <div class="caller-item">
-                        <div class="caller-info">
-                            <div class="caller-avatar">${i === 0 ? '⭐' : caller.name.charAt(0)}</div>
-                            <div>
-                                <div class="caller-name">${i < 2 ? '⭐ ' : ''}${caller.name}</div>
-                            </div>
-                        </div>
-                        <div class="caller-calls">${caller.calls} calls</div>
-                    </div>
-                `).join('');
+                const callerCards = data.callers.map((caller, index) => {
+                    const card = document.createElement('div');
+                    card.className = 'caller-item';
+                    const identity = document.createElement('div');
+                    identity.className = 'caller-info';
+                    identity.appendChild(createTextElement('div', index === 0 ? '⭐' : caller.name.charAt(0), 'caller-avatar'));
+                    const nameContainer = document.createElement('div');
+                    nameContainer.appendChild(createTextElement('div', `${index < 2 ? '⭐ ' : ''}${caller.name}`, 'caller-name'));
+                    identity.appendChild(nameContainer);
+                    card.appendChild(identity);
+                    card.appendChild(createTextElement('div', `${caller.calls} calls`, 'caller-calls'));
+                    return card;
+                });
+                div.replaceChildren(...callerCards);
             } catch (error) {
                 console.error('Error loading frequent callers:', error);
             }
@@ -1276,24 +1338,33 @@
 
                 const tbody = document.getElementById('bookingsBody');
                 if (data.bookings.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-secondary);">No bookings yet</td></tr>';
+                    renderEmptyTable(tbody, 8, 'No bookings yet');
                     return;
                 }
 
-                tbody.innerHTML = data.bookings.map(booking => `
-                    <tr>
-                        <td><strong>${booking.client}</strong></td>
-                        <td>${booking.phone}</td>
-                        <td>${booking.accountant}</td>
-                        <td>${booking.time ? new Date(booking.time).toLocaleString() : '--'}</td>
-                        <td>${booking.type || '--'}</td>
-                        <td><span class="lang-badge ${booking.language}">${booking.language === 'ar' ? '🇸🇦' : '🇺🇸'}</span></td>
-                        <td><span class="status-badge operational">${booking.status}</span></td>
-                        <td>
-                            <button class="btn-action delete" onclick="deleteBooking(${booking.id})">Delete</button>
-                        </td>
-                    </tr>
-                `).join('');
+                const rows = data.bookings.map(booking => {
+                    const row = document.createElement('tr');
+                    const clientCell = document.createElement('td');
+                    clientCell.appendChild(createTextElement('strong', booking.client));
+                    row.appendChild(clientCell);
+                    appendTextCell(row, booking.phone);
+                    appendTextCell(row, booking.accountant);
+                    appendTextCell(row, booking.time ? new Date(booking.time).toLocaleString() : '--');
+                    appendTextCell(row, booking.type || '--');
+                    const languageCell = document.createElement('td');
+                    languageCell.appendChild(createTextElement('span', languageFlag(booking.language), `lang-badge ${booking.language}`));
+                    row.appendChild(languageCell);
+                    const statusCell = document.createElement('td');
+                    statusCell.appendChild(createTextElement('span', booking.status, 'status-badge operational'));
+                    row.appendChild(statusCell);
+                    const actionCell = document.createElement('td');
+                    const deleteButton = createTextElement('button', 'Delete', 'btn-action delete');
+                    deleteButton.addEventListener('click', () => deleteBooking(booking.id));
+                    actionCell.appendChild(deleteButton);
+                    row.appendChild(actionCell);
+                    return row;
+                });
+                tbody.replaceChildren(...rows);
             } catch (error) {
                 console.error('Error loading bookings:', error);
             }
@@ -1322,20 +1393,23 @@
 
                 const tbody = document.getElementById('smsBody');
                 if (data.messages.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">No SMS messages yet</td></tr>';
+                    renderEmptyTable(tbody, 6, 'No SMS messages yet');
                     return;
                 }
 
-                tbody.innerHTML = data.messages.map(sms => `
-                    <tr>
-                        <td>${sms.sent_at ? new Date(sms.sent_at).toLocaleString() : '--'}</td>
-                        <td>${sms.phone}</td>
-                        <td>${sms.name}</td>
-                        <td>${sms.message || '--'}</td>
-                        <td>${sms.provider}</td>
-                        <td><span class="status-badge operational">${sms.status}</span></td>
-                    </tr>
-                `).join('');
+                const rows = data.messages.map(sms => {
+                    const row = document.createElement('tr');
+                    appendTextCell(row, sms.sent_at ? new Date(sms.sent_at).toLocaleString() : '--');
+                    appendTextCell(row, sms.phone);
+                    appendTextCell(row, sms.name);
+                    appendTextCell(row, sms.message || '--');
+                    appendTextCell(row, sms.provider);
+                    const statusCell = document.createElement('td');
+                    statusCell.appendChild(createTextElement('span', sms.status, 'status-badge operational'));
+                    row.appendChild(statusCell);
+                    return row;
+                });
+                tbody.replaceChildren(...rows);
             } catch (error) {
                 console.error('Error loading SMS logs:', error);
             }
@@ -1358,8 +1432,7 @@
                 document.getElementById('totalMonthlyCost').textContent = totalBalance.toFixed(2);
 
                 const div = document.getElementById('apiCosts');
-                div.innerHTML = data.services.map(service => {
-                    // Status badge styling
+                const serviceCards = data.services.map(service => {
                     const statusClass = service.status === 'healthy' ? 'operational' :
                                        service.status === 'warning' ? 'warning' :
                                        service.status === 'critical' ? 'critical' : 'info';
@@ -1368,19 +1441,11 @@
                                       service.status === 'critical' ? 'Critical' :
                                       service.status === 'error' ? 'Error' : 'OK';
 
-                    // For ElevenLabs, show character usage progress bar
-                    let progressBar = '';
+                    let usagePercent = null;
                     if (service.characters_limit && service.characters_used !== null) {
-                        const percent = (service.characters_used / service.characters_limit * 100);
-                        const barClass = percent < 70 ? 'success' : percent < 90 ? 'warning' : 'danger';
-                        progressBar = `
-                            <div class="progress-bar-container">
-                                <div class="progress-bar ${barClass}" style="width: ${Math.min(percent, 100)}%"></div>
-                            </div>
-                        `;
+                        usagePercent = service.characters_used / service.characters_limit * 100;
                     }
 
-                    // Main value display
                     let mainValue = '';
                     let subInfo = '';
 
@@ -1400,22 +1465,33 @@
                         subInfo = service.note;
                     }
 
-                    return `
-                        <div class="cost-card">
-                            <div class="service-name">
-                                <strong>${service.name}</strong>
-                                <span class="status-badge ${statusClass}" style="margin-left: auto;">
-                                    ${statusText}
-                                </span>
-                            </div>
-                            <div class="amounts">
-                                <span class="spent">${mainValue}</span>
-                                <span class="budget">${subInfo}</span>
-                            </div>
-                            ${progressBar}
-                        </div>
-                    `;
-                }).join('');
+                    const card = document.createElement('div');
+                    card.className = 'cost-card';
+                    const nameRow = document.createElement('div');
+                    nameRow.className = 'service-name';
+                    nameRow.appendChild(createTextElement('strong', service.name));
+                    const status = createTextElement('span', statusText, `status-badge ${statusClass}`);
+                    status.style.marginLeft = 'auto';
+                    nameRow.appendChild(status);
+                    card.appendChild(nameRow);
+                    const amounts = document.createElement('div');
+                    amounts.className = 'amounts';
+                    amounts.appendChild(createTextElement('span', mainValue, 'spent'));
+                    amounts.appendChild(createTextElement('span', subInfo, 'budget'));
+                    card.appendChild(amounts);
+                    if (usagePercent !== null) {
+                        const progressContainer = document.createElement('div');
+                        progressContainer.className = 'progress-bar-container';
+                        const progressClass = usagePercent < 70 ? 'success' : usagePercent < 90 ? 'warning' : 'danger';
+                        const progress = document.createElement('div');
+                        progress.className = `progress-bar ${progressClass}`;
+                        progress.style.width = `${Math.max(0, Math.min(usagePercent, 100))}%`;
+                        progressContainer.appendChild(progress);
+                        card.appendChild(progressContainer);
+                    }
+                    return card;
+                });
+                div.replaceChildren(...serviceCards);
             } catch (error) {
                 console.error('Error loading API costs:', error);
                 document.getElementById('apiCosts').innerHTML = '<p style="color: var(--text-secondary);">Error loading API usage data</p>';
@@ -1431,23 +1507,32 @@
 
                 const tbody = document.getElementById('callersBody');
                 if (data.callers.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">No callers yet</td></tr>';
+                    renderEmptyTable(tbody, 6, 'No callers yet');
                     return;
                 }
 
-                tbody.innerHTML = data.callers.map(caller => `
-                    <tr>
-                        <td><strong>${caller.name || 'Unknown'}</strong></td>
-                        <td>${caller.phone}</td>
-                        <td><span class="lang-badge ${caller.language}">${caller.language === 'ar' ? '🇸🇦' : '🇺🇸'}</span></td>
-                        <td>${caller.calls}</td>
-                        <td>${caller.last_call || '--'}</td>
-                        <td>
-                            <button class="btn-action edit" onclick="editCaller('${caller.phone}', '${caller.name || ''}')">✏️ Edit</button>
-                            <button class="btn-action delete" onclick="deleteCaller('${caller.phone}')">🗑️</button>
-                        </td>
-                    </tr>
-                `).join('');
+                const rows = data.callers.map(caller => {
+                    const row = document.createElement('tr');
+                    const nameCell = document.createElement('td');
+                    nameCell.appendChild(createTextElement('strong', caller.name || 'Unknown'));
+                    row.appendChild(nameCell);
+                    appendTextCell(row, caller.phone);
+                    const languageCell = document.createElement('td');
+                    languageCell.appendChild(createTextElement('span', languageFlag(caller.language), `lang-badge ${caller.language}`));
+                    row.appendChild(languageCell);
+                    appendTextCell(row, caller.calls);
+                    appendTextCell(row, caller.last_call || '--');
+                    const actionCell = document.createElement('td');
+                    const editButton = createTextElement('button', '✏️ Edit', 'btn-action edit');
+                    editButton.addEventListener('click', () => editCaller(caller.phone, caller.name || ''));
+                    actionCell.appendChild(editButton);
+                    const deleteButton = createTextElement('button', '🗑️', 'btn-action delete');
+                    deleteButton.addEventListener('click', () => deleteCaller(caller.phone));
+                    actionCell.appendChild(deleteButton);
+                    row.appendChild(actionCell);
+                    return row;
+                });
+                tbody.replaceChildren(...rows);
             } catch (error) {
                 console.error('Error loading callers:', error);
             }

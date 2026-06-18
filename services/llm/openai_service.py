@@ -5,7 +5,6 @@ AI Voice Platform v2 - OpenAI LLM Service
 GPT-4o with streaming support for real-time conversations
 """
 
-import asyncio
 from typing import AsyncIterator, List, Optional
 from loguru import logger
 
@@ -21,9 +20,11 @@ from .llm_base import (
     LLMRequest,
     LLMResponse,
     LLMChunk,
-    Message,
     LLMRole
 )
+
+
+OPENAI_REQUEST_TIMEOUT_SECONDS = 30.0
 
 
 class OpenAILLM(LLMServiceBase):
@@ -78,7 +79,10 @@ class OpenAILLM(LLMServiceBase):
     async def _get_client(self) -> AsyncOpenAI:
         """Get or create OpenAI client"""
         if self._client is None:
-            kwargs = {"api_key": self.api_key}
+            kwargs = {
+                "api_key": self.api_key,
+                "timeout": OPENAI_REQUEST_TIMEOUT_SECONDS,
+            }
             if self._base_url:
                 kwargs["base_url"] = self._base_url
             self._client = AsyncOpenAI(**kwargs)

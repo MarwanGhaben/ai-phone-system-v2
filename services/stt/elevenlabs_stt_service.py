@@ -13,7 +13,7 @@ ulaw_8000 format, avoiding spectral artifacts from upsampling.
 import asyncio
 import base64
 import json
-from typing import AsyncIterator, Optional, List
+from typing import AsyncIterator, Optional
 from loguru import logger
 
 try:
@@ -71,6 +71,7 @@ class ElevenLabsSTT(STTServiceBase):
         self._is_listening = False
         self._receive_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._connection_lock = asyncio.Lock()
 
     async def connect(self) -> bool:
         """
@@ -210,6 +211,7 @@ class ElevenLabsSTT(STTServiceBase):
         transcript consumer to spin-loop. Instead, we swap the WebSocket and
         receive task while keeping _is_listening=True and the same queue.
         """
+        await self._connection_lock.acquire()
         try:
             logger.info(f"ElevenLabs STT: Resetting for listening (language={self.language})")
 
@@ -285,6 +287,8 @@ class ElevenLabsSTT(STTServiceBase):
                 await self.connect()
             except Exception:
                 logger.error("ElevenLabs STT: Failed to recover after reset error")
+        finally:
+            self._connection_lock.release()
 
     async def stream_audio(self, audio_chunk: AudioChunk) -> None:
         """
@@ -296,17 +300,17 @@ class ElevenLabsSTT(STTServiceBase):
         Args:
             audio_chunk: Audio data to transcribe (μ-law 8kHz from Twilio)
         """
-        if self._status != STTStatus.CONNECTED or not self._websocket:
-            return
-
         try:
-            # Send raw μ-law audio directly — no conversion needed
-            message = {
-                "message_type": "input_audio_chunk",
-                "audio_base_64": base64.b64encode(audio_chunk.data).decode("utf-8"),
-            }
+            async with self._connection_lock:
+                if self._status != STTStatus.CONNECTED or not self._websocket:
+                    return
 
-            await self._websocket.send(json.dumps(message))
+                message = {
+                    "message_type": "input_audio_chunk",
+                    "audio_base_64": base64.b64encode(audio_chunk.data).decode("utf-8"),
+                }
+                websocket = self._websocket
+                await websocket.send(json.dumps(message))
 
         except websockets.exceptions.ConnectionClosed:
             logger.warning("ElevenLabs STT: WebSocket closed while sending audio")

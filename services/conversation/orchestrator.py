@@ -14,18 +14,40 @@ The orchestrator is the brain of the AI voice platform. It coordinates:
 """
 
 import asyncio
-import json
+import re
 import time
-from typing import Optional, Dict, Any, AsyncIterator
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
+from dateutil import parser as date_parser
+from dateutil.parser import ParserError
 from loguru import logger
 
 from config.settings import get_settings
 from services.stt import create_stt_service
 from services.tts.elevenlabs_service import create_elevenlabs_tts
-from services.llm.openai_service import create_openai_llm, Message, LLMRole
+from services.llm.openai_service import create_openai_llm
+from services.llm.llm_base import Message, LLMRole
 from services.telephony.twilio_service import TwilioMediaStreamHandler
+
+
+def _parse_booking_datetime(date_time_text: str) -> Optional[datetime]:
+    if not date_time_text.strip():
+        return None
+
+    iso_match = re.match(r'(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})', date_time_text)
+    if iso_match:
+        try:
+            return datetime(*(int(part) for part in iso_match.groups()))
+        except ValueError:
+            pass
+
+    try:
+        appointment_time = date_parser.parse(date_time_text, fuzzy=True)
+    except (ParserError, OverflowError):
+        return None
+    return appointment_time + timedelta(days=7) if appointment_time < datetime.now() else appointment_time
 
 
 class ConversationState(Enum):
@@ -325,7 +347,6 @@ class ConversationOrchestrator:
         """Get system prompt for LLM"""
         # Get accountant names from service
         from services.config.accountants_service import get_accountants_service
-        from datetime import datetime
         acc_service = get_accountants_service()
         accountant_names_en = acc_service.get_names_formatted("en")
         accountant_names_ar = acc_service.get_names_formatted("ar")
@@ -1351,8 +1372,6 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         Returns:
             Result message to feed back to LLM
         """
-        import json
-        from datetime import datetime, timedelta
         from services.calendar.ms_bookings_service import get_calendar_service
         from services.config.accountants_service import get_accountants_service
 
@@ -1362,11 +1381,18 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
         client_type = arguments.get("client_type", "individual")
         accountant_name = arguments.get("accountant_name", "")
-        date_time_str = arguments.get("date_time", "")
+        date_time_str = arguments.get("date_time") or ""
         customer_name = arguments.get("customer_name", context.caller_name if context else "")
         customer_email = arguments.get("customer_email", "")
 
         logger.info(f"Orchestrator: Checking booking - type={client_type}, accountant={accountant_name}, date={date_time_str}, customer={customer_name}, email={customer_email}")
+
+        appointment_time = _parse_booking_datetime(date_time_str)
+        if appointment_time is None:
+            if context:
+                context.pending_booking = None
+            logger.warning(f"Orchestrator: Could not parse booking date: {date_time_str!r}")
+            return "INVALID_DATE_TIME: Ask the caller to repeat the requested date and time."
 
         # Check if MSGraph is configured
         if not await calendar.is_available():
@@ -1422,36 +1448,6 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
             if not service_id:
                 return "BOOKING_ERROR: Could not find a matching service. Please ask the caller for more details or offer to transfer them."
-
-            # Parse date/time
-            appointment_time = None
-            if date_time_str:
-                import re
-                iso_match = re.match(r'(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})', date_time_str)
-                if iso_match:
-                    try:
-                        appointment_time = datetime(
-                            int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)),
-                            int(iso_match.group(4)), int(iso_match.group(5))
-                        )
-                        logger.info(f"Orchestrator: Parsed ISO date: {appointment_time}")
-                    except ValueError as e:
-                        logger.warning(f"Orchestrator: Invalid ISO date values: {date_time_str} - {e}")
-
-                if not appointment_time:
-                    from dateutil import parser as date_parser
-                    try:
-                        appointment_time = date_parser.parse(date_time_str, fuzzy=True)
-                        logger.info(f"Orchestrator: Parsed with dateutil: {appointment_time}")
-                        if appointment_time < datetime.now():
-                            logger.warning(f"Orchestrator: Parsed date {appointment_time} is in the past, adjusting to next week")
-                            appointment_time += timedelta(days=7)
-                    except Exception:
-                        logger.warning(f"Orchestrator: Could not parse date: {date_time_str}")
-
-            if not appointment_time:
-                appointment_time = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                logger.warning(f"Orchestrator: Using default appointment time: {appointment_time}")
 
             logger.info(f"Orchestrator: Final appointment time: {appointment_time} (from input: '{date_time_str}')")
 

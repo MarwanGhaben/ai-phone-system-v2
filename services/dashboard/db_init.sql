@@ -117,8 +117,5 @@ CREATE INDEX IF NOT EXISTS idx_sms_logs_sent_at ON sms_logs(sent_at);
 CREATE INDEX IF NOT EXISTS idx_admin_sessions_token ON admin_sessions(session_token);
 CREATE INDEX IF NOT EXISTS idx_mfa_codes_user_expires ON mfa_codes(user_id, expires_at);
 
--- Insert default admin user (password: admin123 - CHANGE THIS!)
--- Password hash is bcrypt of 'admin123'
-INSERT INTO admin_users (username, email, password_hash, is_superuser)
-VALUES ('admin', 'admin@flexibleaccounting.ca', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4.V4ferE6EbLMOoS', TRUE)
-ON CONFLICT (username) DO NOTHING;
+-- Provision the first dashboard administrator through the trusted deployment
+-- tooling that calls AuthService.create_user with a unique password.
