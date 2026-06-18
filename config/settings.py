@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     # =====================================================
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     redis_session_ttl: int = 3600  # 1 hour
+    trusted_proxy_cidrs: str = Field(
+        default="127.0.0.1/32,::1/128,172.16.0.0/12",
+        alias="TRUSTED_PROXY_CIDRS",
+    )
 
     # =====================================================
     # TWILIO

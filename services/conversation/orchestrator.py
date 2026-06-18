@@ -30,24 +30,31 @@ from services.tts.elevenlabs_service import create_elevenlabs_tts
 from services.llm.openai_service import create_openai_llm
 from services.llm.llm_base import Message, LLMRole
 from services.telephony.twilio_service import TwilioMediaStreamHandler
+from services.calendar.business_time import as_business_time, business_now
 
 
 def _parse_booking_datetime(date_time_text: str) -> Optional[datetime]:
     if not date_time_text.strip():
         return None
 
-    iso_match = re.match(r'(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})', date_time_text)
+    iso_match = re.fullmatch(
+        r'(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})\s*',
+        date_time_text,
+    )
     if iso_match:
         try:
-            return datetime(*(int(part) for part in iso_match.groups()))
+            parsed_time = datetime(*(int(part) for part in iso_match.groups()))
+            return as_business_time(parsed_time)
         except ValueError:
             pass
 
     try:
-        appointment_time = date_parser.parse(date_time_text, fuzzy=True)
+        appointment_time = as_business_time(
+            date_parser.parse(date_time_text, fuzzy=True)
+        )
     except (ParserError, OverflowError):
         return None
-    return appointment_time + timedelta(days=7) if appointment_time < datetime.now() else appointment_time
+    return appointment_time + timedelta(days=7) if appointment_time < business_now() else appointment_time
 
 
 class ConversationState(Enum):
@@ -1918,6 +1925,9 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         if not confirm_cancel:
             return "CANCEL_ABORTED: Cancellation not confirmed. Ask if they still want to cancel or if they'd like to keep the appointment."
 
+        if not context or not context.phone_number:
+            return "CANCEL_ERROR: Cannot identify the caller. Offer to transfer to a human for assistance."
+
         # Select the appointment to cancel from stored context (not from raw LLM
         # IDs - the LLM often hallucinates those). With ONE appointment we use
         # it directly. With SEVERAL, the LLM must pass appointment_number
@@ -1925,7 +1935,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         # cancel the FIRST one, which could be the wrong appointment entirely.
         appointment_id = None
         selected_appt = None
-        found = context.found_appointments if context else None
+        found = context.found_appointments
         if found:
             if len(found) == 1:
                 selected_appt = found[0]
@@ -1951,11 +1961,6 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             appointment_id = selected_appt.get('id', '')
             logger.info(f"Orchestrator: Cancelling appointment: {selected_appt.get('formatted_time', '?')} with {selected_appt.get('staff_name', '?')} (ID: {appointment_id[:30]}...)")
 
-        # Fallback to LLM argument only if context doesn't have it
-        if not appointment_id:
-            appointment_id = arguments.get("appointment_id", "")
-            logger.warning(f"Orchestrator: No appointment in context, using LLM argument: {appointment_id}")
-
         if not appointment_id:
             return "CANCEL_ERROR: No appointment found. Call lookup_my_bookings first to find the appointment."
 
@@ -1967,7 +1972,9 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         logger.info(f"Orchestrator: Spoke hold message before cancel API call")
 
         try:
-            success = await calendar.cancel_appointment(appointment_id)
+            success = await calendar.cancel_customer_appointment(
+                appointment_id, context.phone_number
+            )
 
             if success:
                 logger.info(f"Orchestrator: Cancelled appointment {appointment_id}")
@@ -2501,35 +2508,14 @@ CRITICAL INSTRUCTIONS:
                 logger.error("Orchestrator: TTS streaming returned 0 bytes")
                 return
 
-            # =====================================================
-            # POST-STREAM PLAYBACK WAIT
-            # =====================================================
-            # Audio was streamed in near-real-time, so most of it has
-            # already been played by Twilio during the stream. We only
-            # need to wait for the tail end + network buffer.
-            #
-            # With streaming: TTS generation time ≈ audio duration
-            # (ElevenLabs generates roughly at real-time speed)
-            # So by the time streaming ends, most audio has played.
-            # We just wait a short buffer for the last chunks.
             audio_duration = total_bytes / 8000.0
-            # Estimate how much audio is still buffered at Twilio
-            # (audio_duration minus the time we spent streaming)
-            remaining_playback = max(0, audio_duration - tts_elapsed)
-            playback_buffer = min(remaining_playback + 0.1, audio_duration)  # Reduced buffer for faster response
-            step = 0.1
-
-            if playback_buffer > 0:
-                logger.info(f"Orchestrator: Waiting {playback_buffer:.1f}s for remaining playback (audio={audio_duration:.1f}s, streamed in {tts_elapsed:.1f}s)")
-                elapsed = 0.0
-                while elapsed < playback_buffer:
-                    await asyncio.sleep(step)
-                    elapsed += step
-
-                    # Check for barge-in during remaining playback
-                    if context.state != ConversationState.SPEAKING:
-                        logger.info(f"Orchestrator: Barge-in during post-stream wait at {elapsed:.1f}s")
-                        break
+            playback_confirmed = await twilio_handler.wait_for_playback(
+                timeout=max(1.0, audio_duration + 2.0)
+            )
+            if not playback_confirmed:
+                logger.warning(
+                    f"Orchestrator: Playback was not confirmed for call {call_sid}"
+                )
 
             # Reset STT for clean listening — reconnects to flush echo buffer
             # This gives STT a completely clean slate so the user's first words
@@ -2720,13 +2706,6 @@ CRITICAL INSTRUCTIONS:
             transfer_msg = "Of course, let me transfer you now. One moment please."
 
         await self._speak_to_caller(call_sid, transfer_msg, lang)
-
-        # Wait for the transfer message audio to finish playing
-        # _speak_to_caller queues audio but it's sent asynchronously.
-        # Estimate audio duration: μ-law 8kHz = 8000 bytes/sec.
-        # A typical transfer message is ~3-4 seconds. Add buffer for safety.
-        # We calculate from the last TTS response size if possible.
-        await asyncio.sleep(5)  # 5 seconds is enough for transfer message + Twilio buffer
 
         # Use Twilio REST API to update the call with <Dial> TwiML
         try:

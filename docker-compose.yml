@@ -70,6 +70,7 @@ services:
 
       # Redis
       REDIS_URL: redis://redis:6379/0
+      TRUSTED_PROXY_CIDRS: 172.16.0.0/12
 
       # Twilio
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
@@ -117,9 +118,8 @@ services:
       MSGRAPH_CLIENT_ID: ${MSGRAPH_CLIENT_ID:-}
       MSGRAPH_CLIENT_SECRET: ${MSGRAPH_CLIENT_SECRET:-}
       MSGRAPH_SENDER_EMAIL: ${MSGRAPH_SENDER_EMAIL:-}
-    ports:
-      - "8000:8000"
-      - "8001:8001"  # WebSocket port
+    expose:
+      - "8000"
     volumes:
       - ./logs:/app/logs
       - ./config:/app/config:ro

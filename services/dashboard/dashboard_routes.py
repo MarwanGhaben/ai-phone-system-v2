@@ -13,10 +13,12 @@ from fastapi import APIRouter, Request, Response, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from loguru import logger
+from redis.exceptions import RedisError
 
 from services.dashboard.auth_service import get_auth_service
 from services.dashboard.email_service import get_email_service
 from services.database import get_db_pool
+from services.security.client_ip import get_client_ip
 
 
 # =====================================================
@@ -91,14 +93,6 @@ class PasswordChangeRequest(BaseModel):
 # AUTH HELPERS
 # =====================================================
 
-def get_client_ip(request: Request) -> str:
-    """Get client IP address from request"""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-
 async def get_current_user(request: Request) -> Optional[dict]:
     """Get current user from session cookie"""
     session_token = request.cookies.get("session_token")
@@ -131,11 +125,18 @@ async def login(request: Request, login_data: LoginRequest):
     email_svc = get_email_service()
     ip_address = get_client_ip(request)
 
-    success, user, error = await auth.authenticate_user(
-        login_data.username,
-        login_data.password,
-        ip_address
-    )
+    try:
+        success, user, error = await auth.authenticate_user(
+            login_data.username,
+            login_data.password,
+            ip_address
+        )
+    except RedisError as exc:
+        logger.error(f"Login rate limiting unavailable: {exc}")
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "error": "Login temporarily unavailable"},
+        )
 
     if not success:
         return JSONResponse(

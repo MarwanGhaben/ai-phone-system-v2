@@ -6,17 +6,17 @@ Security utilities including Twilio signature validation,
 rate limiting, and security headers.
 """
 
-import time
-import hashlib
-from collections import defaultdict
-from typing import Callable, Dict, Optional
-from urllib.parse import urlencode
+from typing import Callable, Optional
 
 from fastapi import Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from twilio.request_validator import RequestValidator
 from loguru import logger
+from redis.exceptions import RedisError
+
+from services.security.client_ip import get_client_ip
+from services.security.rate_limiter import RedisRateLimiter, create_redis_client
 
 
 class TwilioSignatureValidator:
@@ -90,98 +90,6 @@ class TwilioSignatureValidator:
         return is_valid
 
 
-class RateLimiter:
-    """
-    Simple in-memory rate limiter using sliding window.
-
-    For production, consider using Redis for distributed rate limiting.
-    """
-
-    def __init__(
-        self,
-        requests_per_minute: int = 60,
-        burst_limit: int = 10
-    ):
-        """
-        Initialize rate limiter.
-
-        Args:
-            requests_per_minute: Max requests allowed per minute per IP
-            burst_limit: Max requests allowed in quick succession
-        """
-        self.requests_per_minute = requests_per_minute
-        self.burst_limit = burst_limit
-        self.requests: Dict[str, list] = defaultdict(list)
-        self.burst_tracker: Dict[str, list] = defaultdict(list)
-
-    def _get_client_ip(self, request: Request) -> str:
-        """Extract client IP, handling reverse proxies."""
-        # Check for forwarded IP (reverse proxy)
-        forwarded = request.headers.get("X-Forwarded-For", "")
-        if forwarded:
-            # Take first IP (original client)
-            return forwarded.split(",")[0].strip()
-
-        # Check X-Real-IP (nginx)
-        real_ip = request.headers.get("X-Real-IP", "")
-        if real_ip:
-            return real_ip.strip()
-
-        # Fall back to direct connection
-        return request.client.host if request.client else "unknown"
-
-    def _cleanup_old_requests(self, client_ip: str, window_seconds: int = 60):
-        """Remove requests outside the time window."""
-        now = time.time()
-        cutoff = now - window_seconds
-
-        self.requests[client_ip] = [
-            t for t in self.requests[client_ip] if t > cutoff
-        ]
-
-        # Cleanup burst tracker (1 second window)
-        burst_cutoff = now - 1
-        self.burst_tracker[client_ip] = [
-            t for t in self.burst_tracker[client_ip] if t > burst_cutoff
-        ]
-
-    def is_rate_limited(self, request: Request) -> tuple[bool, dict]:
-        """
-        Check if request should be rate limited.
-
-        Returns:
-            Tuple of (is_limited, info_dict)
-        """
-        client_ip = self._get_client_ip(request)
-        now = time.time()
-
-        self._cleanup_old_requests(client_ip)
-
-        # Check burst limit (requests per second)
-        if len(self.burst_tracker[client_ip]) >= self.burst_limit:
-            return True, {
-                "reason": "burst_limit_exceeded",
-                "limit": self.burst_limit,
-                "retry_after": 1
-            }
-
-        # Check requests per minute
-        if len(self.requests[client_ip]) >= self.requests_per_minute:
-            oldest = min(self.requests[client_ip]) if self.requests[client_ip] else now
-            retry_after = int(60 - (now - oldest)) + 1
-            return True, {
-                "reason": "rate_limit_exceeded",
-                "limit": self.requests_per_minute,
-                "retry_after": retry_after
-            }
-
-        # Record this request
-        self.requests[client_ip].append(now)
-        self.burst_tracker[client_ip].append(now)
-
-        return False, {}
-
-
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
     Adds security headers to all responses.
@@ -237,7 +145,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         exclude_paths: list[str] = None
     ):
         super().__init__(app)
-        self.limiter = RateLimiter(requests_per_minute, burst_limit)
+        self.limiter = RedisRateLimiter(
+            create_redis_client(), requests_per_minute, burst_limit
+        )
         self.exclude_paths = exclude_paths or ["/health", "/ws/calls"]
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
@@ -245,11 +155,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if any(request.url.path.startswith(p) for p in self.exclude_paths):
             return await call_next(request)
 
-        is_limited, info = self.limiter.is_rate_limited(request)
+        client_ip = get_client_ip(request)
+        try:
+            is_limited, info = await self.limiter.check(client_ip)
+        except RedisError as exc:
+            logger.error(f"Rate limiting unavailable: {exc}")
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"error": "Rate limiting temporarily unavailable"},
+            )
 
         if is_limited:
             logger.warning(
-                f"Rate limit exceeded for {request.client.host}: {info['reason']}"
+                f"Rate limit exceeded for {client_ip}: {info['reason']}"
             )
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,

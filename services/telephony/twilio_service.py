@@ -8,7 +8,8 @@ Handles Twilio Media Streams for real-time bidirectional audio
 import asyncio
 import json
 import base64
-from typing import Callable, Optional, Dict, Any
+from uuid import uuid4
+from typing import Callable, Optional, Any
 from fastapi import WebSocket, WebSocketDisconnect
 from loguru import logger
 import httpx
@@ -30,6 +31,7 @@ class TwilioMediaStreamHandler:
     EVENT_CONNECTED = "connected"
     EVENT_START = "start"
     EVENT_MEDIA = "media"
+    EVENT_MARK = "mark"
     EVENT_STOP = "stop"
     EVENT_DISCONNECTED = "disconnected"
     EVENT_ERROR = "error"
@@ -55,39 +57,20 @@ class TwilioMediaStreamHandler:
         self._is_connected = False
         self._is_streaming = False
         self._interrupted = False  # Set to True to abort current audio playback
-
-        # Queue for audio to send (consumed by event loop)
-        # Initialize immediately so audio can be queued before handle_connection() starts
-        self._audio_queue: asyncio.Queue = asyncio.Queue()
+        self._send_lock = asyncio.Lock()
+        self._pending_marks: dict[str, asyncio.Future] = {}
 
     async def handle_connection(self) -> None:
         """
         Handle the WebSocket connection lifecycle
 
-        This method processes incoming events from Twilio and sends queued audio.
-        Runs both tasks concurrently: receiving messages and sending audio.
+        This method processes incoming events from Twilio.
         """
         self._is_connected = True
         logger.info(f"Twilio: Media stream connected for call {self.call_sid}, starting event loop...")
 
-        # Create tasks for receiving and sending
-        receive_task = asyncio.create_task(self._receive_messages())
-        send_task = asyncio.create_task(self._send_queued_audio())
-
         try:
-            # Wait for either task to complete (usually connection ends)
-            done, pending = await asyncio.wait(
-                [receive_task, send_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-
-            # Cancel remaining tasks
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            await self._receive_messages()
 
         except WebSocketDisconnect:
             logger.info(f"Twilio: WebSocket disconnected for call {self.call_sid}")
@@ -125,26 +108,6 @@ class TwilioMediaStreamHandler:
             logger.error(f"Twilio: Receive loop error: {e}")
             self._is_connected = False
 
-    async def _send_queued_audio(self) -> None:
-        """Send queued audio to Twilio"""
-        try:
-            while self._is_connected:
-                # Wait for audio to send (with timeout to allow checking _is_connected)
-                try:
-                    audio_data = await asyncio.wait_for(
-                        self._audio_queue.get(),
-                        timeout=0.5
-                    )
-                    await self._send_audio_chunked(audio_data)
-                except asyncio.TimeoutError:
-                    # No audio to send, continue loop
-                    continue
-
-        except Exception as e:
-            logger.error(f"Twilio: Send loop error: {e}")
-            import traceback
-            logger.error(f"Twilio: Traceback:\n{traceback.format_exc()}")
-
     async def _process_message(self, message: str) -> None:
         """
         Process incoming message from Twilio
@@ -171,6 +134,8 @@ class TwilioMediaStreamHandler:
                 await self._on_start(data)
             elif event == self.EVENT_MEDIA:
                 await self._on_media(data)
+            elif event == self.EVENT_MARK:
+                self._on_mark(data)
             elif event == self.EVENT_STOP:
                 self._is_streaming = False
                 await self._on_stop(data)
@@ -238,52 +203,17 @@ class TwilioMediaStreamHandler:
     async def _on_disconnected(self, data: dict) -> None:
         """Handle disconnected event"""
         logger.info(f"Twilio: Disconnected event for call {self.call_sid}")
+        self._resolve_pending_marks(False)
 
         # Notify registered handler
         if self._on_call_ended:
             await self._on_call_ended(self.call_sid)
 
-    async def send_audio(self, audio_data: bytes) -> None:
-        """
-        Send audio to Twilio (play to caller)
-
-        Audio is queued and sent from the event loop's send task.
-        NOTE: This clears any pending audio before sending new audio (interruption).
-
-        Args:
-            audio_data: Audio data (μ-law 8kHz for Twilio)
-        """
-        if not self._is_streaming:
-            logger.warning(f"Twilio: Cannot send audio - not streaming")
-            return
-
-        if not self.stream_sid:
-            logger.error(f"Twilio: Cannot send audio - stream_sid is empty!")
-            return
-
-        if self._audio_queue is None:
-            logger.error(f"Twilio: Cannot send audio - queue not initialized!")
-            return
-
-        # CRITICAL: Clear any pending audio before sending new audio
-        # This prevents old audio from playing after new audio (repeating bug)
-        cleared = 0
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-                cleared += 1
-            except asyncio.QueueEmpty:
-                break
-
-        if cleared > 0:
-            logger.info(f"Twilio: Cleared {cleared} pending audio(s) from queue")
-
-        # Send clear event to Twilio to stop any currently playing audio
-        await self.send_event("clear")
-
-        # Put new audio in queue - will be sent by send task
-        await self._audio_queue.put(audio_data)
-        logger.info(f"Twilio: Queued {len(audio_data)} bytes audio for sending")
+    def _on_mark(self, data: dict) -> None:
+        mark_name = data.get("mark", {}).get("name", "")
+        playback_wait = self._pending_marks.get(mark_name)
+        if playback_wait and not playback_wait.done():
+            playback_wait.set_result(True)
 
     async def clear_audio(self) -> None:
         """
@@ -291,15 +221,7 @@ class TwilioMediaStreamHandler:
         Sends a 'clear' event to Twilio to stop playback immediately.
         """
         self._interrupted = True
-
-        # Drain the queue
-        cleared = 0
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-                cleared += 1
-            except asyncio.QueueEmpty:
-                break
+        self._resolve_pending_marks(False)
 
         # Tell Twilio to stop playing any buffered audio
         try:
@@ -307,8 +229,6 @@ class TwilioMediaStreamHandler:
         except Exception as e:
             logger.warning(f"Twilio: Failed to send clear event: {e}")
 
-        if cleared > 0:
-            logger.info(f"Twilio: Barge-in cleared {cleared} queued audio(s)")
         logger.info(f"Twilio: Audio playback interrupted")
 
     async def stream_audio_chunks(self, audio_stream) -> int:
@@ -331,12 +251,7 @@ class TwilioMediaStreamHandler:
 
         self._interrupted = False
 
-        # Clear any pending audio and stop current playback
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        self._resolve_pending_marks(False)
         await self.send_event("clear")
 
         CHUNK_SIZE = 160  # 20ms at 8kHz ulaw
@@ -383,7 +298,7 @@ class TwilioMediaStreamHandler:
                             "payload": payload
                         }
                     }
-                    await self.websocket.send_json(media_event)
+                    await self._send_message(media_event)
                     total_bytes += CHUNK_SIZE
                     chunks_sent += 1
 
@@ -404,7 +319,7 @@ class TwilioMediaStreamHandler:
                         "payload": payload
                     }
                 }
-                await self.websocket.send_json(media_event)
+                await self._send_message(media_event)
                 total_bytes += len(buffer)
 
             logger.info(f"Twilio: Stream complete - {total_bytes} bytes in {chunks_sent} chunks")
@@ -415,79 +330,6 @@ class TwilioMediaStreamHandler:
             import traceback
             logger.error(f"Twilio: Traceback:\n{traceback.format_exc()}")
             return total_bytes
-
-    async def _send_audio_chunked(self, audio_data: bytes) -> None:
-        """
-        Send audio to Twilio with proper chunking
-
-        Twilio Media Streams requires audio in 20ms chunks (160 bytes at 8kHz μ-law).
-        Sending larger payloads can cause playback issues.
-        Checks _interrupted flag each chunk to allow barge-in to abort playback.
-
-        Args:
-            audio_data: Audio data (μ-law 8kHz for Twilio)
-        """
-        total_bytes = len(audio_data)
-        self._interrupted = False  # Reset at start of new playback
-
-        # Twilio Media Streams: 20ms = 160 bytes at 8kHz μ-law
-        CHUNK_SIZE = 160  # 20ms at 8kHz μ-law
-        CHUNK_INTERVAL = 0.015  # Send every 15ms (slightly faster than real-time)
-
-        logger.info(f"Twilio: Sending {total_bytes} bytes audio in {CHUNK_SIZE}-byte chunks (streamSid={self.stream_sid})")
-
-        try:
-            # Note: clear event is already sent in send_audio() before queuing
-            # No need to send it again here
-
-            # Calculate number of chunks
-            num_chunks = (len(audio_data) + CHUNK_SIZE - 1) // CHUNK_SIZE
-            logger.info(f"Twilio: Will send {num_chunks} chunks of {CHUNK_SIZE} bytes each")
-
-            # Send each chunk
-            for i in range(num_chunks):
-                # Check if interrupted by barge-in
-                if self._interrupted:
-                    logger.info(f"Twilio: Audio playback interrupted at chunk {i+1}/{num_chunks} (barge-in)")
-                    await self.send_event("clear")
-                    return
-
-                start = i * CHUNK_SIZE
-                end = min(start + CHUNK_SIZE, len(audio_data))
-                chunk = audio_data[start:end]
-
-                # Encode chunk to base64
-                payload = base64.b64encode(chunk).decode("utf-8")
-
-                # Create media event for this chunk
-                # Per Twilio docs: media events sent TO Twilio should NOT include 'track' field
-                # The 'track' field is only present in media events FROM Twilio
-                media_event = {
-                    "event": "media",
-                    "streamSid": self.stream_sid,
-                    "media": {
-                        "payload": payload
-                    }
-                }
-
-                # Send the chunk
-                await self.websocket.send_json(media_event)
-
-                # Log progress every 50 chunks
-                if (i + 1) % 50 == 0 or i == 0:
-                    logger.info(f"Twilio: Sent chunk {i+1}/{num_chunks} ({len(chunk)} bytes)")
-
-                # Small delay between chunks (except last one)
-                if i < num_chunks - 1:
-                    await asyncio.sleep(CHUNK_INTERVAL)
-
-            logger.info(f"Twilio: Audio sent successfully - {total_bytes} bytes in {num_chunks} chunks")
-
-        except Exception as e:
-            logger.error(f"Twilio: Failed to send audio: {e}")
-            import traceback
-            logger.error(f"Twilio: Traceback:\n{traceback.format_exc()}")
-            raise  # Re-raise so caller knows send failed
 
     async def send_event(self, event: str, **kwargs) -> None:
         """
@@ -503,7 +345,30 @@ class TwilioMediaStreamHandler:
             **kwargs
         }
 
-        await self.websocket.send_json(message)
+        await self._send_message(message)
+
+    async def _send_message(self, message: dict) -> None:
+        async with self._send_lock:
+            await self.websocket.send_json(message)
+
+    async def wait_for_playback(self, timeout: float) -> bool:
+        mark_name = f"playback-{uuid4().hex}"
+        playback_wait = asyncio.get_running_loop().create_future()
+        self._pending_marks[mark_name] = playback_wait
+
+        try:
+            await self.send_event("mark", mark={"name": mark_name})
+            return await asyncio.wait_for(playback_wait, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"Twilio: Playback mark timed out for call {self.call_sid}")
+            return False
+        finally:
+            self._pending_marks.pop(mark_name, None)
+
+    def _resolve_pending_marks(self, played: bool) -> None:
+        for playback_wait in self._pending_marks.values():
+            if not playback_wait.done():
+                playback_wait.set_result(played)
 
     def set_media_handler(self, handler: Callable[[bytes], Any]) -> None:
         """Set handler for incoming audio"""
@@ -517,6 +382,7 @@ class TwilioMediaStreamHandler:
         """Cleanup resources"""
         self._is_connected = False
         self._is_streaming = False
+        self._resolve_pending_marks(False)
         logger.info(f"Twilio: Cleaned up handler for call {self.call_sid}")
 
 

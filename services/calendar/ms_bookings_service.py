@@ -4,13 +4,13 @@ AI Voice Platform v2 - Microsoft Bookings Service
 =====================================================
 """
 
-import os
 import httpx
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from loguru import logger
 
 from config.settings import get_settings
+from services.calendar.business_time import business_now, parse_graph_datetime
 from services.calendar.calendar_base import (
     CalendarServiceBase,
     StaffMember,
@@ -18,6 +18,21 @@ from services.calendar.calendar_base import (
     TimeSlot,
     BookingResult
 )
+
+
+def normalize_customer_phone(phone_number: str) -> Optional[str]:
+    digits = "".join(character for character in phone_number if character.isdigit())
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else None
+
+
+def appointment_customer_phone(appointment: Dict[str, Any]) -> str:
+    direct_phone = appointment.get("customerPhone", "")
+    if direct_phone:
+        return direct_phone
+    customers = appointment.get("customers", [])
+    return customers[0].get("phone", "") if customers else ""
 
 
 class MSBookingsService(CalendarServiceBase):
@@ -288,9 +303,7 @@ class MSBookingsService(CalendarServiceBase):
             # (UTC) here labeled as Eastern shifted the window ~4-5 hours into the
             # future, which excluded same-day morning/noon slots — callers could
             # not book "today" even when slots were free.
-            from zoneinfo import ZoneInfo
-            eastern_tz = ZoneInfo("America/Toronto")
-            now_eastern = datetime.now(eastern_tz)
+            now_eastern = business_now()
             # Small lead buffer so we don't offer a slot that is essentially "now".
             # Kept short (10 min) so near-term same-day bookings still work.
             start_date = now_eastern + timedelta(minutes=10)
@@ -328,13 +341,8 @@ class MSBookingsService(CalendarServiceBase):
                             end_time_str = item.get('endDateTime', {}).get('dateTime', '')
 
                             if start_time_str and end_time_str:
-                                # Parse and strip timezone info to get naive datetime
-                                # (times are already in Eastern since we requested Eastern timezone)
-                                start_dt = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
-                                end_dt = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
-                                # Make naive for consistent comparison with user-provided times
-                                start_dt = start_dt.replace(tzinfo=None)
-                                end_dt = end_dt.replace(tzinfo=None)
+                                start_dt = parse_graph_datetime(start_time_str)
+                                end_dt = parse_graph_datetime(end_time_str)
 
                                 # Generate 30-minute slots
                                 current_slot = start_dt
@@ -425,7 +433,6 @@ class MSBookingsService(CalendarServiceBase):
 
             if result and result.get('id'):
                 # Get staff name
-                staff = await self.get_staff_by_name("")
                 staff_name = "Staff Member"
                 if staff_id:
                     for s in self._staff_cache.values():
@@ -465,6 +472,11 @@ class MSBookingsService(CalendarServiceBase):
         Returns:
             List of appointment dicts with id, staff_name, start_time, service_name
         """
+        normalized_phone = normalize_customer_phone(customer_phone)
+        if not normalized_phone:
+            logger.warning("MS Bookings: Invalid customer phone for appointment lookup")
+            return []
+
         if not await self.is_available():
             logger.warning("MS Bookings: Not configured")
             return []
@@ -475,7 +487,7 @@ class MSBookingsService(CalendarServiceBase):
             endpoint = f"/solutions/bookingBusinesses/{self.business_id}/appointments"
 
             # Filter for future appointments
-            now = datetime.now()
+            now = business_now()
             params = {
                 "$filter": f"startDateTime/dateTime ge '{now.strftime('%Y-%m-%dT%H:%M:%S')}'",
                 "$orderby": "startDateTime/dateTime",
@@ -488,13 +500,11 @@ class MSBookingsService(CalendarServiceBase):
                 logger.info("MS Bookings: No appointments found")
                 return []
 
-            # Normalize phone for comparison
-            normalized_phone = ''.join(c for c in customer_phone if c.isdigit())[-10:]
-
             appointments = []
             for appt in result['value']:
-                appt_phone = appt.get('customerPhone', '')
-                normalized_appt_phone = ''.join(c for c in appt_phone if c.isdigit())[-10:]
+                normalized_appt_phone = normalize_customer_phone(
+                    appointment_customer_phone(appt)
+                )
 
                 if normalized_appt_phone == normalized_phone:
                     # Parse start time - API returns in timezone specified when booking (Eastern)
@@ -514,11 +524,7 @@ class MSBookingsService(CalendarServiceBase):
                             # UTC-4 in summer), shifting appointments by an hour
                             # and breaking the duplicate-day comparison. Use a
                             # DST-aware conversion instead.
-                            from zoneinfo import ZoneInfo
-                            parsed = datetime.fromisoformat(start_dt_str.replace('Z', '+00:00'))
-                            if parsed.tzinfo is not None:
-                                parsed = parsed.astimezone(ZoneInfo("America/Toronto")).replace(tzinfo=None)
-                            start_dt = parsed
+                            start_dt = parse_graph_datetime(start_dt_str)
                             formatted_time = start_dt.strftime('%A, %B %d at %I:%M %p')
                         except Exception as e:
                             logger.warning(f"MS Bookings: Failed to parse time {start_dt_str}: {e}")
@@ -552,22 +558,38 @@ class MSBookingsService(CalendarServiceBase):
             logger.error(f"MS Bookings: Failed to get customer appointments: {e}")
             return []
 
-    async def cancel_appointment(self, appointment_id: str) -> bool:
+    async def cancel_customer_appointment(
+        self, appointment_id: str, customer_phone: str
+    ) -> bool:
         """
         Cancel an appointment by ID.
 
         Args:
             appointment_id: The MS Bookings appointment ID
+            customer_phone: Phone number of the caller requesting cancellation
 
         Returns:
             True if cancelled successfully
         """
+        normalized_phone = normalize_customer_phone(customer_phone)
+        if not normalized_phone:
+            logger.warning("MS Bookings: Invalid customer phone for cancellation")
+            return False
+
         if not await self.is_available():
             logger.warning("MS Bookings: Not configured")
             return False
 
         try:
             endpoint = f"/solutions/bookingBusinesses/{self.business_id}/appointments/{appointment_id}"
+            appointment = await self._make_request("GET", endpoint)
+            owner_phone = normalize_customer_phone(
+                appointment_customer_phone(appointment or {})
+            )
+            if owner_phone != normalized_phone:
+                logger.warning("MS Bookings: Appointment cancellation ownership check failed")
+                return False
+
             result = await self._make_request("DELETE", endpoint)
 
             if result and result.get('deleted'):

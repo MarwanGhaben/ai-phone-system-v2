@@ -2,15 +2,15 @@
 
 from .middleware import (
     TwilioSignatureValidator,
-    RateLimiter,
     SecurityHeadersMiddleware,
     RateLimitMiddleware,
     validate_twilio_signature,
 )
+from .rate_limiter import RedisRateLimiter
 
 __all__ = [
     "TwilioSignatureValidator",
-    "RateLimiter",
+    "RedisRateLimiter",
     "SecurityHeadersMiddleware",
     "RateLimitMiddleware",
     "validate_twilio_signature",

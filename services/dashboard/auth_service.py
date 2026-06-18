@@ -11,14 +11,10 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Tuple
 from loguru import logger
 
-try:
-    import bcrypt
-    BCRYPT_AVAILABLE = True
-except ImportError:
-    BCRYPT_AVAILABLE = False
-    logger.warning("bcrypt not available, using fallback hashing")
+import bcrypt
 
 from services.database import get_db_pool
+from services.security.rate_limiter import LoginAttemptLimiter, create_redis_client
 
 
 class AuthService:
@@ -38,8 +34,12 @@ class AuthService:
     MAX_LOGIN_ATTEMPTS = 5
     LOCKOUT_MINUTES = 15
 
-    def __init__(self):
-        self._login_attempts: Dict[str, list] = {}  # IP -> [timestamps]
+    def __init__(self, login_limiter: LoginAttemptLimiter | None = None):
+        self._login_limiter = login_limiter or LoginAttemptLimiter(
+            create_redis_client(),
+            max_attempts=self.MAX_LOGIN_ATTEMPTS,
+            lockout_seconds=self.LOCKOUT_MINUTES * 60,
+        )
 
     # ============================================================
     # PASSWORD HANDLING
@@ -47,13 +47,7 @@ class AuthService:
 
     def hash_password(self, password: str) -> str:
         """Hash a password using bcrypt"""
-        if BCRYPT_AVAILABLE:
-            return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-        else:
-            # Fallback: SHA256 with salt (less secure but works without bcrypt)
-            salt = secrets.token_hex(16)
-            hash_val = hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
-            return f"sha256:{salt}:{hash_val}"
+        return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
     def verify_password(self, password: str, password_hash: str) -> bool:
         """Verify a password against its hash"""
@@ -65,54 +59,10 @@ class AuthService:
             salt, stored_hash = parts[1], parts[2]
             computed = hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
             return secrets.compare_digest(computed, stored_hash)
-        elif BCRYPT_AVAILABLE:
-            try:
-                return bcrypt.checkpw(password.encode(), password_hash.encode())
-            except Exception:
-                return False
-        return False
-
-    # ============================================================
-    # RATE LIMITING
-    # ============================================================
-
-    def _check_rate_limit(self, ip_address: str) -> Tuple[bool, int]:
-        """
-        Check if IP is rate limited
-
-        Returns:
-            (is_allowed, seconds_remaining)
-        """
-        now = datetime.now()
-        cutoff = now - timedelta(minutes=self.LOCKOUT_MINUTES)
-
-        # Clean old attempts
-        if ip_address in self._login_attempts:
-            self._login_attempts[ip_address] = [
-                ts for ts in self._login_attempts[ip_address]
-                if ts > cutoff
-            ]
-
-        attempts = self._login_attempts.get(ip_address, [])
-
-        if len(attempts) >= self.MAX_LOGIN_ATTEMPTS:
-            oldest = min(attempts)
-            unlock_time = oldest + timedelta(minutes=self.LOCKOUT_MINUTES)
-            remaining = (unlock_time - now).total_seconds()
-            return False, max(0, int(remaining))
-
-        return True, 0
-
-    def _record_login_attempt(self, ip_address: str):
-        """Record a failed login attempt"""
-        if ip_address not in self._login_attempts:
-            self._login_attempts[ip_address] = []
-        self._login_attempts[ip_address].append(datetime.now())
-
-    def _clear_login_attempts(self, ip_address: str):
-        """Clear login attempts after successful login"""
-        if ip_address in self._login_attempts:
-            del self._login_attempts[ip_address]
+        try:
+            return bcrypt.checkpw(password.encode(), password_hash.encode())
+        except ValueError:
+            return False
 
     # ============================================================
     # LOGIN & USER LOOKUP
@@ -126,7 +76,7 @@ class AuthService:
             (success, user_dict, error_message)
         """
         # Check rate limit
-        allowed, wait_seconds = self._check_rate_limit(ip_address)
+        allowed, wait_seconds = await self._login_limiter.check(ip_address)
         if not allowed:
             return False, None, f"Too many login attempts. Try again in {wait_seconds} seconds."
 
@@ -143,7 +93,7 @@ class AuthService:
         )
 
         if not row:
-            self._record_login_attempt(ip_address)
+            await self._login_limiter.record_failure(ip_address)
             return False, None, "Invalid username or password"
 
         if not row['is_active']:
@@ -151,11 +101,18 @@ class AuthService:
 
         # Verify password
         if not self.verify_password(password, row['password_hash']):
-            self._record_login_attempt(ip_address)
+            await self._login_limiter.record_failure(ip_address)
             return False, None, "Invalid username or password"
 
+        if row['password_hash'].startswith("sha256:"):
+            await pool.execute(
+                "UPDATE admin_users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+                self.hash_password(password),
+                row['id']
+            )
+
         # Success - clear attempts
-        self._clear_login_attempts(ip_address)
+        await self._login_limiter.clear(ip_address)
 
         user = {
             'id': row['id'],

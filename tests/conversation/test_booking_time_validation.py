@@ -1,4 +1,5 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -29,4 +30,24 @@ async def test_unclear_booking_time_requests_repetition_and_clears_stale_slot(
 
 
 def test_valid_booking_time_preserves_the_requested_slot() -> None:
-    assert _parse_booking_datetime("2099-06-18 14:30") == datetime(2099, 6, 18, 14, 30)
+    appointment_time = _parse_booking_datetime("2099-06-18 14:30")
+
+    assert appointment_time == datetime(
+        2099, 6, 18, 14, 30, tzinfo=ZoneInfo("America/Toronto")
+    )
+
+
+def test_offset_booking_time_converts_to_toronto() -> None:
+    appointment_time = _parse_booking_datetime("2099-06-18T14:30:00+00:00")
+
+    assert appointment_time == datetime(
+        2099, 6, 18, 10, 30, tzinfo=ZoneInfo("America/Toronto")
+    )
+
+
+def test_space_separated_booking_time_preserves_offset() -> None:
+    appointment_time = _parse_booking_datetime("2099-06-18 14:30 +00:00")
+
+    assert appointment_time == datetime(
+        2099, 6, 18, 10, 30, tzinfo=ZoneInfo("America/Toronto")
+    )
