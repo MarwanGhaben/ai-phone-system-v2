@@ -385,8 +385,9 @@ APPOINTMENT BOOKING (TWO-STEP PROCESS):
 - CORPORATE CLIENTS: For corporate/business appointments, proceed with the booking exactly like individual appointments. Ask for their preferred accountant and date/time. Do NOT redirect or transfer unless they specifically ask for it.
 - Ask: Preferred accountant? (suggest from the list above)
 - Ask: Preferred date/time?
-- Ask: Email address? (Required for booking confirmation. Ask: "What's the best email to send the confirmation to?" / "ما هو بريدك الإلكتروني لإرسال التأكيد؟")
-- Pass the email to check_appointment in the customer_email parameter
+- EMAIL IS OPTIONAL — DO NOT require it and NEVER block a booking over it. A booking confirmation is ALWAYS sent automatically by SMS to the caller's phone number, so an email is NOT needed to complete a booking.
+- Do NOT proactively ask for an email. Only collect one if the caller specifically says they want an emailed confirmation. If they ask for email and you cannot capture it clearly after ONE attempt, say "No problem, I'll send the confirmation by text message instead" / "لا مشكلة، سأرسل لك التأكيد برسالة نصية" and proceed WITHOUT it.
+- If (and only if) you captured a clear email, pass it to check_appointment in the customer_email parameter. Otherwise omit it (leave it empty) — the booking will still complete and a text confirmation will be sent.
 - STEP 1: Call check_appointment to check availability. NEVER call confirm_appointment without checking first.
 - STEP 2: If SLOT_AVAILABLE, tell the caller the time IS available and ASK them to confirm before booking. NEVER tell the caller an available time is taken.
 - STEP 3: ONLY after the caller says YES/confirms, call confirm_appointment with confirm=true. If they say no, call confirm_appointment with confirm=false.
@@ -423,6 +424,8 @@ WHEN TO TRANSFER:
 TRANSFER SCRIPT:
 "Of course, let me transfer you now." (English)
 "بالتأكيد، سأحولك الآن." (Arabic)
+- ⚠️ CRITICAL: Saying you will transfer is NOT enough. Whenever you tell the caller you are transferring them, you MUST call the transfer_to_human tool in the SAME turn. NEVER say "let me transfer you" / "سأحولك" without actually calling transfer_to_human — otherwise the caller is left waiting and nothing happens.
+- If you ever tell a caller you will "get someone to help" or "connect you to a team member," that ALSO means you must call transfer_to_human.
 
 ENDING THE CALL:
 - When the caller says goodbye, thanks you and is done, or clearly wants to hang up — say a brief goodbye and call the end_call tool.
@@ -467,6 +470,8 @@ CALLER NAME REGISTRATION:
 - If the caller says "اسمي غادة مش غايد" → call register_caller_name with "غادة"
 - If the caller says something like "أنا بحب العربي" (I prefer Arabic) → this is NOT a name, do not register anything
 - A real name is typically 1-3 words and is a recognizable personal name. If it doesn't look like a name, ask again.
+- CONFIRM NEW NAMES: When a NEW caller gives their name for the first time, after calling register_caller_name, briefly confirm it back to make sure you heard it correctly (e.g. "Thanks — just to confirm, that's Zeina, is that right?" / "شكراً، فقط للتأكيد، اسمك زينة، صح؟"). If they correct it, call register_caller_name again with the correction. Phone audio often mishears names, so this quick check prevents storing the wrong name.
+- DO NOT RE-ASK KNOWN INFORMATION: If you already know the caller's name (it's on file or they just told you), do NOT ask for it again later in the same call — for example, do NOT ask for their name again after they choose Individual or Corporate. Reuse what you already have.
 
 HANDLING UNCLEAR/GARBLED SPEECH:
 - Phone calls often have audio quality issues — speech may be unclear or garbled
@@ -606,19 +611,21 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             # =====================================================
             # STEP 1b: Create per-call STT with language hint
             # =====================================================
-            # ALWAYS set STT language explicitly — auto-detect is unreliable on phone audio.
-            # For known callers: use their stored language preference.
-            # For new callers: start with Arabic (primary business language).
-            #   - Arabic STT can still detect "English"/"انجلش" keywords for language switching
-            #   - Auto-detect drops short Arabic words like "عربي" entirely
+            # Language strategy for a ~50/50 English/Arabic customer base:
+            # - Known callers: use their stored preference (accurate, fast).
+            # - New callers: start in AUTO-DETECT, not a forced language. Forcing
+            #   the wrong language garbles the caller's speech and used to lock
+            #   English speakers into Arabic. We greet bilingually and lock to the
+            #   language detected on the caller's first clear utterance
+            #   (see process_transcript).
             stt_config = self._stt_config.copy()
             if caller_language and caller_language != "auto":
                 stt_config['elevenlabs_stt_language'] = caller_language
                 logger.info(f"Orchestrator: Setting STT language to '{caller_language}' for known caller")
             else:
-                # New caller: start with Arabic instead of unreliable auto-detect
-                stt_config['elevenlabs_stt_language'] = "ar"
-                logger.info(f"Orchestrator: Setting STT language to 'ar' for new caller (Arabic-first business)")
+                # New caller: auto-detect so we don't bias toward the wrong language.
+                stt_config['elevenlabs_stt_language'] = ""  # "" = auto-detect
+                logger.info("Orchestrator: Setting STT to auto-detect for new caller (50/50 EN/AR — lock on first utterance)")
 
             logger.info(f"Orchestrator: Creating per-call STT instance (provider={self._stt_provider})")
             call_stt = create_stt_service(self._stt_provider, stt_config)
@@ -1003,14 +1010,19 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             garbled_count = self._garbled_drop_count[call_sid]
             logger.info(f"Orchestrator: Garbled drop count for {call_sid}: {garbled_count}")
 
-            # After N garbled drops, the caller is almost certainly speaking Arabic
-            # but STT auto-detect is failing. Auto-switch to Arabic and re-prompt.
-            if garbled_count == self._GARBLED_AUTO_SWITCH_THRESHOLD and context.language == "auto":
-                logger.warning(f"Orchestrator: {garbled_count} consecutive garbled transcripts — auto-switching to Arabic")
-                context.language = "ar"
-                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
-                # Re-prompt the caller so they know the system is still listening
-                await self._speak_to_caller(call_sid, "عذراً، ممكن تعيد من فضلك؟", "ar")
+            # After N consecutive garbled transcripts, our STT language guess is
+            # likely wrong (the caller speaks the other language, or a returning
+            # caller's stored preference no longer matches). Reset to auto-detect
+            # so STT can re-detect on the next utterance, and re-prompt bilingually.
+            # This unsticks BOTH new callers and returning callers — previously this
+            # force-switched to Arabic, which trapped English speakers.
+            if garbled_count == self._GARBLED_AUTO_SWITCH_THRESHOLD:
+                logger.warning(f"Orchestrator: {garbled_count} consecutive garbled transcripts — resetting STT to auto-detect and re-prompting")
+                context.language = "auto"
+                await self._reconnect_stt_with_language(call_sid, "", force=True)
+                # Bilingual re-prompt so the caller knows we're still listening,
+                # whichever language they speak.
+                await self._speak_to_caller(call_sid, "عذراً، ممكن تعيد من فضلك؟ Sorry, could you say that again?", "ar")
 
             return
 
@@ -1118,11 +1130,14 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 # Already in English and no Arabic signal — stay in English
                 pass
             else:
-                # Unknown or unclear language — default to Arabic (primary business language)
-                # If they're speaking English, next transcript will be clearly English
-                context.language = "ar"
-                logger.info(f"Orchestrator: Defaulting to Arabic (primary business language)")
-                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
+                # We reached here with clean Latin-script text (has_arabic is False
+                # and it wasn't dropped as garbled) and no Arabic/romanized signal.
+                # For a 50/50 base that means the caller is speaking English — lock
+                # to English. (Previously this defaulted to Arabic, which locked
+                # English-speaking callers into Arabic.)
+                context.language = "en"
+                logger.info("Orchestrator: Locking to English (clean Latin-script text, no Arabic signal)")
+                await self._reconnect_stt_with_language(call_sid, "en")
 
         # Reset garbled counter on any successful transcript
         if call_sid in self._garbled_drop_count and not has_unexpected_script:
@@ -1218,7 +1233,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                         },
                         "customer_email": {
                             "type": "string",
-                            "description": "Customer email address for booking confirmation. Ask the caller for their email before booking."
+                            "description": "OPTIONAL customer email. Leave empty unless the caller explicitly asked for an emailed confirmation AND clearly provided a valid email. Confirmations are sent by SMS automatically, so this is never required to book."
                         }
                     },
                     "required": ["client_type"]
@@ -2109,7 +2124,11 @@ CRITICAL: Use ONLY these dates. Do NOT use any other date information!
         # CRITICAL: Tell the LLM exactly what language to use based on
         # the detected language. This prevents the LLM from continuing
         # in English after switching to Arabic or vice versa.
-        current_lang = context.language if context.language and context.language != "auto" else "ar"
+        # 50/50 customer base: when the language isn't determined yet, default the
+        # response instruction to English (matches the English-first greeting and
+        # avoids biasing unknown callers into Arabic). The caller's first clear
+        # utterance locks the real language immediately after.
+        current_lang = context.language if context.language and context.language != "auto" else "en"
         if current_lang == "ar":
             system_prompt += """
 
