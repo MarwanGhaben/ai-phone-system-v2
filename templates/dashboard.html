@@ -1263,7 +1263,10 @@
                 document.getElementById('totalCalls').textContent = data.total_calls;
                 document.getElementById('uniqueCallers').textContent = data.unique_callers + ' 👤';
                 document.getElementById('returningCallers').textContent = data.returning_callers + ' 🔄';
-                document.getElementById('avgDuration').textContent = data.avg_duration_seconds + 's ⏱️';
+                document.getElementById('avgDuration').textContent =
+                    data.avg_duration_seconds === null
+                        ? 'Not available'
+                        : `${data.avg_duration_seconds}s ⏱️`;
 
                 // Language distribution
                 const langDiv = document.getElementById('languageDistribution');

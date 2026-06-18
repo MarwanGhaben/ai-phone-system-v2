@@ -158,13 +158,8 @@ class AuthService:
         code = self.generate_mfa_code()
         expires_at = datetime.now() + timedelta(minutes=self.MFA_CODE_EXPIRY_MINUTES)
 
+        await self.invalidate_mfa_codes(user_id)
         pool = await get_db_pool()
-
-        # Invalidate any existing codes for this user
-        await pool.execute(
-            "UPDATE mfa_codes SET used = TRUE WHERE user_id = $1 AND used = FALSE",
-            user_id
-        )
 
         # Create new code
         await pool.execute(
@@ -177,6 +172,13 @@ class AuthService:
 
         logger.info(f"MFA code created for user {user_id}")
         return code
+
+    async def invalidate_mfa_codes(self, user_id: int) -> None:
+        pool = await get_db_pool()
+        await pool.execute(
+            "UPDATE mfa_codes SET used = TRUE WHERE user_id = $1 AND used = FALSE",
+            user_id,
+        )
 
     async def verify_mfa_code(self, user_id: int, code: str) -> Tuple[bool, str]:
         """

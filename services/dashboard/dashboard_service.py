@@ -4,8 +4,8 @@ AI Voice Platform v2 - Dashboard Service
 =====================================================
 """
 
-from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import Dict, Optional
 from loguru import logger
 import os
 
@@ -138,22 +138,37 @@ class DashboardService:
             return {'overall_percentage': 0, 'status': 'unknown', 'components': []}
 
     async def _get_today_bookings(self) -> Dict:
-        """Get today's booking statistics"""
-        # TODO: Implement when database is ready
-        return {'total': 0, 'confirmed': 0, 'pending': 0, 'by_accountant': {}}
+        """Report unavailable booking metrics for the legacy overview API."""
+        return {
+            'available': False,
+            'total': None,
+            'confirmed': None,
+            'pending': None,
+            'by_accountant': None,
+        }
 
     def _get_error_rate(self) -> Dict:
-        """Get current error rate"""
-        # TODO: Implement error tracking
-        return {'current': 0, 'threshold': 5.0, 'status': 'healthy'}
+        """Report that error-rate telemetry is not instrumented."""
+        return {
+            'available': False,
+            'current': None,
+            'threshold': None,
+            'status': 'not_tracked',
+        }
 
     def _get_empty_operational_overview(self) -> Dict:
         """Return empty operational overview when data unavailable"""
         return {
             'active_calls': {'total': 0, 'worker_count': 1, 'worker_status': 'unknown'},
             'system_health': {'overall_percentage': 0, 'status': 'unknown', 'components': []},
-            'today_bookings': {'total': 0, 'confirmed': 0, 'pending': 0, 'by_accountant': {}},
-            'error_rate': {'current': 0, 'threshold': 5.0, 'status': 'unknown'}
+            'today_bookings': {
+                'available': False,
+                'total': None,
+                'confirmed': None,
+                'pending': None,
+                'by_accountant': None,
+            },
+            'error_rate': self._get_error_rate(),
         }
 
     # ============================================================
@@ -172,22 +187,20 @@ class DashboardService:
                 'recent_calls': [...]
             }
         """
-        # TODO: Implement when database is ready
-        return {
-            'total_calls': 0,
-            'unique_callers': 0,
-            'avg_duration_seconds': 0,
-            'language_distribution': [
-                {'language': 'Arabic', 'code': 'ar', 'count': 0, 'percentage': 0},
-                {'language': 'English', 'code': 'en', 'count': 0, 'percentage': 0}
-            ],
+        from services.dashboard.metrics_service import fetch_call_statistics
+        from services.database import get_db_pool
+
+        statistics = await fetch_call_statistics(await get_db_pool())
+        statistics.update({
+            'available': True,
             'quality_metrics': {
-                'interruptions': 0,
-                'transfer_rate': 0,
-                'abandoned_calls': 0
+                'interruptions': None,
+                'transfer_rate': statistics['transfer_rate'],
+                'abandoned_calls': None,
             },
             'recent_calls': []
-        }
+        })
+        return statistics
 
     # ============================================================
     # API USAGE MONITORING
@@ -202,40 +215,41 @@ class DashboardService:
                 'services': [...]
             }
         """
-        # TODO: Implement when usage tracking is ready
         return {
+            'available': False,
+            'message': 'Cost tracking is not instrumented',
             'services': [
                 {
                     'name': 'Twilio',
                     'icon': '',
-                    'spent': 0,
-                    'budget': 100,
-                    'percentage': 0,
-                    'status': 'healthy'
+                    'spent': None,
+                    'budget': None,
+                    'percentage': None,
+                    'status': 'not_tracked'
                 },
                 {
                     'name': 'Deepgram',
                     'icon': '',
-                    'spent': 0,
-                    'budget': 50,
-                    'percentage': 0,
-                    'status': 'healthy'
+                    'spent': None,
+                    'budget': None,
+                    'percentage': None,
+                    'status': 'not_tracked'
                 },
                 {
                     'name': 'ElevenLabs',
                     'icon': '',
-                    'spent': 0,
-                    'budget': 50,
-                    'percentage': 0,
-                    'status': 'healthy'
+                    'spent': None,
+                    'budget': None,
+                    'percentage': None,
+                    'status': 'not_tracked'
                 },
                 {
                     'name': 'OpenAI',
                     'icon': '',
-                    'spent': 0,
-                    'budget': 50,
-                    'percentage': 0,
-                    'status': 'healthy'
+                    'spent': None,
+                    'budget': None,
+                    'percentage': None,
+                    'status': 'not_tracked'
                 }
             ]
         }
@@ -306,9 +320,15 @@ class DashboardService:
                 'upcoming_bookings': [...]
             }
         """
-        # TODO: Implement when database is ready
         return {
-            'stats': {'total': 0, 'upcoming': 0, 'today': 0, 'by_accountant': {}},
+            'available': False,
+            'message': 'Use /dashboard/api/bookings for persisted booking data',
+            'stats': {
+                'total': None,
+                'upcoming': None,
+                'today': None,
+                'by_accountant': None,
+            },
             'recent_bookings': [],
             'upcoming_bookings': []
         }

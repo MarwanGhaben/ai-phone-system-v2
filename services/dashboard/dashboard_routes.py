@@ -7,9 +7,9 @@ All API endpoints for the admin dashboard.
 
 import os
 import psutil
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
-from fastapi import APIRouter, Request, Response, HTTPException, Depends
+from fastapi import APIRouter, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from loguru import logger
@@ -17,6 +17,7 @@ from redis.exceptions import RedisError
 
 from services.dashboard.auth_service import get_auth_service
 from services.dashboard.email_service import get_email_service
+from services.dashboard.metrics_service import fetch_call_statistics
 from services.database import get_db_pool
 from services.security.client_ip import get_client_ip
 
@@ -146,7 +147,19 @@ async def login(request: Request, login_data: LoginRequest):
 
     # Generate and send MFA code
     mfa_code = await auth.create_mfa_code(user['id'])
-    email_svc.send_mfa_code(user['email'], mfa_code, user['username'])
+    delivered = await email_svc.send_mfa_code(
+        user['email'], mfa_code, user['username']
+    )
+    if not delivered:
+        await auth.invalidate_mfa_codes(user['id'])
+        logger.error(f"MFA email delivery failed for user {user['id']}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "error": "Unable to deliver the login code. Please try again later.",
+            },
+        )
 
     # Store user_id in temporary cookie for MFA step
     response = JSONResponse(content={
@@ -213,8 +226,11 @@ async def verify_mfa(request: Request, mfa_data: MFARequest):
     user_agent = request.headers.get("User-Agent", "Unknown")
     session_token = await auth.create_session(user_id, ip_address, user_agent)
 
-    # Send login notification (optional)
-    # email_svc.send_login_alert(user['email'], user['username'], ip_address, user_agent)
+    alert_delivered = await email_svc.send_login_alert(
+        user['email'], user['username'], ip_address, user_agent
+    )
+    if not alert_delivered:
+        logger.error(f"Login alert delivery failed for user {user_id}")
 
     response = JSONResponse(content={
         "success": True,
@@ -389,15 +405,16 @@ async def get_disk_usage(user: dict = Depends(require_auth)):
 
 @router.get("/api/pipeline-latency")
 async def get_pipeline_latency(user: dict = Depends(require_auth)):
-    """Get pipeline latency metrics (placeholder)"""
-    # TODO: Implement actual latency tracking
+    """Report that pipeline latency is not currently instrumented."""
     return {
-        "total_ms": 0,
-        "tts_ms": 0,
-        "stt_ms": 0,
-        "llm_ms": 0,
-        "ffmpeg_ms": 0,
-        "samples": 0
+        "available": False,
+        "message": "Pipeline latency tracking is not instrumented",
+        "total_ms": None,
+        "tts_ms": None,
+        "stt_ms": None,
+        "llm_ms": None,
+        "ffmpeg_ms": None,
+        "samples": 0,
     }
 
 
@@ -480,45 +497,7 @@ async def get_recent_calls(user: dict = Depends(require_auth), limit: int = 20):
 async def get_call_statistics(user: dict = Depends(require_auth)):
     """Get call statistics"""
     pool = await get_db_pool()
-
-    # Get stats from callers table
-    stats = await pool.fetchrow(
-        """
-        SELECT
-            COUNT(*) as unique_callers,
-            SUM(call_count) as total_calls,
-            COUNT(CASE WHEN call_count > 1 THEN 1 END) as returning_callers
-        FROM callers
-        """
-    )
-
-    # Language distribution
-    lang_dist = await pool.fetch(
-        """
-        SELECT language, COUNT(*) as count
-        FROM callers
-        GROUP BY language
-        """
-    )
-
-    total = sum(r['count'] for r in lang_dist) or 1
-
-    return {
-        "total_calls": stats['total_calls'] or 0,
-        "unique_callers": stats['unique_callers'] or 0,
-        "returning_callers": stats['returning_callers'] or 0,
-        "avg_duration_seconds": 0,  # TODO: calculate from call_logs
-        "transfer_rate": 0,
-        "language_distribution": [
-            {
-                "language": "Arabic" if r['language'] == 'ar' else "English",
-                "code": r['language'] or 'en',
-                "count": r['count'],
-                "percentage": round(r['count'] / total * 100, 1)
-            }
-            for r in lang_dist
-        ]
-    }
+    return await fetch_call_statistics(pool)
 
 
 @router.get("/api/frequent-callers")

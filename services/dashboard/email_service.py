@@ -7,6 +7,8 @@ Handles sending emails for MFA codes and notifications via Microsoft Graph API.
 
 import aiohttp
 import asyncio
+from datetime import datetime, timezone
+from html import escape
 from typing import Optional
 from loguru import logger
 import os
@@ -25,6 +27,7 @@ class EmailService:
 
     GRAPH_TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
     GRAPH_SEND_MAIL_URL = "https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
+    REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
     def __init__(self):
         # Load Microsoft Graph credentials from environment
@@ -44,7 +47,7 @@ class EmailService:
         if not self.is_configured:
             logger.warning(
                 "Email service not configured. Set MSGRAPH_TENANT_ID, MSGRAPH_CLIENT_ID, "
-                "MSGRAPH_CLIENT_SECRET, and MSGRAPH_SENDER_EMAIL. MFA codes will be logged to console."
+                "MSGRAPH_CLIENT_SECRET, and MSGRAPH_SENDER_EMAIL. Dashboard MFA delivery is unavailable."
             )
 
         # Cache for access token
@@ -72,7 +75,7 @@ class EmailService:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=self.REQUEST_TIMEOUT) as session:
                 async with session.post(token_url, data=data) as response:
                     if response.status != 200:
                         error_text = await response.text()
@@ -87,11 +90,13 @@ class EmailService:
                     logger.debug("Obtained new Microsoft Graph access token")
                     return self._access_token
 
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"Error getting Graph access token: {e}")
             return None
 
-    async def send_email_async(self, to_email: str, subject: str, body_html: str, body_text: str = None) -> bool:
+    async def send_email_async(
+        self, to_email: str, subject: str, body_html: str
+    ) -> bool:
         """
         Send an email via Microsoft Graph API (async version).
 
@@ -99,27 +104,50 @@ class EmailService:
             to_email: Recipient email address
             subject: Email subject
             body_html: HTML body content
-            body_text: Plain text body (optional, unused for Graph API)
-
         Returns:
             True if sent successfully
         """
         if not self.is_configured:
-            logger.info(f"[EMAIL NOT CONFIGURED] Would send to {to_email}: {subject}")
-            if body_text:
-                logger.info(f"[EMAIL BODY] {body_text[:200]}...")
-            return True  # Pretend success for testing
+            logger.error("Cannot send email: Microsoft Graph email is not configured")
+            return False
 
         # Get access token
         access_token = await self._get_access_token()
         if not access_token:
             logger.error("Cannot send email: Failed to obtain access token")
             return False
+        return await self._send_graph_email(
+            access_token, to_email, subject, body_html
+        )
 
-        # Build the Graph API request
+    async def _send_graph_email(
+        self, access_token: str, to_email: str, subject: str, body_html: str
+    ) -> bool:
         send_mail_url = self.GRAPH_SEND_MAIL_URL.format(sender=self.sender_email)
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=self.REQUEST_TIMEOUT) as session:
+                async with session.post(
+                    send_mail_url,
+                    json=self._mail_payload(to_email, subject, body_html),
+                    headers=headers,
+                ) as response:
+                    if response.status == 202:
+                        logger.info(f"Email sent successfully to {to_email} via Microsoft Graph")
+                        return True
+                    error_text = await response.text()
+                    logger.error(f"Failed to send email via Graph: {response.status} - {error_text}")
+                    return False
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(f"Error sending email via Graph: {e}")
+            return False
 
-        mail_body = {
+    @staticmethod
+    def _mail_payload(to_email: str, subject: str, body_html: str) -> dict:
+        return {
             "message": {
                 "subject": subject,
                 "body": {
@@ -137,45 +165,9 @@ class EmailService:
             "saveToSentItems": "true"
         }
 
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(send_mail_url, json=mail_body, headers=headers) as response:
-                    if response.status == 202:
-                        logger.info(f"Email sent successfully to {to_email} via Microsoft Graph")
-                        return True
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"Failed to send email via Graph: {response.status} - {error_text}")
-                        return False
-
-        except Exception as e:
-            logger.error(f"Error sending email via Graph: {e}")
-            return False
-
-    def send_email(self, to_email: str, subject: str, body_html: str, body_text: str = None) -> bool:
-        """
-        Send an email (sync wrapper for async method).
-        """
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If we're already in an async context, create a task
-                future = asyncio.ensure_future(self.send_email_async(to_email, subject, body_html, body_text))
-                # For sync contexts within async, we need to handle this differently
-                # This is a best-effort approach
-                return True  # Optimistically return True, actual send happens async
-            else:
-                return loop.run_until_complete(self.send_email_async(to_email, subject, body_html, body_text))
-        except RuntimeError:
-            # No event loop, create one
-            return asyncio.run(self.send_email_async(to_email, subject, body_html, body_text))
-
-    def send_mfa_code(self, to_email: str, code: str, username: str = "User") -> bool:
+    async def send_mfa_code(
+        self, to_email: str, code: str, username: str = "User"
+    ) -> bool:
         """
         Send MFA verification code email.
 
@@ -188,6 +180,7 @@ class EmailService:
             True if sent successfully
         """
         subject = "Your AI Voice Platform Login Code"
+        safe_username = escape(username)
 
         body_html = f"""
         <!DOCTYPE html>
@@ -210,7 +203,7 @@ class EmailService:
                     <p>Admin Dashboard Login</p>
                 </div>
                 <div class="content">
-                    <p>Hello {username},</p>
+                    <p>Hello {safe_username},</p>
                     <p>Your verification code for logging into the AI Voice Platform dashboard is:</p>
                     <div class="code">{code}</div>
                     <p>This code will expire in <strong>10 minutes</strong>.</p>
@@ -227,31 +220,15 @@ class EmailService:
         </html>
         """
 
-        body_text = f"""
-AI Voice Platform - Login Verification
-
-Hello {username},
-
-Your verification code is: {code}
-
-This code will expire in 10 minutes.
-
-If you did not request this code, please ignore this email.
-
----
-Flexible Accounting - AI Voice Platform
-        """
-
-        # If not configured, log the code prominently
         if not self.is_configured:
-            logger.warning("=" * 50)
-            logger.warning(f"MFA CODE FOR {to_email}: {code}")
-            logger.warning("=" * 50)
-            return True
+            logger.error("Cannot send MFA code: Microsoft Graph email is not configured")
+            return False
 
-        return self.send_email(to_email, subject, body_html, body_text)
+        return await self.send_email_async(to_email, subject, body_html)
 
-    def send_login_alert(self, to_email: str, username: str, ip_address: str, user_agent: str) -> bool:
+    async def send_login_alert(
+        self, to_email: str, username: str, ip_address: str, user_agent: str
+    ) -> bool:
         """
         Send login notification email.
 
@@ -265,9 +242,10 @@ Flexible Accounting - AI Voice Platform
             True if sent successfully
         """
         subject = "New Login to AI Voice Platform Dashboard"
-
-        from datetime import datetime
-        login_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+        login_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        safe_username = escape(username)
+        safe_ip_address = escape(ip_address)
+        safe_user_agent = escape(user_agent[:100])
 
         body_html = f"""
         <!DOCTYPE html>
@@ -291,10 +269,10 @@ Flexible Accounting - AI Voice Platform
                 <div class="content">
                     <p>A new login was detected on your AI Voice Platform dashboard:</p>
                     <div class="details">
-                        <p><span class="label">User:</span> {username}</p>
+                        <p><span class="label">User:</span> {safe_username}</p>
                         <p><span class="label">Time:</span> {login_time}</p>
-                        <p><span class="label">IP Address:</span> {ip_address}</p>
-                        <p><span class="label">Device:</span> {user_agent[:100]}...</p>
+                        <p><span class="label">IP Address:</span> {safe_ip_address}</p>
+                        <p><span class="label">Device:</span> {safe_user_agent}...</p>
                     </div>
                     <p>If this wasn't you, please change your password immediately.</p>
                 </div>
@@ -303,22 +281,11 @@ Flexible Accounting - AI Voice Platform
         </html>
         """
 
-        body_text = f"""
-New Login to AI Voice Platform Dashboard
-
-User: {username}
-Time: {login_time}
-IP Address: {ip_address}
-Device: {user_agent[:100]}
-
-If this wasn't you, please change your password immediately.
-        """
-
         if not self.is_configured:
-            logger.info(f"[LOGIN ALERT] {username} logged in from {ip_address}")
-            return True
+            logger.error("Cannot send login alert: Microsoft Graph email is not configured")
+            return False
 
-        return self.send_email(to_email, subject, body_html, body_text)
+        return await self.send_email_async(to_email, subject, body_html)
 
 
 # Global instance
