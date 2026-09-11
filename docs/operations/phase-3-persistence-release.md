@@ -8,6 +8,32 @@ and 0001 checksum
 Server directory: `/opt/ai-phone-system-v2`. Existing checkout remains 1480eeb;
 running application is the image selected by the protected Compose override.
 
+## Stopped rehearsal and correction (2026-09-11)
+
+The owner's first attempt at script eee5706 stopped after `rehearsal.dump`.
+Read-only marker inspection confirmed no cutover or deployment; the previous
+b1c4dc4 app remained healthy. Sanitized log categories locate the restore failure
+at a missing database. Source inspection identified a startup race: socket-only
+`pg_isready` can accept the image's temporary initialization server before the
+requested database exists. The [official image entrypoint](https://github.com/docker-library/postgres/blob/master/docker-entrypoint.sh)
+starts that socket-only server before creating POSTGRES_DB and later replaces it
+with the final server.
+
+The corrected gate requires a successful, password-authenticated TCP query
+returning `current_database() = rehearsal` before TCP restore, with bounded
+waiting. Live migration, application source, resource limits, backup protection
+and fallback behavior are unchanged. No server memory change is justified by the
+earlier diagnostic: its broad OOMKilled match also matched false values. The
+classifier now distinguishes true OOM flags and excludes normal network-not-found
+cleanup evidence.
+
+Validation: 18 focused release/diagnostic tests passed, including a delayed/missing
+database gate and diagnostic false-positive regression. The actual release
+rehearsal passed locally against isolated PostgreSQL 16 with synthetic legacy
+rows: authenticated readiness, restore, old contract, migration, historical-row
+preservation, candidate/fallback contracts and cleanup. Server retry remains
+pending; keep the failed release's protected files.
+
 ## Owner execution
 
 End test calls before running the pinned script supplied by the lead. Use the

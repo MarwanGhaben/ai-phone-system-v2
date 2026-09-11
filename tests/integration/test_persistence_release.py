@@ -15,6 +15,39 @@ def load(name, path):
     return module
 
 
+@pytest.mark.parametrize('becomes_ready', [True, False])
+def test_initializing_database_cannot_pass_rehearsal_gate(tmp_path, monkeypatch, becomes_ready):
+    # Server incident: pg_isready accepted the init server before CREATE DATABASE.
+    scripts = Path(__file__).resolve().parents[2] / 'scripts'
+    base = load('startup_release_base', scripts / 'deploy-booking-guards.py')
+    module = load('startup_persistence_release', scripts / 'deploy-booking-persistence.py')
+    monkeypatch.setattr(module.time, 'sleep', lambda _: None)
+    probes = []
+
+    def execute(args, **kwargs):
+        probes.append(args)
+        if 'pg_isready' in args:
+            return subprocess.CompletedProcess(args, 0, b'accepting connections', b'')
+        assert '-h' in args and args[args.index('-h') + 1] == '127.0.0.1'
+        assert args[args.index('-d') + 1] == 'rehearsal'
+        assert '-w' in args and 'PGPASSWORD=synthetic' in args
+        # Connection refused, then wrong database, then the intended database.
+        connected = len(probes) >= 2
+        output = b'rehearsal\n' if becomes_ready and len(probes) >= 3 else b'postgres\n'
+        return subprocess.CompletedProcess(args, 0 if connected else 2, output, b'')
+
+    monkeypatch.setattr(module.subprocess, 'run', execute)
+    deployment = module.release_class(base)(tmp_path)
+    if becomes_ready:
+        deployment.wait_for_rehearsal_database('synthetic-db')
+        assert len(probes) == 3
+    else:
+        with pytest.raises(RuntimeError, match='rehearsal database startup failed'):
+            deployment.wait_for_rehearsal_database('synthetic-db')
+        assert len(probes) == 60
+    assert not (tmp_path / 'cutover-started').exists()
+
+
 @pytest.fixture
 def release(tmp_path, monkeypatch):
     scripts = Path(__file__).resolve().parents[2] / 'scripts'

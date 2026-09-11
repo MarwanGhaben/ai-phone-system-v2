@@ -18,3 +18,6 @@ def test_classifier_reports_error_categories_without_private_text():
         'restore_error', 'role_missing', 'schema_contract_rejected']
     assert private not in json.dumps(result)
     assert module.classify(private) == []
+    assert module.classify('"OOMKilled": false\nError response from daemon: network synthetic not found') == []
+    assert module.classify('"OOMKilled": true')[0]['category'] == 'memory_failure'
+    assert module.classify('Error response from daemon: network synthetic has active endpoints')[0]['category'] == 'docker_network_error'

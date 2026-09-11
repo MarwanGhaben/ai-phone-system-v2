@@ -131,6 +131,22 @@ def release_class(base):
             print('PROTECTED_BACKUP_OK=' + name, flush=True)
             return archive
 
+        def wait_for_rehearsal_database(self, db):
+            # The image's temporary initialization server only listens on a Unix
+            # socket. Require the final TCP server and the actual database instead.
+            for _ in range(60):
+                probe = self.run('docker', 'exec', '-e', 'PGPASSWORD=synthetic',
+                                 '-e', 'PGCONNECT_TIMEOUT=2', db,
+                                 'psql', '-X', '-w', '-A', '-t', '-h', '127.0.0.1',
+                                 '-U', 'rehearsal', '-d', 'rehearsal',
+                                 '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT current_database()',
+                                 timeout=5, check=False)
+                if probe.returncode == 0 and probe.stdout.strip() == b'rehearsal':
+                    print('REHEARSAL_DATABASE_READY', flush=True)
+                    return
+                time.sleep(1)
+            raise RuntimeError('rehearsal database startup failed')
+
         def rehearsal(self, candidate, fallback, archive):
             network = 't005d-net-' + self.directory.name
             db = 't005d-db-' + self.directory.name
@@ -146,15 +162,10 @@ def release_class(base):
                          '-e', 'POSTGRES_USER=rehearsal', '-e', 'POSTGRES_PASSWORD=synthetic',
                          '-e', 'POSTGRES_DB=rehearsal', self.pg_image,
                          '-c', 'shared_buffers=16MB', '-c', 'max_connections=12')
-                for _ in range(30):
-                    if self.run('docker', 'exec', db, 'pg_isready', '-U', 'rehearsal',
-                                '-d', 'rehearsal', check=False).returncode == 0:
-                        break
-                    time.sleep(1)
-                else:
-                    raise RuntimeError('rehearsal database startup failed')
+                self.wait_for_rehearsal_database(db)
                 with archive.open('rb') as source:
-                    self.stream(['docker', 'exec', '-i', db, 'pg_restore', '--exit-on-error',
+                    self.stream(['docker', 'exec', '-i', '-e', 'PGPASSWORD=synthetic',
+                                 db, 'pg_restore', '-h', '127.0.0.1', '--no-password', '--exit-on-error',
                                  '--single-transaction', '--no-owner', '--no-acl',
                                  '-U', 'rehearsal', '-d', 'rehearsal'], source=source)
                 fingerprint_query = ("SELECT md5(COALESCE(jsonb_agg(to_jsonb(b) "
