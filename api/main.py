@@ -40,35 +40,46 @@ logger.add(lambda msg: print(msg, end=""), level=settings.log_level)
 async def lifespan(app: FastAPI):
     """Application lifespan management"""
     logger.info("AI Voice Platform v2 starting up...")
+    from services.database import (
+        check_database_compatibility,
+        close_db_pool,
+        get_db_pool,
+    )
 
-    # Initialize async database connection pool
-    from services.database import get_db_pool, close_db_pool
-    await get_db_pool()
-    logger.info("Database connection pool initialized")
-
-    # Start the SMS reminder scheduler (checks every 60s for due reminders)
-    from services.sms.reminder_scheduler import get_reminder_scheduler
-    reminder_scheduler = get_reminder_scheduler()
-    reminder_scheduler.start()
-    logger.info("SMS reminder scheduler started")
-
-    # Pre-warm ElevenLabs HTTP connection pool to eliminate cold-start audio issues
-    # Without this, the first call after restart has "underwater" audio for ~5s
+    app.state.ready = False
+    reminder_scheduler = None
+    scheduler_started = False
     try:
-        from services.tts.elevenlabs_service import create_elevenlabs_tts
-        tts_service = create_elevenlabs_tts(settings.model_dump())
-        if tts_service:
-            await tts_service.prewarm()
-    except Exception as e:
-        logger.warning(f"TTS prewarm skipped: {e}")
+        pool = await get_db_pool()
+        await check_database_compatibility(pool)
+        logger.info("Database connection pool and schema initialized")
 
-    yield
+        # Start only after the database has passed the read-only compatibility gate.
+        from services.sms.reminder_scheduler import get_reminder_scheduler
+        reminder_scheduler = get_reminder_scheduler()
+        reminder_scheduler.start()
+        scheduler_started = True
+        logger.info("SMS reminder scheduler started")
 
-    # Stop reminder scheduler
-    reminder_scheduler.stop()
-    # Close database pool
-    await close_db_pool()
-    logger.info("AI Voice Platform v2 shutting down...")
+        # Pre-warm only after database startup has succeeded.
+        try:
+            from services.tts.elevenlabs_service import create_elevenlabs_tts
+            tts_service = create_elevenlabs_tts(settings.model_dump())
+            if tts_service:
+                await tts_service.prewarm()
+        except Exception:
+            logger.warning("TTS prewarm skipped")
+
+        app.state.ready = True
+        yield
+    finally:
+        app.state.ready = False
+        try:
+            if scheduler_started and reminder_scheduler is not None:
+                reminder_scheduler.stop()
+        finally:
+            await close_db_pool()
+            logger.info("AI Voice Platform v2 shutting down...")
 
 
 # Create FastAPI app
@@ -87,7 +98,7 @@ app.add_middleware(
     RateLimitMiddleware,
     requests_per_minute=120,  # 120 requests per minute per IP
     burst_limit=20,  # Max 20 requests per second
-    exclude_paths=["/health", "/ws/calls"]  # Exclude health checks and WebSocket
+    exclude_paths=["/health", "/ready", "/ws/calls"]
 )
 
 # CORS middleware - restrict to configured origins
@@ -124,6 +135,19 @@ async def health_check():
         "version": "2.0.0",
         "environment": settings.environment
     }
+
+
+@app.get("/ready")
+async def readiness_check(request: Request):
+    """Current database-backed readiness; response details stay generic."""
+    if not getattr(request.app.state, "ready", False):
+        return JSONResponse(status_code=503, content={"status": "unavailable"})
+    try:
+        from services.database import check_database_compatibility
+        await check_database_compatibility()
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "unavailable"})
+    return {"status": "ready"}
 
 
 @app.get("/api/diagnostics")

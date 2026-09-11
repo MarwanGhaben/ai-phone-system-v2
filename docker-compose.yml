@@ -20,7 +20,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-ai_voice_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
     # SECURITY: No exposed ports - only accessible within Docker network
     # For local development, uncomment the ports section below:
     # ports:
@@ -55,6 +54,23 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    networks:
+      - ai-voice-network
+
+  # One-shot database preparation gate. Application/provider credentials are absent.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      MIGRATION_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ai_voice_db}
+    command: ["python", "-m", "migrations.runner", "--prepare"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    restart: "no"
     networks:
       - ai-voice-network
 
@@ -127,10 +143,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -153,7 +171,8 @@ services:
       - "80:80"    # HTTP for health checks
       - "8443:443"  # HTTPS WebSocket port (external 8443 -> internal 443)
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - ai-voice-network
