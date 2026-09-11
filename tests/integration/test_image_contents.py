@@ -33,6 +33,7 @@ REQUIRED_SENTINELS = {
     "migrations/runner.py": b"T005_REQUIRED_MIGRATION_RUNNER",
     "migrations/schema_contract.py": b"T005_REQUIRED_SCHEMA_CONTRACT",
     "migrations/0001_admin_users_updated_at.sql": b"T005_REQUIRED_MIGRATION_SQL",
+    "migrations/0002_bookings_aware_time.sql": b"T005_REQUIRED_BOOKING_TIME_SQL",
     "migrations/bootstrap_schema.sql": b"T005_REQUIRED_BOOTSTRAP_SQL",
     "services/knowledge/faq_service.py": b"T004_REQUIRED_SERVICE_SOURCE",
     "models/__init__.py": b"T004_REQUIRED_MODEL_SOURCE",

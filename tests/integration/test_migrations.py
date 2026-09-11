@@ -369,6 +369,21 @@ class OfflineTests(unittest.TestCase):
         self.assertNotIn(SENTINEL, output)
         connect.assert_not_called()
 
+    def test_status_rejects_changed_bookings_revision_before_database_access(self):
+        original = Path.read_bytes
+
+        def read_bytes(path):
+            raw = original(path)
+            return raw + b"-- drift\n" if path.name == "0002_bookings_aware_time.sql" else raw
+
+        with mock.patch.dict(os.environ, {"MIGRATION_DATABASE_URL": "postgresql://synthetic"}), \
+                mock.patch.object(Path, "read_bytes", read_bytes), \
+                mock.patch.object(self.runner, "_connect", new_callable=mock.AsyncMock) as connect:
+            code, output = self.invoke(["--status"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("migration file", output)
+        connect.assert_not_awaited()
+
     def test_cli_requires_exactly_one_mode_and_redacts_bad_arguments(self):
         for args in (
             [], ["--apply", "--status"], ["--apply", "--prepare"],
@@ -417,8 +432,11 @@ class OfflineTests(unittest.TestCase):
         connect.assert_not_called()
 
     def test_exact_byte_manifest_and_auth_path_oracle(self):
-        revision, = self.runner.MANIFEST
-        self.assertEqual(revision, ("0001", "0001_admin_users_updated_at.sql"))
+        self.assertEqual(self.runner.MANIFEST, (
+            ("0001", "0001_admin_users_updated_at.sql"),
+            ("0002", "0002_bookings_aware_time.sql"),
+        ))
+        revision = self.runner.MANIFEST[0]
         sql, checksum = self.runner._load_revision()
         raw = (ROOT / "migrations" / revision[1]).read_bytes()
         self.assertEqual(checksum, hashlib.sha256(raw).hexdigest())
@@ -430,8 +448,18 @@ class OfflineTests(unittest.TestCase):
     def test_prepare_assets_have_pinned_exact_byte_checksums(self):
         contract = importlib.import_module("migrations.schema_contract")
         _, revision_checksum = self.runner._load_revision()
+        revisions = self.runner._load_revisions()
         bootstrap_sql, bootstrap_checksum = self.runner._load_bootstrap()
         self.assertEqual(revision_checksum, contract.REVISION_CHECKSUM)
+        self.assertEqual(
+            [(version, checksum) for version, _, checksum in revisions],
+            [("0001", contract.REVISION_CHECKSUM),
+             ("0002", contract.BOOKINGS_REVISION_CHECKSUM)],
+        )
+        self.assertEqual(
+            revisions[1][1],
+            (ROOT / "migrations/0002_bookings_aware_time.sql").read_bytes().decode("utf-8"),
+        )
         self.assertEqual(bootstrap_checksum, contract.BOOTSTRAP_CHECKSUM)
         self.assertEqual(
             bootstrap_sql,
@@ -441,6 +469,8 @@ class OfflineTests(unittest.TestCase):
             "migrations/*.sql text eol=lf",
             (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines(),
         )
+        self.assertNotIn("LIMIT", (ROOT / "migrations/schema_contract.py").read_text(
+            encoding="utf-8").split("FROM public.schema_migrations", 1)[1].split(")", 1)[0])
 
     def test_connection_closed_after_transaction_failure(self):
         conn = mock.Mock()
@@ -587,7 +617,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
     async def test_prepare_empty_schema_is_atomic_idempotent_and_read_only_compatible(self):
         contract = importlib.import_module("migrations.schema_contract")
         await self.reset_public()
-        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001")
+        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001 0002")
         tables = await self.conn.fetchval(
             "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n "
             "ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r'")
@@ -597,6 +627,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(row["version"], row["checksum"]) for row in history],
             [("0001", contract.REVISION_CHECKSUM),
+             ("0002", contract.BOOKINGS_REVISION_CHECKSUM),
              ("bootstrap-v1", contract.BOOTSTRAP_CHECKSUM)],
         )
         self.assertTrue(all(row["applied_at"].tzinfo is not None for row in history))
@@ -607,9 +638,9 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         async with self.conn.transaction(isolation="repeatable_read", readonly=True):
             await contract.check_runtime_compatibility(self.conn)
         self.assertEqual(await self.snapshot(), before)
-        self.assertEqual(await self.prepare(), "up-to-date 0001")
+        self.assertEqual(await self.prepare(), "up-to-date 0002")
         self.assertEqual(await self.snapshot(), before)
-        self.assertEqual(await self.migrate(False), "up-to-date 0001")
+        self.assertEqual(await self.migrate(False), "up-to-date 0002")
         self.assertEqual(await self.migrate(), "up-to-date 0001")
         self.assertEqual(await self.snapshot(), before)
 
@@ -636,17 +667,20 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             SELECT pg_catalog.setval('public.bookings_id_seq',81,true);
         """)
         before = await self.snapshot()
-        self.assertEqual(await self.prepare(), "applied 0001")
+        self.assertEqual(await self.prepare(), "applied 0002")
         after = await self.snapshot()
         self.assertEqual(before["sequences"], after["sequences"])
-        self.assertEqual(before["rows"]["bookings"], after["rows"]["bookings"])
+        old_bookings = [json.loads(row["row"]) for row in before["rows"]["bookings"]]
+        new_bookings = [json.loads(row["row"]) for row in after["rows"]["bookings"]]
+        self.assertEqual(new_bookings,
+                         [dict(row, appointment_time_utc=None) for row in old_bookings])
         self.assertEqual(before["rows"]["admin_sessions"], after["rows"]["admin_sessions"])
         old_admin = [json.loads(row["row"]) for row in before["rows"]["admin_users"]]
         new_admin = [json.loads(row["row"]) for row in after["rows"]["admin_users"]]
         self.assertEqual(new_admin, [dict(row, updated_at=None) for row in old_admin])
         history = await self.conn.fetch(
             "SELECT version FROM public.schema_migrations ORDER BY version")
-        self.assertEqual([row["version"] for row in history], ["0001"])
+        self.assertEqual([row["version"] for row in history], ["0001", "0002"])
 
     async def test_prepare_rejects_partial_or_unknown_empty_path_without_mutation(self):
         for sql in (
@@ -667,10 +701,15 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         cases = (
             "ALTER TABLE public.calls ALTER tenant_id TYPE bigint",
             "ALTER TABLE public.calls DROP CONSTRAINT calls_call_sid_key CASCADE",
+            "ALTER TABLE public.bookings ADD appointment_time_utc TIMESTAMP",
+            "ALTER TABLE public.bookings ADD appointment_time_utc "
+            "TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
             LEDGER + "INSERT INTO public.schema_migrations "
             "VALUES ('unknown','redacted',CURRENT_TIMESTAMP)",
             LEDGER + "INSERT INTO public.schema_migrations "
             "VALUES ('0001','wrong',CURRENT_TIMESTAMP)",
+            LEDGER + "INSERT INTO public.schema_migrations "
+            "VALUES ('0002','62addab700e047dff2a13973c881a874bfe6c7f88967d593f189987192782be6',CURRENT_TIMESTAMP)",
         )
         for sql in cases:
             with self.subTest(sql=sql[:45]):
@@ -687,6 +726,8 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         for sql in (
             "UPDATE public.schema_migrations SET checksum='wrong' "
             "WHERE version='bootstrap-v1'",
+            "UPDATE public.schema_migrations SET checksum='wrong' "
+            "WHERE version='0002'",
             "DELETE FROM public.schema_migrations WHERE version='0001'",
         ):
             with self.subTest(history_sql=sql):
@@ -729,7 +770,75 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c "
             "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
             "WHERE n.nspname='public' AND c.relkind IN ('r','S'))"))
-        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001")
+        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001 0002")
+
+    async def test_prepare_upgrades_old_0001_histories_without_fabricating_bootstrap(self):
+        contract = importlib.import_module("migrations.schema_contract")
+        for with_bootstrap in (False, True):
+            with self.subTest(with_bootstrap=with_bootstrap):
+                await self.reset_public()
+                await self.bootstrap()
+                await self.conn.execute(LEDGER)
+                if with_bootstrap:
+                    await self.conn.execute(
+                        "INSERT INTO schema_migrations VALUES ($1,$2,CURRENT_TIMESTAMP)",
+                        contract.BOOTSTRAP_VERSION, contract.BOOTSTRAP_CHECKSUM)
+                await self.conn.execute(
+                    "INSERT INTO schema_migrations VALUES ($1,$2,CURRENT_TIMESTAMP)",
+                    contract.REVISION_VERSION, contract.REVISION_CHECKSUM)
+                await self.conn.execute("""
+                    INSERT INTO public.bookings
+                        (call_sid,appointment_time,ms_booking_id)
+                    VALUES ('synthetic-legacy', TIMESTAMP '2026-06-09 16:30:00', 'synthetic-old-id')
+                """)
+                old_rows = await self.conn.fetch(
+                    "SELECT row_to_json(b)::text AS row FROM bookings b ORDER BY id")
+                before_status = await self.snapshot()
+                self.assertEqual(await self.migrate(False), "pending 0002")
+                self.assertEqual(await self.snapshot(), before_status)
+                async with self.conn.transaction(readonly=True):
+                    with self.assertRaises(contract.SchemaCompatibilityError):
+                        await contract.check_runtime_compatibility(self.conn)
+                self.assertEqual(await self.prepare(), "applied 0002")
+                history = await self.conn.fetch(
+                    "SELECT version FROM schema_migrations ORDER BY version")
+                expected = ["0001", "0002"]
+                if with_bootstrap:
+                    expected.append("bootstrap-v1")
+                self.assertEqual([row["version"] for row in history], expected)
+                new_rows = await self.conn.fetch(
+                    "SELECT row_to_json(b)::text AS row FROM bookings b ORDER BY id")
+                self.assertEqual(
+                    [json.loads(row["row"]) for row in new_rows],
+                    [dict(json.loads(row["row"]), appointment_time_utc=None)
+                     for row in old_rows],
+                )
+
+    async def test_bookings_revision_failure_rolls_back_column_and_history(self):
+        contract = importlib.import_module("migrations.schema_contract")
+        await self.reset_public()
+        await self.bootstrap()
+        await self.conn.execute(LEDGER)
+        await self.conn.execute(
+            "INSERT INTO schema_migrations VALUES ($1,$2,CURRENT_TIMESTAMP)",
+            contract.REVISION_VERSION, contract.REVISION_CHECKSUM)
+        before = await self.snapshot()
+        original = self.runner._record_revision
+
+        async def fail_0002(conn, version, checksum):
+            if version == contract.BOOKINGS_REVISION_VERSION:
+                self.assertIsNotNone(await conn.fetchval(
+                    "SELECT 1 FROM pg_attribute WHERE "
+                    "attrelid='public.bookings'::regclass "
+                    "AND attname='appointment_time_utc' AND NOT attisdropped"))
+                raise RuntimeError(SENTINEL)
+            return await original(conn, version, checksum)
+
+        with mock.patch.object(self.runner, "_record_revision", side_effect=fail_0002):
+            with self.assertRaisesRegex(self.runner.MigrationError, "migration failed"):
+                await self.prepare()
+        self.assertEqual(await self.snapshot(), before)
+        self.assertEqual(await self.prepare(), "applied 0002")
 
     async def test_runtime_rejects_admin_drift_and_cross_schema_foreign_key(self):
         contract = importlib.import_module("migrations.schema_contract")
@@ -812,7 +921,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(
             str(result) == "busy" for result in failures
         ))
-        self.assertEqual(await self.prepare(), "up-to-date 0001")
+        self.assertEqual(await self.prepare(), "up-to-date 0002")
 
     async def snapshot(self):
         # Complete synthetic row values and sequence states; no sequence calls.
@@ -1425,6 +1534,9 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             LEDGER + "ALTER TABLE schema_migrations ALTER version SET DEFAULT '0001'",
             LEDGER + "INSERT INTO schema_migrations VALUES ('unknown','x',NOW())",
             LEDGER + "INSERT INTO schema_migrations VALUES ('0001','wrong',NOW())",
+            LEDGER + "INSERT INTO schema_migrations VALUES "
+            "('0001','53c861ac91cae5ecaf9f794b15563c88ee58bc0dafa5ae64fa81c89d907aa3a9',NOW()),"
+            "('0002','62addab700e047dff2a13973c881a874bfe6c7f88967d593f189987192782be6',NOW())",
         ]
         for case_number, sql in enumerate(cases):
             with self.subTest(case=case_number):

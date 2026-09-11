@@ -20,6 +20,7 @@ from services.dashboard.email_service import get_email_service
 from services.dashboard.metrics_service import fetch_call_statistics
 from services.database import get_db_pool
 from services.security.client_ip import get_client_ip
+from services.scheduling.booking_records import booking_time_for_dashboard
 
 
 # =====================================================
@@ -537,9 +538,10 @@ async def get_bookings(user: dict = Depends(require_auth), limit: int = 50):
         rows = await pool.fetch(
             """
             SELECT id, client_name, client_email, phone_number, accountant_name,
-                   appointment_time, client_type, language, status, created_at
+                   appointment_time, appointment_time_utc, client_type, language,
+                   status, created_at
             FROM bookings
-            ORDER BY appointment_time DESC
+            ORDER BY appointment_time_utc DESC NULLS LAST, appointment_time DESC
             LIMIT $1
             """,
             limit
@@ -557,13 +559,19 @@ async def get_bookings(user: dict = Depends(require_auth), limit: int = 50):
         upcoming = await pool.fetchval(
             """
             SELECT COUNT(*) FROM bookings
-            WHERE appointment_time > NOW() AND status = 'confirmed'
+            WHERE appointment_time_utc > CURRENT_TIMESTAMP
+              AND status = 'confirmed'
             """
+        )
+
+        unresolved_time = await pool.fetchval(
+            "SELECT COUNT(*) FROM bookings WHERE appointment_time_utc IS NULL"
         )
 
         return {
             "total": len(rows),
             "upcoming": upcoming or 0,
+            "unresolved_time": unresolved_time or 0,
             "by_accountant": {r['accountant_name']: r['count'] for r in accountant_counts},
             "bookings": [
                 {
@@ -572,7 +580,13 @@ async def get_bookings(user: dict = Depends(require_auth), limit: int = 50):
                     "email": row['client_email'],
                     "phone": row['phone_number'],
                     "accountant": row['accountant_name'],
-                    "time": row['appointment_time'].isoformat() if row['appointment_time'] else None,
+                    "time": (
+                        booking_time_for_dashboard(row['appointment_time_utc'])
+                        if row['appointment_time_utc'] is not None
+                        else (row['appointment_time'].isoformat()
+                              if row['appointment_time'] else None)
+                    ),
+                    "time_verified": row['appointment_time_utc'] is not None,
                     "type": row['client_type'],
                     "language": row['language'],
                     "status": row['status']
@@ -580,9 +594,10 @@ async def get_bookings(user: dict = Depends(require_auth), limit: int = 50):
                 for row in rows
             ]
         }
-    except Exception as e:
-        logger.error(f"Error fetching bookings: {e}")
-        return {"total": 0, "upcoming": 0, "by_accountant": {}, "bookings": []}
+    except Exception:
+        logger.error("Error fetching bookings")
+        return {"total": 0, "upcoming": 0, "unresolved_time": 0,
+                "by_accountant": {}, "bookings": []}
 
 
 @router.delete("/api/bookings/{booking_id}")

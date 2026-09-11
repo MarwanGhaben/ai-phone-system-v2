@@ -32,6 +32,11 @@ from services.llm.llm_base import Message, LLMRole
 from services.telephony.twilio_service import TwilioMediaStreamHandler
 from services.calendar.calendar_base import TimeSlot
 from services.calendar.business_time import as_business_time, business_now
+from services.scheduling.booking_records import (
+    BookingPersistenceError,
+    persist_booking_record,
+    require_aware_booking_time,
+)
 
 _DATETIME_TYPE = datetime
 
@@ -1740,6 +1745,19 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 "then call confirm_appointment after SLOT_AVAILABLE."
             )
 
+        try:
+            appointment_time = as_business_time(
+                require_aware_booking_time(pending.get("appointment_time"))
+            )
+        except BookingPersistenceError:
+            context.pending_booking = None
+            logger.warning("Orchestrator: booking confirmation rejected invalid time")
+            return (
+                "BOOKING_NEEDS_RECHECK: The appointment time could not be verified. "
+                "Call check_appointment again for the caller's chosen date and time, "
+                "then obtain a fresh confirmation."
+            )
+
         calendar = get_calendar_service()
 
         # Use the latest caller name from context (may have been registered after check_appointment)
@@ -1766,7 +1784,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             result = await calendar.create_booking(
                 service_id=pending["service_id"],
                 staff_id=pending["staff_id"],
-                start_time=pending["appointment_time"],
+                start_time=appointment_time,
                 customer_name=customer_name,
                 customer_email=customer_email,
                 customer_phone=context.phone_number or "",
@@ -1776,37 +1794,49 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             if result.success:
                 logger.info("Orchestrator: booking provider reported success")
 
-                # Save booking to local database for dashboard
+                # A provider success is not caller-visible success until its local
+                # reconciliation record has been inserted.
                 try:
                     from services.database import get_db_pool
                     pool = await get_db_pool()
-                    await pool.execute(
-                        """
-                        INSERT INTO bookings (
-                            call_sid, phone_number, client_name, client_email,
-                            accountant_name, appointment_time, client_type,
-                            language, status, ms_booking_id
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                        ON CONFLICT DO NOTHING
-                        """,
-                        call_sid,
-                        context.phone_number or "",
-                        customer_name,
-                        customer_email,  # email
-                        result.staff_name or pending.get("staff_name", ""),
-                        pending["appointment_time"],
-                        pending.get("client_type", "unknown"),
-                        context.language or "en",
-                        "confirmed",
-                        result.appointment_id or ""
+                    await persist_booking_record(
+                        pool,
+                        call_sid=call_sid,
+                        phone_number=context.phone_number or "",
+                        client_name=customer_name,
+                        client_email=customer_email,
+                        accountant_name=(
+                            result.staff_name or pending.get("staff_name", "")
+                        ),
+                        appointment_time=appointment_time,
+                        client_type=pending.get("client_type", "unknown"),
+                        language=context.language or "en",
+                        provider_appointment_id=result.appointment_id,
+                        notes=("Booked via AI phone system. Client type: "
+                               f"{pending.get('client_type', 'unknown')}"),
                     )
-                    logger.info(f"Orchestrator: Booking saved to dashboard database")
-                except Exception:
-                    logger.warning("Orchestrator: failed to save booking dashboard record")
+                    logger.info("Orchestrator: booking persistence completed")
+                except asyncio.CancelledError:
+                    context.pending_booking = None
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "Orchestrator: BOOKING_OUTCOME_UNKNOWN local persistence {}",
+                        type(exc).__name__,
+                    )
+                    context.pending_booking = None
+                    context.booking_just_completed = False
+                    context.last_booking_summary = None
+                    return (
+                        "BOOKING_OUTCOME_UNKNOWN: The appointment may have been "
+                        "created, but its local record could not be verified. Do not "
+                        "attempt another booking. Offer human help to check the "
+                        "calendar before any further action."
+                    )
 
                 # Send SMS confirmation + schedule 24hr reminder
                 display_staff = result.staff_name or pending["staff_name"] or "your accountant"
-                display_time = pending["appointment_time"].strftime('%A, %B %d at %I:%M %p')
+                display_time = appointment_time.strftime('%A, %B %d at %I:%M %p')
                 display_customer = customer_name if customer_name != "Phone Caller" else "there"
                 caller_lang = context.language if context else "en"
 
@@ -1815,7 +1845,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                     customer_name=display_customer,
                     staff_name=display_staff,
                     appointment_time_str=display_time,
-                    appointment_dt=pending["appointment_time"],
+                    appointment_dt=appointment_time,
                     language=caller_lang,
                 ))
 

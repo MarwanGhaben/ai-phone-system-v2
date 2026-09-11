@@ -5,6 +5,8 @@ BOOTSTRAP_VERSION = "bootstrap-v1"
 BOOTSTRAP_CHECKSUM = "1c72bbe0a120860902c565e5573c05ad1cd640891a42bb35cca2c6e0876f31e8"
 REVISION_VERSION = "0001"
 REVISION_CHECKSUM = "53c861ac91cae5ecaf9f794b15563c88ee58bc0dafa5ae64fa81c89d907aa3a9"
+BOOKINGS_REVISION_VERSION = "0002"
+BOOKINGS_REVISION_CHECKSUM = "62addab700e047dff2a13973c881a874bfe6c7f88967d593f189987192782be6"
 
 
 class SchemaCompatibilityError(Exception):
@@ -19,7 +21,7 @@ _SPECS = {
     "analytics_events": "id:int4! tenant_id:int4 call_sid:varchar:100 event_type:varchar:100! event_data:jsonb duration_ms:int4 timestamp:timestamptz",
     "api_usage": "id:int4! service_name:varchar:100! request_count:int4 tokens_used:int4 characters_used:int4 audio_seconds:float8 estimated_cost:numeric recorded_at:date",
     "appointments": "id:int4! call_sid:varchar:100 tenant_id:int4 client_name:varchar:100! client_phone:varchar:50! client_email:varchar:100 accountant_name:varchar:100 appointment_time:timestamptz! appointment_time_formatted:varchar:200 client_type:varchar:50 language:varchar:10 status:varchar:50 booking_url:text event_type_uri:varchar:255 service_id:varchar:100 staff_id:varchar:100 ms_booking_id:varchar:100 reminder_sent:bool reminder_sent_at:timestamptz created_at:timestamptz updated_at:timestamptz",
-    "bookings": "id:int4! call_sid:varchar:100 phone_number:varchar:50 client_name:varchar:255 client_email:varchar:255 accountant_name:varchar:255 appointment_time:timestamp client_type:varchar:50 language:varchar:10 status:varchar:50 created_at:timestamp ms_booking_id:varchar:255 notes:text",
+    "bookings": "id:int4! call_sid:varchar:100 phone_number:varchar:50 client_name:varchar:255 client_email:varchar:255 accountant_name:varchar:255 appointment_time:timestamp client_type:varchar:50 language:varchar:10 status:varchar:50 created_at:timestamp ms_booking_id:varchar:255 notes:text appointment_time_utc:timestamptz",
     "call_logs": "id:int4! call_sid:varchar:100 phone_number:varchar:50 caller_name:varchar:255 language:varchar:10 started_at:timestamp ended_at:timestamp duration_seconds:int4 status:varchar:50 transfer_requested:bool dtmf_count:int4 booking_made:bool notes:text",
     "callers": "id:int4! phone_number:varchar:50! name:varchar:100! language:varchar:10 call_count:int4 first_call:timestamptz last_call:timestamptz tenant_id:int4 created_at:timestamptz updated_at:timestamptz",
     "calls": "id:int4! call_sid:varchar:100! tenant_id:int4 phone_number:varchar:50 caller_name:varchar:100 language:varchar:10 detected_language:varchar:10 direction:varchar:20 status:varchar:50 started_at:timestamptz ended_at:timestamptz duration_seconds:int4 conversation_turns:int4 transferred:bool transferred_to:varchar:100 recording_url:text transcription:text error_message:text created_at:timestamptz updated_at:timestamptz",
@@ -175,10 +177,11 @@ async def admin(conn, *, required_updated=False):
     return "updated_at" in actual
 
 
-async def ledger(conn, *, allow_bootstrap=False, require_revision=False):
+async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
+                 require_current=False):
     oid = await relation(conn, "schema_migrations", optional=True)
     if oid is None:
-        if require_revision:
+        if require_revision or require_current:
             raise SchemaCompatibilityError("incompatible schema")
         return False, frozenset()
     actual = await columns(conn, oid)
@@ -188,8 +191,11 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False):
     await keys(conn, oid, {("p", ("version",))}, ledger_table=True)
     rows = await conn.fetch(
         "SELECT version,checksum,pg_catalog.isfinite(applied_at) AS finite,applied_at "
-        "FROM public.schema_migrations LIMIT 3")
-    expected = {REVISION_VERSION: REVISION_CHECKSUM}
+        "FROM public.schema_migrations")
+    expected = {
+        REVISION_VERSION: REVISION_CHECKSUM,
+        BOOKINGS_REVISION_VERSION: BOOKINGS_REVISION_CHECKSUM,
+    }
     if allow_bootstrap:
         expected[BOOTSTRAP_VERSION] = BOOTSTRAP_CHECKSUM
     versions, applied = set(), {}
@@ -205,10 +211,17 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False):
         applied[version] = row["applied_at"]
     if BOOTSTRAP_VERSION in versions and REVISION_VERSION not in versions:
         raise SchemaCompatibilityError("incompatible schema")
+    if BOOKINGS_REVISION_VERSION in versions and REVISION_VERSION not in versions:
+        raise SchemaCompatibilityError("incompatible schema")
     if (BOOTSTRAP_VERSION in versions
             and applied[BOOTSTRAP_VERSION] > applied[REVISION_VERSION]):
         raise SchemaCompatibilityError("incompatible schema")
     if require_revision and REVISION_VERSION not in versions:
+        raise SchemaCompatibilityError("incompatible schema")
+    if (REVISION_VERSION in versions and BOOKINGS_REVISION_VERSION in versions
+            and applied[REVISION_VERSION] > applied[BOOKINGS_REVISION_VERSION]):
+        raise SchemaCompatibilityError("incompatible schema")
+    if require_current and BOOKINGS_REVISION_VERSION not in versions:
         raise SchemaCompatibilityError("incompatible schema")
     return True, frozenset(versions)
 
@@ -223,6 +236,7 @@ async def relation_names(conn):
 
 
 async def check_application_schema(conn, *, allow_missing_admin_updated=False,
+                                   allow_missing_booking_aware=False,
                                    ledger_optional=True):
     names = await relation_names(conn)
     expected_names = set(TABLE_COLUMNS)
@@ -257,7 +271,16 @@ async def check_application_schema(conn, *, allow_missing_admin_updated=False,
         actual = await columns(conn, oid)
         if table == "admin_users" and allow_missing_admin_updated and "updated_at" not in actual:
             expected = {name: shape for name, shape in expected.items() if name != "updated_at"}
+        if (table == "bookings" and allow_missing_booking_aware
+                and "appointment_time_utc" not in actual):
+            expected = {
+                name: shape for name, shape in expected.items()
+                if name != "appointment_time_utc"
+            }
         check_columns(actual, expected)
+        if (table == "bookings" and "appointment_time_utc" in actual
+                and actual["appointment_time_utc"]["default_expr"] is not None):
+            raise SchemaCompatibilityError("incompatible schema")
         rows = await conn.fetch("""
             SELECT k.contype::text,k.condeferrable,k.condeferred,k.convalidated,
                    rn.relname AS referenced_table,ns.nspname AS referenced_schema,
@@ -307,4 +330,5 @@ async def check_runtime_compatibility(conn):
     """Validate current structure and history using catalog reads only."""
     await check_application_schema(conn, ledger_optional=False)
     await admin(conn, required_updated=True)
-    await ledger(conn, allow_bootstrap=True, require_revision=True)
+    await ledger(conn, allow_bootstrap=True, require_revision=True,
+                 require_current=True)

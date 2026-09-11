@@ -1,4 +1,4 @@
-"""Explicit, bounded T005-A migration entry point; never imported by the app."""
+"""Explicit, bounded migration entry point; never imported by the app."""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,8 @@ import sys
 from urllib.parse import unquote, urlsplit
 
 from migrations.schema_contract import (
+    BOOKINGS_REVISION_CHECKSUM,
+    BOOKINGS_REVISION_VERSION,
     BOOTSTRAP_CHECKSUM,
     BOOTSTRAP_VERSION,
     REVISION_CHECKSUM,
@@ -19,12 +21,16 @@ from migrations.schema_contract import (
     admin as contract_admin,
     check_application_schema,
     check_runtime_compatibility,
+    columns as contract_columns,
     ledger as contract_ledger,
     relation as contract_relation,
     relation_names,
 )
 
-MANIFEST = (("0001", "0001_admin_users_updated_at.sql"),)
+MANIFEST = (
+    ("0001", "0001_admin_users_updated_at.sql"),
+    ("0002", "0002_bookings_aware_time.sql"),
+)
 # Stable across processes/Python hash randomization; database-local project key.
 LOCK_KEY = int.from_bytes(
     hashlib.sha256(b"ai-voice-platform-v2:public:schema_migrations").digest()[:8],
@@ -55,6 +61,24 @@ def _load_revision():
     if checksum != REVISION_CHECKSUM:
         raise MigrationError("migration file")
     return raw.decode("utf-8"), checksum
+
+
+def _load_revisions():
+    expected = {
+        REVISION_VERSION: REVISION_CHECKSUM,
+        BOOKINGS_REVISION_VERSION: BOOKINGS_REVISION_CHECKSUM,
+    }
+    revisions = []
+    for version, filename in MANIFEST:
+        raw = Path(__file__).with_name(filename).read_bytes()
+        checksum = hashlib.sha256(raw).hexdigest()
+        if expected.get(version) != checksum:
+            raise MigrationError("migration file")
+        revisions.append((version, raw.decode("utf-8"), checksum))
+    if tuple(version for version, _, _ in revisions) != (
+            REVISION_VERSION, BOOKINGS_REVISION_VERSION):
+        raise MigrationError("migration file")
+    return tuple(revisions)
 
 
 def _load_bootstrap():
@@ -111,6 +135,8 @@ async def _ledger(conn, checksum):
         raise MigrationError("migration file")
     try:
         exists, versions = await contract_ledger(conn, allow_bootstrap=True)
+        if BOOKINGS_REVISION_VERSION in versions:
+            await check_runtime_compatibility(conn)
     except SchemaCompatibilityError as exc:
         raise MigrationError(str(exc)) from None
     return exists, REVISION_VERSION in versions
@@ -171,7 +197,32 @@ async def _public_is_empty(conn):
     """)
 
 
+async def _status(conn, *, revision_sql, revision_checksum):
+    """Report the full-schema revision when this is an application family."""
+    try:
+        names = await relation_names(conn)
+        allowed = set(TABLE_COLUMNS) | {"schema_migrations"}
+        if set(TABLE_COLUMNS).issubset(names):
+            if not names.issubset(allowed):
+                raise SchemaCompatibilityError("incompatible schema")
+            await check_application_schema(
+                conn, allow_missing_admin_updated=True,
+                allow_missing_booking_aware=True, ledger_optional=True)
+            _, versions = await contract_ledger(conn, allow_bootstrap=True)
+            await _admin(
+                conn, required_updated=REVISION_VERSION in versions)
+            if BOOKINGS_REVISION_VERSION in versions:
+                await check_runtime_compatibility(conn)
+                return "up-to-date 0002"
+            return "pending 0002"
+    except SchemaCompatibilityError as exc:
+        raise MigrationError(str(exc)) from None
+    return await _execute(
+        conn, apply=False, sql=revision_sql, checksum=revision_checksum)
+
+
 async def _prepare_execute(conn, *, revision_sql, revision_checksum,
+                           bookings_sql, bookings_checksum,
                            bootstrap_sql, bootstrap_checksum):
     if not await conn.fetchval(
         "SELECT pg_catalog.pg_try_advisory_xact_lock($1::bigint)", LOCK_KEY,
@@ -181,7 +232,8 @@ async def _prepare_execute(conn, *, revision_sql, revision_checksum,
     if await _public_is_empty(conn):
         await conn.execute(bootstrap_sql)
         try:
-            await check_application_schema(conn)
+            await check_application_schema(
+                conn, allow_missing_booking_aware=True)
         except SchemaCompatibilityError as exc:
             raise MigrationError(str(exc)) from None
         await _admin(conn, required_updated=True)
@@ -192,11 +244,12 @@ async def _prepare_execute(conn, *, revision_sql, revision_checksum,
             raise MigrationError(str(exc)) from None
         await _record_revision(conn, BOOTSTRAP_VERSION, bootstrap_checksum)
         await _record_revision(conn, REVISION_VERSION, revision_checksum)
+        await _apply_bookings_revision(conn, bookings_sql, bookings_checksum)
         try:
             await check_runtime_compatibility(conn)
         except SchemaCompatibilityError as exc:
             raise MigrationError(str(exc)) from None
-        return "prepared bootstrap-v1 0001"
+        return "prepared bootstrap-v1 0001 0002"
 
     try:
         names = await relation_names(conn)
@@ -210,26 +263,59 @@ async def _prepare_execute(conn, *, revision_sql, revision_checksum,
             lock_targets.append("public.schema_migrations")
         await conn.execute("LOCK TABLE " + ",".join(lock_targets) + " IN SHARE MODE")
         await check_application_schema(
-            conn, allow_missing_admin_updated=True, ledger_optional=True)
+            conn, allow_missing_admin_updated=True,
+            allow_missing_booking_aware=True, ledger_optional=True)
         _, versions = await contract_ledger(conn, allow_bootstrap=True)
     except SchemaCompatibilityError as exc:
         raise MigrationError(str(exc)) from None
 
-    if versions:
+    if BOOKINGS_REVISION_VERSION in versions:
         await _admin(conn, required_updated=True)
         try:
             await check_runtime_compatibility(conn)
         except SchemaCompatibilityError as exc:
             raise MigrationError(str(exc)) from None
-        return "up-to-date 0001"
+        return "up-to-date 0002"
 
-    result = await _execute(
-        conn, apply=True, sql=revision_sql, checksum=revision_checksum)
+    if REVISION_VERSION not in versions:
+        await _execute(
+            conn, apply=True, sql=revision_sql, checksum=revision_checksum)
+    else:
+        await _admin(conn, required_updated=True)
+    result = await _apply_bookings_revision(
+        conn, bookings_sql, bookings_checksum)
     try:
         await check_runtime_compatibility(conn)
     except SchemaCompatibilityError as exc:
         raise MigrationError(str(exc)) from None
     return result
+
+
+async def _apply_bookings_revision(conn, sql, checksum):
+    if checksum != BOOKINGS_REVISION_CHECKSUM:
+        raise MigrationError("migration file")
+    try:
+        _, versions = await contract_ledger(
+            conn, allow_bootstrap=True, require_revision=True)
+        if BOOKINGS_REVISION_VERSION in versions:
+            await check_runtime_compatibility(conn)
+            return "up-to-date 0002"
+        await conn.execute("LOCK TABLE public.bookings IN ACCESS EXCLUSIVE MODE")
+        await check_application_schema(
+            conn, allow_missing_booking_aware=True, ledger_optional=False)
+        oid = await contract_relation(conn, "bookings", allow_triggers=True)
+        actual = await contract_columns(conn, oid)
+        if "appointment_time_utc" not in actual:
+            await conn.execute(sql)
+        await check_application_schema(conn, ledger_optional=False)
+        await _record_revision(
+            conn, BOOKINGS_REVISION_VERSION, BOOKINGS_REVISION_CHECKSUM)
+        await contract_ledger(
+            conn, allow_bootstrap=True, require_revision=True,
+            require_current=True)
+        return "applied 0002"
+    except SchemaCompatibilityError as exc:
+        raise MigrationError(str(exc)) from None
 
 
 async def run(*, apply=False, prepare=False):
@@ -242,6 +328,10 @@ async def run(*, apply=False, prepare=False):
     try:
         sql, checksum = _load_revision()
         bootstrap_sql = bootstrap_checksum = None
+        bookings_sql = bookings_checksum = None
+        if not apply:
+            revisions = _load_revisions()
+            _, bookings_sql, bookings_checksum = revisions[1]
         if prepare:
             bootstrap_sql, bootstrap_checksum = _load_bootstrap()
     except Exception:
@@ -260,7 +350,12 @@ async def run(*, apply=False, prepare=False):
             if prepare:
                 return await _prepare_execute(
                     conn, revision_sql=sql, revision_checksum=checksum,
+                    bookings_sql=bookings_sql,
+                    bookings_checksum=bookings_checksum,
                     bootstrap_sql=bootstrap_sql, bootstrap_checksum=bootstrap_checksum)
+            if not apply:
+                return await _status(
+                    conn, revision_sql=sql, revision_checksum=checksum)
             return await _execute(conn, apply=apply, sql=sql, checksum=checksum)
     except MigrationError:
         raise
