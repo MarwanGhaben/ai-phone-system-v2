@@ -15,6 +15,7 @@ BASE = '1480eeb0e36596e26d0dedde77f08beee91aec5b'
 OLD_IMAGE = 'sha256:01cee33a5a13aea37919568f6d00e0f2c12a8e98bd6eb93ab063b73f51711605'
 NGINX_HASH = '59ac9bdaa9a86c1022a573c9709faddf7e93a53015da8acfcc4330b3e288f3ab'
 APP_PATH = 'services/conversation/orchestrator.py'
+RUNTIME_PATHS = [APP_PATH]
 SETTINGS = 'import json; from config.settings import settings; print(json.dumps(settings.model_dump(mode="json"),sort_keys=True))'
 
 
@@ -79,7 +80,7 @@ class Release:
         changed = self.run('git', 'diff', '--name-only', BASE, commit, '--',
                            'api', 'services', 'config', 'models', 'clients', 'migrations',
                            'requirements.txt', 'Dockerfile', 'docker-compose.yml').stdout.decode().splitlines()
-        if changed != [APP_PATH]:
+        if changed != sorted(RUNTIME_PATHS):
             raise RuntimeError('candidate exceeds app-only scope')
         old = self.inspect('ai-voice-app')
         if old['Image'] != OLD_IMAGE or old['State']['Health']['Status'] != 'healthy':
