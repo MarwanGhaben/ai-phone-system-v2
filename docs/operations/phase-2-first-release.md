@@ -46,6 +46,44 @@ were separately inspected on the live container.
 
 ## Cutover after successful rehearsal
 
+Server rehearsal now passed for source commit
+`1480eeb0e36596e26d0dedde77f08beee91aec5b`, image
+`sha256:01cee33a5a13aea37919568f6d00e0f2c12a8e98bd6eb93ab063b73f51711605`,
+release directory `/opt/ai-phone-release.02W6q2`. Both restored-copy preparation
+and runtime compatibility passed; rehearsal containers were removed.
+
+The owner-run `scripts/cutover-database-release.py` is pinned to this evidence.
+It requires host Python 3 and stops if its preconditions differ. It preserves
+the old process environment and any bundled `/app/.env` in root-only runtime
+files, checks effective settings with a configuration-only candidate process,
+and compares the application's mounted paths and network before downtime.
+Do not edit, publish or paste the generated overrides or private log: they contain
+credentials. The automatic `docker-compose.override.yml` is root-only, excluded
+via `.git/info/exclude`, and excluded from the image by the existing Docker rules.
+Keep the release directory: the deployed application mounts its runtime.env.
+
+Before running, stop test calls/dashboard changes and let current calls finish.
+The script gracefully stops nginx and the app, takes a final database snapshot,
+runs the rehearsed image's migration, replaces only the app, verifies readiness
+and unchanged settings, switches the server to the familiar phase-2 branch at the
+exact candidate source commit, then starts nginx and checks its HTTP proxy health.
+PostgreSQL, Redis and certbot remain running. The application retains its existing
+reminder/TTS startup behavior; this is an actual deployment, not a provider-free test.
+
+Failures during cutover attempt to recreate the old image with preserved settings
+and restore nginx. No automatic database rewind occurs: revision 0001 is additive
+and leaves the old app compatible. If rollback itself fails, the generic stop
+marker requires operator recovery using the protected files; do not rerun blindly.
+The cutover-started marker prevents accidental repeat deployment. A private log
+captures diagnostics without printing credentials into the console.
+
+Validation: five fault/success cases with simulated Docker/Git boundaries cover
+settings drift before downtime, migration failure, app replacement failure, proxy
+failure after branch switch, and success. A real local isolated Compose container
+proved literal dollar signs and multiline environment values survive the override.
+This is not a claim that the live cutover has already run. External TLS and an
+actual test phone call are owner checks after the deployment markers succeed.
+
 The lead will use the reported release directory and immutable candidate ID to
 prepare the manual cutover: stop new test calls, drain active calls/writers, take
 the final pre-change snapshot, run the same migration image against the existing
