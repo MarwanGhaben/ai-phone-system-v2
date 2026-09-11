@@ -1,2 +1,4 @@
 migrations/*.sql text eol=lf
 scripts/prepare-database-release.sh text eol=lf
+scripts/renew-https.sh text eol=lf
+scripts/install-https-repair.sh text eol=lf
