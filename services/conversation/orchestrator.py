@@ -16,7 +16,7 @@ The orchestrator is the brain of the AI voice platform. It coordinates:
 import asyncio
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -30,7 +30,10 @@ from services.tts.elevenlabs_service import create_elevenlabs_tts
 from services.llm.openai_service import create_openai_llm
 from services.llm.llm_base import Message, LLMRole
 from services.telephony.twilio_service import TwilioMediaStreamHandler
+from services.calendar.calendar_base import TimeSlot
 from services.calendar.business_time import as_business_time, business_now
+
+_DATETIME_TYPE = datetime
 
 
 def _parse_booking_datetime(date_time_text: str) -> Optional[datetime]:
@@ -55,6 +58,35 @@ def _parse_booking_datetime(date_time_text: str) -> Optional[datetime]:
     except (ParserError, OverflowError):
         return None
     return appointment_time + timedelta(days=7) if appointment_time < business_now() else appointment_time
+
+
+def _validated_booking_slots(value: object, selected_staff_id: str) -> Optional[list[TimeSlot]]:
+    """Return safe selected-staff slots, or None for an invalid provider shape."""
+    if not isinstance(value, list) or not isinstance(selected_staff_id, str):
+        return None
+    selected_staff_id = selected_staff_id.strip()
+    if not selected_staff_id:
+        return None
+    validated = []
+    for slot in value:
+        if not isinstance(slot, TimeSlot):
+            return None
+        if not isinstance(slot.staff_id, str) or slot.staff_id.strip() != selected_staff_id:
+            return None
+        if (not isinstance(slot.start_time, _DATETIME_TYPE)
+                or not isinstance(slot.end_time, _DATETIME_TYPE)):
+            return None
+        try:
+            start_offset = slot.start_time.utcoffset()
+            end_offset = slot.end_time.utcoffset()
+        except Exception:
+            return None
+        if start_offset is None or end_offset is None:
+            return None
+        if slot.end_time.astimezone(timezone.utc) <= slot.start_time.astimezone(timezone.utc):
+            return None
+        validated.append(slot)
+    return validated
 
 
 class ConversationState(Enum):
@@ -1383,30 +1415,45 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         from services.config.accountants_service import get_accountants_service
 
         context = self._conversations.get(call_sid)
-        calendar = get_calendar_service()
-        acc_service = get_accountants_service()
+        if context is None:
+            logger.warning("Orchestrator: booking check rejected without call context")
+            return (
+                "BOOKING_ERROR: Booking cannot be checked for this call. "
+                "Offer to retry or transfer the caller to a human."
+            )
+
+        # Invalidate stale authorization before parsing or any awaited provider work.
+        context.pending_booking = None
+        if not isinstance(arguments, dict):
+            logger.warning("Orchestrator: booking check rejected invalid arguments")
+            return "INVALID_DATE_TIME: Ask the caller to repeat the requested date and time."
 
         client_type = arguments.get("client_type", "individual")
         accountant_name = arguments.get("accountant_name", "")
         date_time_str = arguments.get("date_time") or ""
-        customer_name = arguments.get("customer_name", context.caller_name if context else "")
+        customer_name = arguments.get("customer_name", context.caller_name or "")
         customer_email = arguments.get("customer_email", "")
-
-        logger.info(f"Orchestrator: Checking booking - type={client_type}, accountant={accountant_name}, date={date_time_str}, customer={customer_name}, email={customer_email}")
-
-        appointment_time = _parse_booking_datetime(date_time_str)
-        if appointment_time is None:
-            if context:
-                context.pending_booking = None
-            logger.warning(f"Orchestrator: Could not parse booking date: {date_time_str!r}")
-            return "INVALID_DATE_TIME: Ask the caller to repeat the requested date and time."
-
-        # Check if MSGraph is configured
-        if not await calendar.is_available():
-            logger.error("Orchestrator: MS Bookings not configured")
-            return "BOOKING_ERROR: Microsoft Bookings is not configured. Please inform the caller that booking is temporarily unavailable and offer to transfer them to a human."
+        logger.info("Orchestrator: booking availability check started")
 
         try:
+            appointment_time = _parse_booking_datetime(date_time_str)
+        except Exception:
+            appointment_time = None
+        if appointment_time is None:
+            logger.warning("Orchestrator: booking check rejected invalid date")
+            return "INVALID_DATE_TIME: Ask the caller to repeat the requested date and time."
+
+        try:
+            calendar = get_calendar_service()
+            acc_service = get_accountants_service()
+            if not await calendar.is_available():
+                logger.warning("Orchestrator: booking check unavailable")
+                return (
+                    "BOOKING_ERROR: Microsoft Bookings is not configured. "
+                    "Please inform the caller that booking is temporarily unavailable "
+                    "and offer to transfer them to a human."
+                )
+
             # Look up accountant
             staff_id = ""
             service_id = ""
@@ -1417,7 +1464,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                     staff_id = acc.get("staff_id", "")
                     service_id = acc.get("service_id", "")
                     accountant_name = acc.get("name", accountant_name)
-                    logger.info(f"Orchestrator: Found accountant {accountant_name}, staff_id={staff_id}, service_id={service_id}")
+                    logger.info("Orchestrator: configured booking mapping found")
 
             # If no staff/service IDs configured, try to get from MSGraph
             if not staff_id or not service_id:
@@ -1430,17 +1477,17 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                             if name_lower in staff_name_lower or staff_name_lower in name_lower:
                                 staff_id = staff.id
                                 matched_staff_name = staff.name
-                                logger.info(f"Orchestrator: Matched staff from MSGraph: {staff.name} (id={staff.id})")
+                                logger.info("Orchestrator: matching calendar staff found")
                                 break
                             if name_lower.split()[0] in staff_name_lower.split() if name_lower.split() else False:
                                 staff_id = staff.id
                                 matched_staff_name = staff.name
-                                logger.info(f"Orchestrator: Matched staff by first name: {staff.name} (id={staff.id})")
+                                logger.info("Orchestrator: calendar staff alias matched")
                                 break
                     if not staff_id and staff_members:
                         staff_id = staff_members[0].id
                         matched_staff_name = staff_members[0].name
-                        logger.info(f"Orchestrator: Using default staff: {staff_members[0].name}")
+                        logger.info("Orchestrator: default calendar staff selected")
 
                 if not service_id:
                     services = await calendar.get_services()
@@ -1451,12 +1498,19 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                                 break
                         if not service_id and services:
                             service_id = services[0].id
-                            logger.info(f"Orchestrator: Using default service: {services[0].name}")
+                            logger.info("Orchestrator: default calendar service selected")
 
-            if not service_id:
-                return "BOOKING_ERROR: Could not find a matching service. Please ask the caller for more details or offer to transfer them."
+            if (not isinstance(staff_id, str) or not staff_id.strip()
+                    or not isinstance(service_id, str) or not service_id.strip()):
+                logger.warning("Orchestrator: booking check missing staff or service mapping")
+                return (
+                    "BOOKING_ERROR: Could not find a matching staff member and service. "
+                    "Please ask the caller for more details or offer to transfer them."
+                )
+            staff_id = staff_id.strip()
+            service_id = service_id.strip()
 
-            logger.info(f"Orchestrator: Final appointment time: {appointment_time} (from input: '{date_time_str}')")
+            logger.info("Orchestrator: booking mapping resolved")
 
             # =====================================================
             # VALIDATE: Weekend check - Office closed Sat/Sun
@@ -1499,12 +1553,12 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 if max_date.weekday() < 5:
                     business_days_added += 1
 
-            logger.info(f"Orchestrator: Date validation - today={today}, max_date={max_date}, requested={appointment_time.date()}")
+            logger.info("Orchestrator: booking date policy evaluated")
 
             if appointment_time.date() > max_date:
                 max_date_str = max_date.strftime('%A, %B %d')
                 max_date_ar = self._format_date_arabic(max_date)
-                logger.warning(f"Orchestrator: BOOKING_TOO_FAR - Requested: {appointment_time.date()}, Max allowed: {max_date}")
+                logger.warning("Orchestrator: booking check rejected horizon")
                 return (
                     f"BOOKING_TOO_FAR: The requested date is too far in advance. "
                     f"We can ONLY book appointments up to 2 business days ahead. "
@@ -1526,12 +1580,12 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                         for appt in existing_appointments:
                             appt_start = appt.get("start_time")
                             appt_staff = appt.get("staff_name", "")
-                            if appt_start and hasattr(appt_start, 'date'):
+                            if isinstance(appt_start, _DATETIME_TYPE):
                                 if appt_start.date() == appointment_time.date():
                                     # Mark as warned so subsequent checks proceed
                                     context.duplicate_warned = True
                                     appt_date = appt_start.date()
-                                    logger.warning(f"Orchestrator: DUPLICATE_BOOKING_WARNING - Caller already has appointment on {appt_date}")
+                                    logger.warning("Orchestrator: duplicate booking warning")
                                     return (
                                         f"DUPLICATE_WARNING: The caller already has an appointment on {appt_date.strftime('%A, %B %d')} "
                                         f"with {appt_staff}. Ask if they want to: 1) Keep existing and book another, "
@@ -1539,124 +1593,103 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                                         f"In Arabic: 'عندك موعد موجود يوم {self._format_date_arabic(appt_date)} مع {appt_staff}. "
                                         f"تحب تحجز موعد إضافي، أو تلغي الموجود وتحجز جديد، أو تختار يوم ثاني؟'"
                                     )
-                except Exception as e:
-                    logger.warning(f"Orchestrator: Could not check for duplicate bookings: {e}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Orchestrator: duplicate booking check failed")
+                    return (
+                        "AVAILABILITY_UNVERIFIED: Unable to verify an available appointment. "
+                        "Ask the caller to retry or offer help from a human."
+                    )
 
-            logger.info(f"Orchestrator: Checking availability for staff={staff_display}, date={appointment_time}")
+            logger.info("Orchestrator: checking selected-staff availability")
             available_slots = await calendar.get_available_slots(
                 service_id=service_id,
                 staff_id=staff_id,
                 days_ahead=7
             )
 
-            if available_slots:
-                requested_date = appointment_time.date()
-                requested_hour = appointment_time.hour
-                requested_minute = appointment_time.minute
+            slots = _validated_booking_slots(available_slots, staff_id)
+            if slots is None or not slots:
+                logger.warning("Orchestrator: availability could not be verified")
+                return (
+                    "AVAILABILITY_UNVERIFIED: Unable to verify an available appointment. "
+                    "Ask the caller to retry or offer help from a human."
+                )
 
-                # STRICT slot matching: the requested time must match an EXACT
-                # slot start time (not just fall within a slot's range). This
-                # prevents booking times like 4:30 PM when the portal only
-                # offers 4:00 PM or 5:00 PM slots.
-                slot_match = False
-                matched_slot = None
-                for slot in available_slots:
-                    slot_date = slot.start_time.date()
-                    if slot_date == requested_date:
-                        if (slot.start_time.hour == requested_hour and
-                            slot.start_time.minute == requested_minute):
-                            slot_match = True
-                            matched_slot = slot
+            matched_slot = next(
+                (slot for slot in slots
+                 if slot.start_time.astimezone(timezone.utc)
+                 == appointment_time.astimezone(timezone.utc)),
+                None,
+            )
+            if matched_slot is None:
+                local_starts = [
+                    slot.start_time.astimezone(appointment_time.tzinfo)
+                    for slot in slots
+                ]
+                same_day = [
+                    start for start in local_starts
+                    if start.date() == appointment_time.date()
+                ]
+                if same_day:
+                    alternatives = ", ".join(
+                        start.strftime(full_fmt) for start in same_day[:2]
+                    )
+                    result_type = "SLOT_BUSY"
+                    description = "That exact time was not returned as available."
+                else:
+                    suggestions = []
+                    seen_days = set()
+                    for start in local_starts:
+                        if start.date() not in seen_days:
+                            suggestions.append(start.strftime(full_fmt))
+                            seen_days.add(start.date())
+                        if len(suggestions) == 2:
                             break
+                    alternatives = ", ".join(suggestions)
+                    result_type = "SCHEDULE_FULL"
+                    description = "No verified slot was returned on the requested day."
+                logger.info("Orchestrator: booking alternatives returned for recheck")
+                return (
+                    f"{result_type}: {description} Suggested alternatives: "
+                    f"{alternatives}. Ask which date and time the caller chooses. "
+                    "Then call check_appointment again with that exact choice, read "
+                    "back the new SLOT_AVAILABLE result, and obtain a fresh "
+                    "confirmation before booking. Suggestions must pass the new "
+                    "check and must not be confirmed directly."
+                )
 
-                if not slot_match:
-                    same_day_slots = [s for s in available_slots if s.start_time.date() == requested_date]
-
-                    # Store the FIRST offered alternative as a real, bookable
-                    # pending time. The alternatives come straight from
-                    # get_available_slots, so they are already validated as free.
-                    # This is critical: if the caller says a bare "yes" to the
-                    # offered alternative, confirm_appointment can book it
-                    # immediately instead of bouncing back a "go re-check"
-                    # instruction that causes the LLM to stall in dead air.
-                    if same_day_slots:
-                        primary_alt = same_day_slots[0]
-                    else:
-                        primary_alt = available_slots[0] if available_slots else None
-
-                    context.pending_booking = {
-                        "service_id": service_id,
-                        "staff_id": staff_id,
-                        "staff_name": matched_staff_name or accountant_name,
-                        "appointment_time": primary_alt.start_time if primary_alt else None,
-                        "customer_name": customer_name,
-                        "customer_email": customer_email,
-                        "client_type": client_type,
-                    }
-
-                    if same_day_slots:
-                        alt_times = ", ".join([s.start_time.strftime(full_fmt) for s in same_day_slots[:2]])
-                        logger.info(f"Orchestrator: Requested time not available. Offering (primary={primary_alt.start_time.strftime(full_fmt)}): {alt_times}")
-                        return (
-                            f"SLOT_BUSY: {staff_display} is busy at that exact time (the office IS open, just that time slot is taken). "
-                            f"Same-day alternatives: {alt_times}. "
-                            f"Ask which works. If the caller says yes / agrees to the FIRST alternative ({primary_alt.start_time.strftime(full_fmt)}), call confirm_appointment with confirm=true directly. "
-                            f"If they pick a DIFFERENT time, call check_appointment AGAIN with that time."
-                        )
-                    else:
-                        next_slots = []
-                        seen_days = set()
-                        for s in available_slots:
-                            day_key = s.start_time.date()
-                            if day_key not in seen_days:
-                                next_slots.append(s.start_time.strftime(full_fmt))
-                                seen_days.add(day_key)
-                            if len(seen_days) >= 2:
-                                break
-
-                        if next_slots:
-                            alt_info = ", ".join(next_slots)
-                            primary_alt_str = primary_alt.strftime(full_fmt) if primary_alt else next_slots[0]
-                            logger.info(f"Orchestrator: No slots on requested day. Next available: {alt_info}")
-                            return (
-                                f"SCHEDULE_FULL: {staff_display}'s schedule is full that day (office IS open Monday-Friday, but this accountant is booked). "
-                                f"Next available: {alt_info}. "
-                                f"Ask which works. If the caller agrees to the FIRST option ({primary_alt_str}), call confirm_appointment with confirm=true directly. "
-                                f"If they pick a DIFFERENT time, call check_appointment AGAIN with that time."
-                            )
-                        else:
-                            context.pending_booking = None
-                            return (
-                                f"NO_AVAILABILITY: {staff_display} has no available slots in the next 7 days. "
-                                f"Apologize and offer to transfer or suggest a different accountant."
-                            )
-
-            # =====================================================
-            # SLOT IS AVAILABLE — store pending booking, ask for confirmation
-            # =====================================================
+            # The legacy create adapter labels wall-clock fields as Eastern Time.
+            # Preserve the verified instant in Toronto before passing it downstream.
+            booking_time = as_business_time(matched_slot.start_time)
+            display_time = booking_time.strftime(full_fmt)
             context.pending_booking = {
                 "service_id": service_id,
                 "staff_id": staff_id,
-                "staff_name": matched_staff_name or accountant_name,
-                "appointment_time": appointment_time,
+                "staff_name": matched_slot.staff_name or staff_display,
+                "appointment_time": booking_time,
                 "customer_name": customer_name,
                 "customer_email": customer_email,
                 "client_type": client_type,
             }
-            display_time = appointment_time.strftime(full_fmt)
-            logger.info(f"Orchestrator: Slot available - pending confirmation for {display_time} with {staff_display}")
-
+            logger.info("Orchestrator: exact selected-staff slot pending confirmation")
             return (
-                f"SLOT_AVAILABLE: The appointment with {staff_display} on {display_time} is available. "
-                f"Ask the caller to confirm: do they want to go ahead and book this appointment? "
-                f"Do NOT book yet — wait for the caller to say yes."
+                f"SLOT_AVAILABLE: The appointment with {staff_display} on "
+                f"{display_time} is available. Ask the caller to confirm whether "
+                "they want to book this exact appointment. Do not book until the "
+                "caller says yes."
             )
 
-        except Exception as e:
-            logger.error(f"Orchestrator: Check booking exception: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return f"BOOKING_ERROR: System error while checking availability: {str(e)}. Apologize and offer to transfer."
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            context.pending_booking = None
+            logger.error("Orchestrator: booking availability check failed")
+            return (
+                "AVAILABILITY_UNVERIFIED: Unable to verify an available appointment. "
+                "Ask the caller to retry or offer help from a human."
+            )
 
     async def _confirm_booking(self, call_sid: str, arguments: dict) -> str:
         """
@@ -1680,7 +1713,16 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 "then call confirm_appointment after SLOT_AVAILABLE."
             )
 
-        if not arguments.get("confirm", False):
+        confirm = arguments.get("confirm") if isinstance(arguments, dict) else None
+        if confirm is not True and confirm is not False:
+            context.pending_booking = None
+            logger.warning("Orchestrator: invalid booking confirmation rejected")
+            return (
+                "BOOKING_NEEDS_RECHECK: The confirmation value was invalid. "
+                "Call check_appointment again for the caller's chosen date and time, "
+                "read back the exact appointment, and obtain a fresh confirmation."
+            )
+        if confirm is False:
             # Caller said no — clear pending booking
             context.pending_booking = None
             return "BOOKING_CANCELLED: The caller chose not to book. Ask if they would like a different time or anything else."
@@ -1690,6 +1732,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         # If pending booking is from an UNAVAILABLE check (no confirmed time),
         # the LLM skipped re-checking — tell it to call check_appointment first
         if pending.get("awaiting_recheck") or pending.get("appointment_time") is None:
+            context.pending_booking = None
             logger.warning("Orchestrator: confirm_appointment called but pending booking has no confirmed time (awaiting recheck)")
             return (
                 "BOOKING_NEEDS_RECHECK: The previous time was unavailable and no new time was checked. "
@@ -1716,7 +1759,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             import re as _re
             customer_email = pending.get("customer_email", "") or ""
             if customer_email and not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", customer_email.strip()):
-                logger.warning(f"Orchestrator: Discarding malformed email '{customer_email}' before booking")
+                logger.warning("Orchestrator: discarding malformed booking email")
                 customer_email = ""
             else:
                 customer_email = customer_email.strip()
@@ -1731,7 +1774,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             )
 
             if result.success:
-                logger.info(f"Orchestrator: BOOKING CREATED - id={result.appointment_id}, time={result.start_time}, staff={result.staff_name}")
+                logger.info("Orchestrator: booking provider reported success")
 
                 # Save booking to local database for dashboard
                 try:
@@ -1758,8 +1801,8 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                         result.appointment_id or ""
                     )
                     logger.info(f"Orchestrator: Booking saved to dashboard database")
-                except Exception as db_err:
-                    logger.warning(f"Orchestrator: Failed to save booking to dashboard DB: {db_err}")
+                except Exception:
+                    logger.warning("Orchestrator: failed to save booking dashboard record")
 
                 # Send SMS confirmation + schedule 24hr reminder
                 display_staff = result.staff_name or pending["staff_name"] or "your accountant"
@@ -1781,18 +1824,29 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 context.booking_just_completed = True
                 context.last_booking_summary = f"{display_time} with {display_staff}"
 
-                return f"BOOKING_SUCCESS: Appointment booked successfully. Appointment ID: {result.appointment_id}. Time: {result.start_time}. Staff: {result.staff_name or pending['staff_name']}. Customer: {result.customer_name}."
+                return (
+                    f"BOOKING_SUCCESS: Appointment booked successfully for "
+                    f"{display_time} with {pending['staff_name']}."
+                )
             else:
-                logger.error(f"Orchestrator: BOOKING FAILED - {result.error_message}")
+                logger.error("Orchestrator: booking outcome could not be verified")
                 context.pending_booking = None
-                return f"BOOKING_ERROR: Failed to create booking: {result.error_message}. Apologize and offer to transfer to a human."
+                return (
+                    "BOOKING_OUTCOME_UNKNOWN: Unable to verify whether the appointment "
+                    "was created. Do not attempt another booking. Offer human help "
+                    "to check the calendar before any further action."
+                )
 
-        except Exception as e:
-            logger.error(f"Orchestrator: Confirm booking exception: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("Orchestrator: booking confirmation failed")
             context.pending_booking = None
-            return f"BOOKING_ERROR: System error while booking: {str(e)}. Apologize and offer to transfer."
+            return (
+                "BOOKING_OUTCOME_UNKNOWN: Unable to verify whether the appointment "
+                "was created. Do not attempt another booking. Offer human help "
+                "to check the calendar before any further action."
+            )
 
     async def _send_booking_sms(
         self,
