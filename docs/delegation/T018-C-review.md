@@ -1,5 +1,25 @@
 # T018-C lead acceptance, 2026-09-12
 
+## Pre-cutover mount-order correction, 2026-09-13
+
+Owner diagnostic for release `.oomp1k6t` confirmed cutover_started=false,
+deployed_marker=false and every health/configuration check true except
+mount_list_order_matches. mount_contents_match=true proves the same mount
+dictionaries were returned in a different order. The pre-cutover guard still
+compared raw lists, although replacement verification already ignored ordering.
+
+Added a failing-first regression against the actual pre-cutover method: the old
+code raised `running app changed before cutover` for reversed identical mounts.
+Both pre-cutover and replacement now use the same sorted full-dictionary
+fingerprint. Every field and duplicate count remains significant; no mount is
+dropped or compared by path alone. The regression rejects changed source,
+destination, read/write, mode, propagation or type, and missing/duplicate mounts.
+No server configuration, runtime application, database or dependency changes.
+Focused release/diagnostic21 passed. The last server attempt's settings and
+restored0003/fallback rehearsal already passed; it never stopped writers.
+The next owner action is a fresh guarded attempt using the corrected pinned
+commit, not a manual edit of the private override or a skip of pre-cutover checks.
+
 ## Settings-mount incident and correction (latest evidence)
 
 The first server attempt stopped at settings, before cutover, in

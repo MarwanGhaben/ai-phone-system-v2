@@ -279,6 +279,42 @@ class ReleaseTests(unittest.TestCase):
         item.stop_writers.assert_not_called()
         self.assertFalse((self.path / 'cutover-started').exists())
 
+    def test_pre_cutover_accepts_reordered_mounts_but_rejects_real_mount_drift(self):
+        # 2026-09-13 server refusal: all guards matched except Docker mount order.
+        item = self.item
+        item.root = self.path
+        (self.path / 'nginx').mkdir()
+        (self.path / 'nginx/nginx.conf').write_bytes(b'synthetic nginx')
+        (self.path / 'docker-compose.yml').write_bytes(b'synthetic compose')
+        (self.path / 'compose.sha256').write_text(release.sha256(b'synthetic compose'))
+        for name in ('docker-compose.override.yml', 'previous-override.json'):
+            (self.path / name).write_bytes(b'synthetic private override')
+        item.db = {'Image': item.pg_image, 'State': {'Running': True,
+                   'Health': {'Status': 'healthy'}}, 'NetworkSettings': {'Networks': {'internal': {}}}}
+        current = json.loads(json.dumps(item.old))
+        current['Mounts'].reverse()
+        item.inspect = lambda name: (current if name == 'ai-voice-app' else item.db
+                                     if name == 'ai-voice-db' else {'State': {'Running': True}})
+        item.settings = lambda: dict(item.previous_settings)
+        item.run = mock.Mock()
+        item.schema_matches = mock.Mock(return_value=True)
+        item.public_health = mock.Mock()
+        with mock.patch.object(release, 'NGINX_HASH', release.sha256(b'synthetic nginx')):
+            item.recheck_before_stop()
+            self.assertFalse((self.path / 'cutover-started').exists())
+            for field, value in (('Source', '/changed'), ('Destination', '/changed'),
+                                 ('RW', True), ('Mode', 'changed'), ('Propagation', 'rshared'),
+                                 ('Type', 'volume')):
+                with self.subTest(field=field):
+                    current['Mounts'] = json.loads(json.dumps(item.old['Mounts']))
+                    current['Mounts'][0][field] = value
+                    with self.assertRaisesRegex(RuntimeError, 'running app changed'):
+                        item.recheck_before_stop()
+            for mounts in (item.old['Mounts'][:1], item.old['Mounts'] + item.old['Mounts'][:1]):
+                current['Mounts'] = mounts
+                with self.assertRaisesRegex(RuntimeError, 'running app changed'):
+                    item.recheck_before_stop()
+
     def _cutover_harness(self, *, migrate_fails=False, post_migration_fails=False,
                          predecessor=False, current=True):
         item = self.item

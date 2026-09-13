@@ -133,6 +133,11 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def mount_fingerprint(mounts: list[dict]) -> list[str]:
+    """Docker may reorder mounts; preserve every field and duplicate count."""
+    return sorted(json.dumps(mount, sort_keys=True) for mount in mounts)
+
+
 def settings_for(previous: dict, *, candidate: bool) -> dict:
     expected = dict(previous)
     if candidate:
@@ -593,7 +598,7 @@ class Release:
         old = self.inspect('ai-voice-app')
         if (old['Image'] != OLD_IMAGE or not old['State']['Running']
                 or old['State'].get('Health', {}).get('Status') != 'healthy'
-                or old['Mounts'] != self.old['Mounts']
+                or mount_fingerprint(old['Mounts']) != mount_fingerprint(self.old['Mounts'])
                 or old['NetworkSettings']['Networks'] != self.old['NetworkSettings']['Networks']
                 or old['HostConfig'].get('PortBindings') != self.old['HostConfig'].get('PortBindings')
                 or old['Config']['Env'] != self.old['Config']['Env']
@@ -635,8 +640,7 @@ class Release:
         self.wait_ready()
         current = self.inspect('ai-voice-app')
         # Docker inspect may reorder mounts on recreation. Compare every field.
-        expected_mounts = sorted(json.dumps(mount, sort_keys=True)
-                                 for mount in self.old['Mounts'])
+        expected_mounts = mount_fingerprint(self.old['Mounts'])
         mounted = current['Mounts']
         if candidate:
             overlays = [m for m in mounted if m['Destination'] == SETTINGS_TARGET]
@@ -644,7 +648,7 @@ class Release:
                     or overlays[0].get('Type') != 'bind' or overlays[0]['RW']):
                 raise RuntimeError('replacement pinned settings mount differs')
             mounted = [m for m in mounted if m['Destination'] != SETTINGS_TARGET]
-        actual_mounts = sorted(json.dumps(mount, sort_keys=True) for mount in mounted)
+        actual_mounts = mount_fingerprint(mounted)
         if (current['Image'] != image or not current['State']['Running']
                 or actual_mounts != expected_mounts
                 or set(current['NetworkSettings']['Networks'])
