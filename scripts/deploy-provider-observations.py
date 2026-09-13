@@ -54,6 +54,7 @@ OBSERVATION_SETTINGS = {
     'booking_observation_interval_seconds': 60,
     'booking_observation_freshness_seconds': 180,
 }
+SETTINGS_TARGET = '/app/config/settings.py'
 BUSINESS_TABLES = (
     'admin_sessions', 'admin_users', 'analytics_events', 'api_usage',
     'appointments', 'bookings', 'call_logs', 'callers', 'calls',
@@ -142,7 +143,7 @@ def settings_for(previous: dict, *, candidate: bool) -> dict:
     return expected
 
 
-def normalized_compose(config: dict, *, candidate: bool) -> dict:
+def normalized_compose(config: dict, *, candidate: bool, settings_source=None) -> dict:
     value = copy.deepcopy(config)
     app = value['services']['app']
     app['image'] = '<app-image>'
@@ -154,6 +155,14 @@ def normalized_compose(config: dict, *, candidate: bool) -> dict:
             if str(environment.pop(key, None)) != expected:
                 raise RuntimeError('observation environment differs')
     app['environment'] = environment
+    if candidate and settings_source is not None:
+        mounts = app.get('volumes', [])
+        overlays = [m for m in mounts if m.get('target') == SETTINGS_TARGET]
+        if (len(overlays) != 1 or overlays[0].get('source') != str(settings_source)
+                or overlays[0].get('type') != 'bind'
+                or overlays[0].get('read_only') is not True):
+            raise RuntimeError('pinned settings mount differs')
+        app['volumes'] = [m for m in mounts if m.get('target') != SETTINGS_TARGET]
     value['services']['migrate']['image'] = '<migration-image>'
     return value
 
@@ -170,6 +179,7 @@ class Release:
         self.live_env = None
         self.db = None
         self.stage = 'preflight'
+        self.settings_overlay = self.directory / 'candidate-settings.py'
 
     def private_write(self, name: str, data: bytes) -> Path:
         path = self.directory / name
@@ -433,16 +443,33 @@ class Release:
             if not isinstance(environment, dict) or OBSERVATION_ENV.keys() & environment.keys():
                 raise RuntimeError('private observation environment differs')
             environment.update(OBSERVATION_ENV)
+            if any(m['Destination'] == SETTINGS_TARGET for m in self.old['Mounts']):
+                raise RuntimeError('previous app already has a settings file overlay')
+            source = self.run('git', 'show', self.commit + ':config/settings.py').stdout
+            self.private_write('candidate-settings.py', source)
+            # This is reviewed application source, not configuration values or
+            # credentials. Keep its directory private; permit image users to read
+            # the bind-mounted file while leaving the original config mount intact.
+            self.settings_overlay.chmod(0o644)
+            mounts = app.setdefault('volumes', [])
+            if not isinstance(mounts, list) or any(
+                    isinstance(m, dict) and m.get('target') == SETTINGS_TARGET for m in mounts):
+                raise RuntimeError('private settings mount already exists')
+            mounts.append({'type': 'bind', 'source': str(self.settings_overlay),
+                           'target': SETTINGS_TARGET, 'read_only': True})
         path = self.private_write(label + '-override.json',
                                   (json.dumps(config, indent=2) + '\n').encode())
         previous = self.directory / 'previous-override.json'
         baseline = json.loads(self.compose(previous, 'config', '--format', 'json').stdout)
         rendered = json.loads(self.compose(path, 'config', '--format', 'json').stdout)
-        if (normalized_compose(rendered, candidate=(label == 'candidate'))
+        if (normalized_compose(rendered, candidate=(label == 'candidate'),
+                               settings_source=self.settings_overlay)
                 != normalized_compose(baseline, candidate=False)):
             raise RuntimeError('effective Compose configuration changed')
         rendered_app = rendered['services']['app']
         old_mounts = {(m['Source'], m['Destination'], not m['RW']) for m in self.old['Mounts']}
+        if label == 'candidate':
+            old_mounts.add((str(self.settings_overlay), SETTINGS_TARGET, True))
         new_mounts = {(m['source'], m['target'], m.get('read_only', False))
                       for m in rendered_app['volumes']}
         new_networks = {rendered['networks'][n]['name'] for n in rendered_app['networks']}
@@ -610,8 +637,14 @@ class Release:
         # Docker inspect may reorder mounts on recreation. Compare every field.
         expected_mounts = sorted(json.dumps(mount, sort_keys=True)
                                  for mount in self.old['Mounts'])
-        actual_mounts = sorted(json.dumps(mount, sort_keys=True)
-                               for mount in current['Mounts'])
+        mounted = current['Mounts']
+        if candidate:
+            overlays = [m for m in mounted if m['Destination'] == SETTINGS_TARGET]
+            if (len(overlays) != 1 or overlays[0]['Source'] != str(self.settings_overlay)
+                    or overlays[0].get('Type') != 'bind' or overlays[0]['RW']):
+                raise RuntimeError('replacement pinned settings mount differs')
+            mounted = [m for m in mounted if m['Destination'] != SETTINGS_TARGET]
+        actual_mounts = sorted(json.dumps(mount, sort_keys=True) for mount in mounted)
         if (current['Image'] != image or not current['State']['Running']
                 or actual_mounts != expected_mounts
                 or set(current['NetworkSettings']['Networks'])

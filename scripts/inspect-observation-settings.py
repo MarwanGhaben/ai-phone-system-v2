@@ -16,7 +16,7 @@ LOG_CATEGORIES = {
     'container_name_conflict': r'container name .* already in use',
     'image_unavailable': r'No such image|pull access denied',
     'mount_error': r'invalid mount config|error mounting|mount .* denied',
-    'python_import_error': r'ModuleNotFoundError:|ImportError:',
+    'python_import_error': r'(?m)^(?:ModuleNotFoundError|ImportError):',
     'settings_validation_error': r'ValidationError|validation error[s]? for Settings',
     'docker_permission_error': r'permission denied while trying to connect',
     'memory_error': r'out of memory|cannot allocate memory|"OOMKilled"\s*:\s*true',

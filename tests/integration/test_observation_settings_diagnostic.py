@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -44,6 +45,12 @@ def test_log_decoder_handles_concatenated_json_and_unrelated_errors():
     expected = {'database_url': SECRET, 'openai_model': 'synthetic'}
     log = 'build progress {invalid\n' + json.dumps([{'Env': [SECRET]}]) + json.dumps(expected)
     assert diagnostic.settings_objects(log) == [expected]
+
+
+def test_logged_source_except_clause_is_not_an_import_failure():
+    pattern = diagnostic.LOG_CATEGORIES['python_import_error']
+    assert not re.search(pattern, '            except ImportError:\n                pass')
+    assert re.search(pattern, "ImportError: cannot import name 'model_validator'\n")
 
 
 def test_full_report_only_runs_readonly_commands_and_redacts(tmp_path):

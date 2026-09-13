@@ -1,5 +1,38 @@
 # T018-C lead acceptance, 2026-09-12
 
+## Settings-mount incident and correction (latest evidence)
+
+The first server attempt stopped at settings, before cutover, in
+`/opt/ai-phone-observation-release._jjs4r2g`. Owner diagnostic confirms no cutover
+marker, matching Compose values/mounts/networks, and the original app still healthy.
+Its settings probe returned the old model without observation fields.
+
+The server's existing `/app/config` bind mount hides the new image settings.py.
+The initial local proof lacked that directory mount and missed this packaging
+condition. Lead reproduced the exact behavior with the old config directory
+mounted onto the real candidate image: observation fields disappear even though
+the new environment variables are present. A pinned candidate-only settings.py
+file bind restores the new settings without modifying the shared config folder.
+The corrected preservation checks permit only this precise read-only source/target
+in addition to the three new environment values; all previous mounts/settings
+remain required. Fallback gets no additional file mount.
+
+The initial diagnostic's import-error category was a false positive from literal
+`except ImportError:` source logged during Git blob reads. Corrected it to match
+exception lines at the start of a line; added a regression. No Pydantic dependency
+change was needed. Application source and migration bytes remain unchanged.
+
+Actual proof `.repo-review/t018c_settings_mount_rehearsal.py`: reproduced hidden
+settings, passed corrected candidate and fallback settings probes with real
+Compose/images and synthetic dollar/multiline values, verified original config
+source unchanged, and confirmed all temporary container/network cleanup.
+Focused release/diagnostic23 passed; full normal164 passed/35 optional skips/two
+existing warnings in5.39seconds. No further SOL work or owner inventory is needed.
+Retry must use the new pinned script commit; the earlier failed release has no
+cutover marker, so a fresh guarded attempt is permitted. Do not reuse its override.
+
+## Original release acceptance
+
 Accepted for the separate manual beta rollout after two direct release fixes.
 Server remains source075d8cf/imagef65fd1b4 with schema0002; no server or Microsoft
 access occurred during this review. Accepted T018-B application files were not

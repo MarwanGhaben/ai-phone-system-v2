@@ -48,7 +48,7 @@ def override(image: str) -> dict:
 
 def rendered(config: dict) -> dict:
     value = json.loads(json.dumps(config))
-    value['services']['app']['volumes'] = [
+    value['services']['app']['volumes'] = value['services']['app'].get('volumes', []) + [
         {'source': '/opt/runtime.env', 'target': '/app/.env', 'read_only': True},
         {'source': '/opt/cert', 'target': '/cert', 'read_only': True},
     ]
@@ -119,6 +119,7 @@ class ReleaseTests(unittest.TestCase):
             seen.append((path.name, args))
             return SimpleNamespace(stdout=json.dumps(config).encode())
         item.compose = compose
+        item.run = lambda *args, **kwargs: SimpleNamespace(stdout=b'# reviewed settings source\n')
         item.settings_probe = lambda path, label: release.settings_for(
             item.previous_settings, candidate=label == 'candidate')
         candidate = item.prepare_override('candidate', 'sha256:candidate', 'sha256:candidate', previous)
@@ -129,6 +130,7 @@ class ReleaseTests(unittest.TestCase):
                          previous['services']['app']['environment'] | release.OBSERVATION_ENV)
         self.assertEqual(len(seen), 4)
         (self.path / 'candidate-override.json').unlink()
+        (self.path / 'candidate-settings.py').unlink()
         item.settings_probe = lambda path, label: {'token': 'changed'}
         with self.assertRaisesRegex(RuntimeError, 'effective application settings changed'):
             item.prepare_override('candidate', 'sha256:candidate', 'sha256:candidate', previous)
@@ -168,6 +170,8 @@ class ReleaseTests(unittest.TestCase):
         current = json.loads(json.dumps(item.old))
         current['Image'] = 'sha256:candidate'
         current['Mounts'].reverse()
+        current['Mounts'].append({'Type': 'bind', 'Source': str(item.settings_overlay),
+                                 'Destination': release.SETTINGS_TARGET, 'RW': False})
         current['Config']['Env'].extend(k + '=' + v for k, v in release.OBSERVATION_ENV.items())
         item.wait_ready = lambda: None
         item.inspect = lambda name: current
@@ -176,6 +180,24 @@ class ReleaseTests(unittest.TestCase):
         current['Mounts'][0]['RW'] = True
         with self.assertRaisesRegex(RuntimeError, 'mounts differ'):
             item.verify_replaced('sha256:candidate', candidate=True)
+
+    def test_settings_overlay_is_pinned_readonly_and_only_mount_exception(self):
+        old = rendered(override(release.OLD_IMAGE))
+        new = rendered(override('candidate'))
+        new['services']['app']['environment'].update(release.OBSERVATION_ENV)
+        overlay = {'type': 'bind', 'source': str(self.item.settings_overlay),
+                   'target': release.SETTINGS_TARGET, 'read_only': True}
+        new['services']['app']['volumes'].append(overlay)
+        self.assertEqual(release.normalized_compose(old, candidate=False),
+                         release.normalized_compose(new, candidate=True,
+                                                    settings_source=self.item.settings_overlay))
+        for field, value in (('read_only', False), ('source', '/unreviewed/settings.py')):
+            with self.subTest(field=field):
+                wrong = json.loads(json.dumps(new))
+                wrong['services']['app']['volumes'][-1][field] = value
+                with self.assertRaisesRegex(RuntimeError, 'pinned settings mount differs'):
+                    release.normalized_compose(wrong, candidate=True,
+                                               settings_source=self.item.settings_overlay)
 
     def test_preflight_rejects_wrong_private_image_before_live_action(self):
         item = self.item

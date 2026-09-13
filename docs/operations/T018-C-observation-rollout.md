@@ -20,6 +20,16 @@ isolated PostgreSQL rehearsal, then stops ingress and app for the final backup,
 file, checkout, TLS files, database/Redis/certbot containers, old image or
 private runtime.env mount. The existing on-server-only backup risk was accepted.
 
+The existing `/app/config` directory bind mount hides the candidate image's new
+settings module. The corrected candidate therefore adds exactly one read-only
+file mount: `<new release directory>/candidate-settings.py` to
+`/app/config/settings.py`. It is application source fetched from the pinned
+release commit, not an environment file. Every original mount is retained;
+fallback uses the original mounts only. Keep the new protected release directory
+after success because the running app requires this file. Do not edit the shared
+server config directory, remove old runtime.env files, or copy secrets into this
+source file. The release verifies this one explicit mount exception separately.
+
 **DigitalOcean browser console: use the lead's published exact commit:**
 
 ```sh
