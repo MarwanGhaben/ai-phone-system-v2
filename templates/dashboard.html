@@ -897,7 +897,9 @@
                     <div class="icon success"><i class="fas fa-calendar-check"></i></div>
                     <h3>Recent Bookings</h3>
                     <span style="margin-left: auto; color: var(--text-secondary);">
-                        Total: <strong id="totalBookings">--</strong> | Upcoming: <strong id="upcomingBookings">--</strong>
+                        Total: <strong id="totalBookings">--</strong> |
+                        Local recorded upcoming: <strong id="upcomingBookings">--</strong> |
+                        Fresh Microsoft-verified upcoming: <strong id="verifiedUpcomingBookings">--</strong>
                     </span>
                 </div>
                 <div class="table-container">
@@ -911,11 +913,14 @@
                                 <th>Type</th>
                                 <th>Lang</th>
                                 <th>Status</th>
+                                <th>Microsoft state</th>
+                                <th>Last checked</th>
+                                <th>Observed Microsoft time</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody id="bookingsBody">
-                            <tr><td colspan="8" style="text-align: center;">Loading...</td></tr>
+                            <tr><td colspan="11" style="text-align: center;">Loading...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1337,11 +1342,12 @@
                 const data = await response.json();
 
                 document.getElementById('totalBookings').textContent = data.total;
-                document.getElementById('upcomingBookings').textContent = data.upcoming;
+                document.getElementById('upcomingBookings').textContent = data.local_recorded_upcoming;
+                document.getElementById('verifiedUpcomingBookings').textContent = data.microsoft_verified_upcoming;
 
                 const tbody = document.getElementById('bookingsBody');
                 if (data.bookings.length === 0) {
-                    renderEmptyTable(tbody, 8, 'No bookings yet');
+                    renderEmptyTable(tbody, 11, 'No bookings yet');
                     return;
                 }
 
@@ -1358,8 +1364,21 @@
                     languageCell.appendChild(createTextElement('span', languageFlag(booking.language), `lang-badge ${booking.language}`));
                     row.appendChild(languageCell);
                     const statusCell = document.createElement('td');
-                    statusCell.appendChild(createTextElement('span', booking.status, 'status-badge operational'));
+                    const verified = booking.status === 'confirmed' && booking.provider_state === 'present';
+                    const localStatus = booking.status === 'confirmed' ? 'Confirmed locally' : (booking.status || 'Unknown local status');
+                    statusCell.appendChild(createTextElement('span', localStatus, verified ? 'status-badge operational' : 'status-badge warning'));
                     row.appendChild(statusCell);
+                    const providerLabels = {
+                        present: 'Available in Microsoft (time observed)',
+                        changed: 'Time changed in Microsoft',
+                        unavailable: 'Unavailable in Microsoft: needs review',
+                        check_failed: 'Check failed',
+                        stale: 'Stale: needs recheck',
+                        not_checked: 'Not checked'
+                    };
+                    appendTextCell(row, providerLabels[booking.provider_state] || 'Not checked');
+                    appendTextCell(row, booking.provider_checked_at ? new Date(booking.provider_checked_at).toLocaleString() : '--');
+                    appendTextCell(row, booking.provider_observed_time ? new Date(booking.provider_observed_time).toLocaleString() : '--');
                     const actionCell = document.createElement('td');
                     const deleteButton = createTextElement('button', 'Delete', 'btn-action delete');
                     deleteButton.addEventListener('click', () => deleteBooking(booking.id));

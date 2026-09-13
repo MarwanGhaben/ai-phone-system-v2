@@ -7,7 +7,7 @@ All API endpoints for the admin dashboard.
 
 import os
 import psutil
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -21,6 +21,8 @@ from services.dashboard.metrics_service import fetch_call_statistics
 from services.database import get_db_pool
 from services.security.client_ip import get_client_ip
 from services.scheduling.booking_records import booking_time_for_dashboard
+from services.scheduling.provider_observations import provider_state
+from config.settings import get_settings
 
 
 # =====================================================
@@ -531,17 +533,22 @@ async def get_frequent_callers(user: dict = Depends(require_auth), limit: int = 
 
 @router.get("/api/bookings")
 async def get_bookings(user: dict = Depends(require_auth), limit: int = 50):
-    """Get all bookings"""
+    """Get local history and stored provider evidence; never contact Graph here."""
     pool = await get_db_pool()
+    freshness = getattr(get_settings(), "booking_observation_freshness_seconds", 180)
+    now = datetime.now(timezone.utc)
 
     try:
         rows = await pool.fetch(
             """
-            SELECT id, client_name, client_email, phone_number, accountant_name,
-                   appointment_time, appointment_time_utc, client_type, language,
-                   status, created_at
-            FROM bookings
-            ORDER BY appointment_time_utc DESC NULLS LAST, appointment_time DESC
+            SELECT b.id,b.client_name,b.client_email,b.phone_number,b.accountant_name,
+                   b.appointment_time,b.appointment_time_utc,b.client_type,b.language,
+                   b.status,b.created_at,b.ms_booking_id,
+                   o.snapshot_provider_id,o.snapshot_start,o.snapshot_status,
+                   o.checked_at,o.outcome,o.provider_start,o.provider_end
+            FROM public.bookings AS b
+            LEFT JOIN public.booking_provider_observations AS o ON o.booking_id=b.id
+            ORDER BY b.appointment_time_utc DESC NULLS LAST,b.appointment_time DESC
             LIMIT $1
             """,
             limit
@@ -564,6 +571,22 @@ async def get_bookings(user: dict = Depends(require_auth), limit: int = 50):
             """
         )
 
+        microsoft_verified_upcoming = await pool.fetchval(
+            """
+            SELECT COUNT(*) FROM public.bookings AS b
+            JOIN public.booking_provider_observations AS o ON o.booking_id=b.id
+            WHERE b.appointment_time_utc > CURRENT_TIMESTAMP
+              AND b.status='confirmed' AND o.outcome='present'
+              AND o.snapshot_provider_id=b.ms_booking_id
+              AND o.snapshot_start=b.appointment_time_utc
+              AND o.snapshot_status=b.status
+              AND o.provider_start=b.appointment_time_utc
+              AND o.checked_at BETWEEN
+                  CURRENT_TIMESTAMP - ($1::integer * INTERVAL '1 second')
+                  AND CURRENT_TIMESTAMP
+            """, freshness
+        )
+
         unresolved_time = await pool.fetchval(
             "SELECT COUNT(*) FROM bookings WHERE appointment_time_utc IS NULL"
         )
@@ -571,33 +594,45 @@ async def get_bookings(user: dict = Depends(require_auth), limit: int = 50):
         return {
             "total": len(rows),
             "upcoming": upcoming or 0,
+            "local_recorded_upcoming": upcoming or 0,
+            "microsoft_verified_upcoming": microsoft_verified_upcoming or 0,
             "unresolved_time": unresolved_time or 0,
             "by_accountant": {r['accountant_name']: r['count'] for r in accountant_counts},
-            "bookings": [
-                {
-                    "id": row['id'],
-                    "client": row['client_name'],
-                    "email": row['client_email'],
-                    "phone": row['phone_number'],
-                    "accountant": row['accountant_name'],
-                    "time": (
-                        booking_time_for_dashboard(row['appointment_time_utc'])
-                        if row['appointment_time_utc'] is not None
-                        else (row['appointment_time'].isoformat()
-                              if row['appointment_time'] else None)
-                    ),
-                    "time_verified": row['appointment_time_utc'] is not None,
-                    "type": row['client_type'],
-                    "language": row['language'],
-                    "status": row['status']
-                }
-                for row in rows
-            ]
+            "bookings": [_booking_observation_view(dict(row), now, freshness)
+                         for row in rows]
         }
     except Exception:
         logger.error("Error fetching bookings")
-        return {"total": 0, "upcoming": 0, "unresolved_time": 0,
+        return {"total": 0, "upcoming": 0, "local_recorded_upcoming": 0,
+                "microsoft_verified_upcoming": 0, "unresolved_time": 0,
                 "by_accountant": {}, "bookings": []}
+
+
+def _booking_observation_view(row: dict, now: datetime, freshness: int) -> dict:
+    state = provider_state(row, now, freshness)
+    canonical = row['appointment_time_utc']
+    return {
+        "id": row['id'],
+        "client": row['client_name'],
+        "email": row['client_email'],
+        "phone": row['phone_number'],
+        "accountant": row['accountant_name'],
+        "time": (booking_time_for_dashboard(canonical) if canonical is not None
+                 else (row['appointment_time'].isoformat()
+                       if row['appointment_time'] else None)),
+        "time_verified": canonical is not None,
+        "type": row['client_type'],
+        "language": row['language'],
+        "status": row['status'],
+        "provider_state": state,
+        "provider_checked_at": (
+            row['checked_at'].isoformat() if row['checked_at'] else None
+        ),
+        "provider_observed_time": (
+            booking_time_for_dashboard(row['provider_start'])
+            if state == 'changed' and row['provider_start'] is not None else None
+        ),
+    }
 
 
 @router.delete("/api/bookings/{booking_id}")

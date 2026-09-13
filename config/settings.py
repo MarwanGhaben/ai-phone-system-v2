@@ -8,7 +8,7 @@ Centralized configuration management using pydantic-settings
 import os
 import json
 from typing import List, Optional, Union
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -144,6 +144,22 @@ class Settings(BaseSettings):
     ms_bookings_client_id: str = Field(default="", alias="MS_BOOKINGS_CLIENT_ID")
     ms_bookings_client_secret: str = Field(default="", alias="MS_BOOKINGS_CLIENT_SECRET")
     ms_bookings_business_id: str = Field(default="", alias="MS_BOOKINGS_BUSINESS_ID")
+    booking_observation_enabled: bool = Field(
+        default=False, alias="BOOKING_OBSERVATION_ENABLED"
+    )
+    booking_observation_interval_seconds: int = Field(
+        default=60, ge=10, le=3600, alias="BOOKING_OBSERVATION_INTERVAL_SECONDS"
+    )
+    booking_observation_freshness_seconds: int = Field(
+        default=180, ge=11, le=7200, alias="BOOKING_OBSERVATION_FRESHNESS_SECONDS"
+    )
+
+    @model_validator(mode="after")
+    def validate_observation_freshness(self):
+        if (self.booking_observation_freshness_seconds
+                <= self.booking_observation_interval_seconds):
+            raise ValueError("observation freshness must exceed poll interval")
+        return self
 
     # =====================================================
     # SMS (Telnyx)

@@ -175,6 +175,57 @@ def test_compatible_database_starts_then_ready_tracks_current_database(monkeypat
     assert events[-2:] == ["scheduler-stop", "close"]
 
 
+def test_optional_observation_poller_starts_after_schema_and_stops_before_pool(monkeypatch):
+    events = []
+    module, _ = _load_main(monkeypatch, events)
+    module.settings.booking_observation_enabled = True
+
+    class Poller:
+        def __init__(self, pool, settings):
+            events.append("poller-created")
+
+        def start(self):
+            events.append("poller-start")
+
+        async def stop(self):
+            events.append("poller-stop")
+
+    monkeypatch.setitem(
+        sys.modules, "services.scheduling.provider_observations",
+        types.SimpleNamespace(ObservationPoller=Poller),
+    )
+    with TestClient(module.app) as client:
+        assert client.get("/ready").json() == {"status": "ready"}
+        assert events.index("check") < events.index("poller-start")
+    assert events.index("poller-stop") < events.index("close")
+
+
+def test_observation_poller_start_failure_closes_pool(monkeypatch):
+    events = []
+    module, _ = _load_main(monkeypatch, events)
+    module.settings.booking_observation_enabled = True
+
+    class Poller:
+        def __init__(self, pool, settings):
+            pass
+
+        def start(self):
+            raise RuntimeError(SENTINEL)
+
+        async def stop(self):
+            events.append("poller-stop")
+
+    monkeypatch.setitem(
+        sys.modules, "services.scheduling.provider_observations",
+        types.SimpleNamespace(ObservationPoller=Poller),
+    )
+    with pytest.raises(RuntimeError):
+        with TestClient(module.app):
+            pass
+    assert events.index("poller-stop") < events.index("close")
+    assert module.app.state.ready is False
+
+
 def test_incompatible_database_aborts_before_scheduler_or_tts_and_closes(monkeypatch):
     events = []
     module, _ = _load_main(monkeypatch, events, compatible=False)

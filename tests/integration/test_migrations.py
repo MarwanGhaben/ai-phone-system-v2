@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+from datetime import timedelta
 import hashlib
 import importlib
 import io
@@ -435,6 +436,7 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(self.runner.MANIFEST, (
             ("0001", "0001_admin_users_updated_at.sql"),
             ("0002", "0002_bookings_aware_time.sql"),
+            ("0003", "0003_booking_provider_observations.sql"),
         ))
         revision = self.runner.MANIFEST[0]
         sql, checksum = self.runner._load_revision()
@@ -454,11 +456,16 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(
             [(version, checksum) for version, _, checksum in revisions],
             [("0001", contract.REVISION_CHECKSUM),
-             ("0002", contract.BOOKINGS_REVISION_CHECKSUM)],
+             ("0002", contract.BOOKINGS_REVISION_CHECKSUM),
+             ("0003", contract.OBSERVATION_REVISION_CHECKSUM)],
         )
         self.assertEqual(
             revisions[1][1],
             (ROOT / "migrations/0002_bookings_aware_time.sql").read_bytes().decode("utf-8"),
+        )
+        self.assertEqual(
+            revisions[2][1],
+            (ROOT / "migrations/0003_booking_provider_observations.sql").read_bytes().decode("utf-8"),
         )
         self.assertEqual(bootstrap_checksum, contract.BOOTSTRAP_CHECKSUM)
         self.assertEqual(
@@ -617,17 +624,27 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
     async def test_prepare_empty_schema_is_atomic_idempotent_and_read_only_compatible(self):
         contract = importlib.import_module("migrations.schema_contract")
         await self.reset_public()
-        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001 0002")
+        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001 0002 0003")
         tables = await self.conn.fetchval(
             "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n "
             "ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r'")
-        self.assertEqual(tables, 18)
+        self.assertEqual(tables, 20)
+        primary_key = await self.conn.fetchrow("""
+            SELECT contype::text,convalidated,connoinherit
+            FROM pg_catalog.pg_constraint
+            WHERE conrelid='public.booking_provider_observations'::regclass
+              AND conname='booking_provider_observations_pkey'
+        """)
+        self.assertEqual(primary_key["contype"], "p")
+        self.assertTrue(primary_key["convalidated"])
+        self.assertTrue(primary_key["connoinherit"])
         history = await self.conn.fetch(
             "SELECT version,checksum,applied_at FROM public.schema_migrations ORDER BY version")
         self.assertEqual(
             [(row["version"], row["checksum"]) for row in history],
             [("0001", contract.REVISION_CHECKSUM),
              ("0002", contract.BOOKINGS_REVISION_CHECKSUM),
+             ("0003", contract.OBSERVATION_REVISION_CHECKSUM),
              ("bootstrap-v1", contract.BOOTSTRAP_CHECKSUM)],
         )
         self.assertTrue(all(row["applied_at"].tzinfo is not None for row in history))
@@ -638,9 +655,9 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         async with self.conn.transaction(isolation="repeatable_read", readonly=True):
             await contract.check_runtime_compatibility(self.conn)
         self.assertEqual(await self.snapshot(), before)
-        self.assertEqual(await self.prepare(), "up-to-date 0002")
+        self.assertEqual(await self.prepare(), "up-to-date 0003")
         self.assertEqual(await self.snapshot(), before)
-        self.assertEqual(await self.migrate(False), "up-to-date 0002")
+        self.assertEqual(await self.migrate(False), "up-to-date 0003")
         self.assertEqual(await self.migrate(), "up-to-date 0001")
         self.assertEqual(await self.snapshot(), before)
 
@@ -667,7 +684,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             SELECT pg_catalog.setval('public.bookings_id_seq',81,true);
         """)
         before = await self.snapshot()
-        self.assertEqual(await self.prepare(), "applied 0002")
+        self.assertEqual(await self.prepare(), "applied 0003")
         after = await self.snapshot()
         self.assertEqual(before["sequences"], after["sequences"])
         old_bookings = [json.loads(row["row"]) for row in before["rows"]["bookings"]]
@@ -680,7 +697,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new_admin, [dict(row, updated_at=None) for row in old_admin])
         history = await self.conn.fetch(
             "SELECT version FROM public.schema_migrations ORDER BY version")
-        self.assertEqual([row["version"] for row in history], ["0001", "0002"])
+        self.assertEqual([row["version"] for row in history], ["0001", "0002", "0003"])
 
     async def test_prepare_rejects_partial_or_unknown_empty_path_without_mutation(self):
         for sql in (
@@ -770,7 +787,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c "
             "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
             "WHERE n.nspname='public' AND c.relkind IN ('r','S'))"))
-        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001 0002")
+        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001 0002 0003")
 
     async def test_prepare_upgrades_old_0001_histories_without_fabricating_bootstrap(self):
         contract = importlib.import_module("migrations.schema_contract")
@@ -799,10 +816,10 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
                 async with self.conn.transaction(readonly=True):
                     with self.assertRaises(contract.SchemaCompatibilityError):
                         await contract.check_runtime_compatibility(self.conn)
-                self.assertEqual(await self.prepare(), "applied 0002")
+                self.assertEqual(await self.prepare(), "applied 0003")
                 history = await self.conn.fetch(
                     "SELECT version FROM schema_migrations ORDER BY version")
-                expected = ["0001", "0002"]
+                expected = ["0001", "0002", "0003"]
                 if with_bootstrap:
                     expected.append("bootstrap-v1")
                 self.assertEqual([row["version"] for row in history], expected)
@@ -838,7 +855,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(self.runner.MigrationError, "migration failed"):
                 await self.prepare()
         self.assertEqual(await self.snapshot(), before)
-        self.assertEqual(await self.prepare(), "applied 0002")
+        self.assertEqual(await self.prepare(), "applied 0003")
 
     async def test_runtime_rejects_admin_drift_and_cross_schema_foreign_key(self):
         contract = importlib.import_module("migrations.schema_contract")
@@ -921,7 +938,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(
             str(result) == "busy" for result in failures
         ))
-        self.assertEqual(await self.prepare(), "up-to-date 0002")
+        self.assertEqual(await self.prepare(), "up-to-date 0003")
 
     async def snapshot(self):
         # Complete synthetic row values and sequence states; no sequence calls.
@@ -1620,6 +1637,411 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(SENTINEL, str(raised.exception))
         self.assertEqual(await self.snapshot(), before)
         self.assertEqual(await self.migrate(), "applied 0001")
+
+    async def test_0003_upgrades_exact_0002_history_without_historical_backfill(self):
+        contract = importlib.import_module("migrations.schema_contract")
+        await self.reset_public()
+        await self.bootstrap()
+        await self.conn.execute(
+            "ALTER TABLE public.bookings ADD COLUMN appointment_time_utc TIMESTAMPTZ")
+        await self.conn.execute(LEDGER)
+        for version, checksum in (
+            (contract.REVISION_VERSION, contract.REVISION_CHECKSUM),
+            (contract.BOOKINGS_REVISION_VERSION, contract.BOOKINGS_REVISION_CHECKSUM),
+        ):
+            await self.conn.execute(
+                "INSERT INTO public.schema_migrations VALUES ($1,$2,CURRENT_TIMESTAMP)",
+                version, checksum)
+        await self.conn.execute("""
+            INSERT INTO public.bookings
+                (call_sid,appointment_time,appointment_time_utc,status,ms_booking_id)
+            VALUES ('synthetic-0002',TIMESTAMP '2026-09-14 11:00:00',
+                    TIMESTAMPTZ '2026-09-14 15:00:00+00','confirmed','synthetic-id')
+        """)
+        before = await self.conn.fetch("SELECT * FROM public.bookings")
+        self.assertEqual(await self.migrate(False), "pending 0003")
+        self.assertEqual(await self.prepare(), "applied 0003")
+        self.assertEqual(await self.conn.fetch("SELECT * FROM public.bookings"), before)
+        self.assertEqual(await self.conn.fetchval(
+            "SELECT count(*) FROM public.booking_provider_observations"), 0)
+        self.assertEqual(await self.conn.fetchval(
+            "SELECT count(*) FROM public.booking_provider_observation_control "
+            "WHERE singleton=1 AND next_request_at < CURRENT_TIMESTAMP"), 1)
+        history = await self.conn.fetch(
+            "SELECT version FROM public.schema_migrations ORDER BY version")
+        self.assertEqual([row["version"] for row in history], ["0001", "0002", "0003"])
+        snapshot = await self.snapshot()
+        self.assertEqual(await self.prepare(), "up-to-date 0003")
+        self.assertEqual(await self.snapshot(), snapshot)
+
+    async def test_0003_rollback_and_schema_history_drift_are_detected(self):
+        contract = importlib.import_module("migrations.schema_contract")
+        await self.reset_public()
+        await self.bootstrap()
+        await self.conn.execute(
+            "ALTER TABLE public.bookings ADD COLUMN appointment_time_utc TIMESTAMPTZ")
+        await self.conn.execute(LEDGER)
+        for version, checksum in (
+            (contract.REVISION_VERSION, contract.REVISION_CHECKSUM),
+            (contract.BOOKINGS_REVISION_VERSION, contract.BOOKINGS_REVISION_CHECKSUM),
+        ):
+            await self.conn.execute(
+                "INSERT INTO public.schema_migrations VALUES ($1,$2,CURRENT_TIMESTAMP)",
+                version, checksum)
+        before = await self.snapshot()
+        original = self.runner._record_revision
+
+        async def fail_0003(conn, version, checksum):
+            if version == "0003":
+                self.assertIsNotNone(await conn.fetchval(
+                    "SELECT pg_catalog.to_regclass('public.booking_provider_observations')"))
+                raise RuntimeError(SENTINEL)
+            return await original(conn, version, checksum)
+
+        with mock.patch.object(self.runner, "_record_revision", side_effect=fail_0003):
+            with self.assertRaisesRegex(self.runner.MigrationError, "migration failed"):
+                await self.prepare()
+        self.assertEqual(await self.snapshot(), before)
+        self.assertEqual(await self.prepare(), "applied 0003")
+        for change in (
+            "ALTER TABLE public.booking_provider_observations DROP CONSTRAINT booking_observation_outcome_check",
+            "ALTER TABLE public.booking_provider_observations ALTER checked_at DROP NOT NULL",
+            "UPDATE public.schema_migrations SET checksum='drift' WHERE version='0003'",
+            "DELETE FROM public.booking_provider_observation_control",
+            "UPDATE public.booking_provider_observation_control SET check_definitions='{}'::jsonb",
+            "ALTER TABLE public.booking_provider_observations "
+            "DROP CONSTRAINT booking_observation_interval_order_check; "
+            "ALTER TABLE public.booking_provider_observations "
+            "ADD CONSTRAINT booking_observation_interval_order_check "
+            "CHECK (provider_start IS NULL OR "
+            "(provider_end IS NOT NULL AND provider_start > provider_end))",
+            "ALTER TABLE public.booking_provider_observations "
+            "DROP CONSTRAINT booking_observation_outcome_check; "
+            "ALTER TABLE public.booking_provider_observations "
+            "ADD CONSTRAINT booking_observation_outcome_check "
+            "CHECK (outcome IN ('present','changed','unavailable','check_failed') "
+            "OR outcome = 'invalid')",
+        ):
+            with self.subTest(change=change):
+                await self.reset_public()
+                await self.prepare()
+                await self.conn.execute(change)
+                drift = await self.snapshot()
+                with self.assertRaises(self.runner.MigrationError):
+                    await self.prepare()
+                self.assertEqual(await self.snapshot(), drift)
+
+    async def test_0003_fk_constraints_and_late_local_change_fence(self):
+        from services.calendar.booking_readback import AppointmentDetails, ProviderResult
+        from services.scheduling.provider_observations import record_observation
+        await self.reset_public()
+        await self.prepare()
+        booking_id = await self.conn.fetchval("""
+            INSERT INTO public.bookings
+                (call_sid,appointment_time_utc,status,ms_booking_id)
+            VALUES ('synthetic-fence',TIMESTAMPTZ '2099-01-08 16:00:00+00',
+                    'confirmed','synthetic-fence-id') RETURNING id
+        """)
+        row = await self.conn.fetchrow(
+            "SELECT id,ms_booking_id,appointment_time_utc,status FROM public.bookings WHERE id=$1",
+            booking_id)
+        details = AppointmentDetails(
+            row["appointment_time_utc"],
+            row["appointment_time_utc"] + timedelta(minutes=30),
+            ("synthetic-staff",), "synthetic-service", False)
+        result = ProviderResult(
+            "present", http_status=200, details=details,
+            observed_provider_id="synthetic-fence-id")
+        self.assertTrue(await record_observation(self.conn, row, result))
+        for field, value in (("ms_booking_id", "changed-id"),
+                             ("appointment_time_utc", details.end),
+                             ("status", "cancelled")):
+            with self.subTest(field=field):
+                await self.conn.execute(
+                    f"UPDATE public.bookings SET {field}=$1 WHERE id=$2", value, booking_id)
+                before = await self.conn.fetchrow(
+                    "SELECT * FROM public.booking_provider_observations WHERE booking_id=$1",
+                    booking_id)
+                self.assertFalse(await record_observation(self.conn, row, result))
+                self.assertEqual(await self.conn.fetchrow(
+                    "SELECT * FROM public.booking_provider_observations WHERE booking_id=$1",
+                    booking_id), before)
+                await self.conn.execute(
+                    f"UPDATE public.bookings SET {field}=$1 WHERE id=$2", row[field], booking_id)
+        with self.assertRaises(self.driver.CheckViolationError):
+            await self.conn.execute(
+                "UPDATE public.booking_provider_observations SET provider_end=provider_start WHERE booking_id=$1",
+                booking_id)
+        for outcome, error_category, start, end in (
+            ("unavailable", None, None, details.end),
+            ("check_failed", "timeout", details.start, None),
+        ):
+            with self.subTest(outcome=outcome), self.assertRaises(self.driver.CheckViolationError):
+                await self.conn.execute("""
+                    UPDATE public.booking_provider_observations
+                    SET outcome=$2,error_category=$3,provider_start=$4,
+                        provider_end=$5,observed_provider_id=NULL
+                    WHERE booking_id=$1
+                """, booking_id, outcome, error_category, start, end)
+        await self.conn.execute("DELETE FROM public.bookings WHERE id=$1", booking_id)
+        self.assertEqual(await self.conn.fetchval(
+            "SELECT count(*) FROM public.booking_provider_observations WHERE booking_id=$1",
+            booking_id), 0)
+
+    async def test_two_connection_observation_tick_lock_and_cancellation_release(self):
+        from services.calendar.booking_readback import BookingReadbackClient
+        from services.scheduling.provider_observations import ObservationPoller
+        await self.reset_public()
+        await self.prepare()
+        booking_id = await self.conn.fetchval("""
+            INSERT INTO public.bookings
+                (call_sid,appointment_time_utc,status,ms_booking_id)
+            VALUES ('synthetic-lock',TIMESTAMPTZ '2099-01-08 16:00:00+00',
+                    'confirmed','synthetic-lock-id') RETURNING id
+        """)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        class Response:
+            def __init__(self, status, body):
+                self.status_code = status
+                self.body = body
+                self.headers = {}
+
+            def json(self):
+                return self.body
+
+        class Transport:
+            def __init__(self, wait):
+                self.wait = wait
+
+            async def post(self, url, **kwargs):
+                calls.append("token")
+                return Response(200, {"access_token": "synthetic-token"})
+
+            async def get(self, url, **kwargs):
+                calls.append("appointment")
+                if self.wait:
+                    started.set()
+                    await release.wait()
+                return Response(200, {
+                    "id": "synthetic-lock-id",
+                    "startDateTime": {"dateTime": "2099-01-08T16:00:00Z", "timeZone": "UTC"},
+                    "endDateTime": {"dateTime": "2099-01-08T16:30:00Z", "timeZone": "UTC"},
+                })
+
+        settings = types.SimpleNamespace(
+            booking_observation_enabled=True,
+            booking_observation_interval_seconds=60,
+            ms_bookings_tenant_id="synthetic", ms_bookings_client_id="synthetic",
+            ms_bookings_client_secret="synthetic", ms_bookings_business_id="synthetic",
+        )
+        async with self.driver.create_pool(self.dsn, min_size=2, max_size=2) as pool:
+            first = ObservationPoller(
+                pool, settings,
+                client=BookingReadbackClient(settings, client=Transport(True)))
+            second = ObservationPoller(
+                pool, settings,
+                client=BookingReadbackClient(settings, client=Transport(False)))
+            task = asyncio.create_task(first.tick())
+            try:
+                await asyncio.wait_for(started.wait(), 5)
+                self.assertEqual(await second.tick(), 0)
+                self.assertEqual(calls.count("appointment"), 1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertEqual(await second.tick(), 1)
+                self.assertEqual(await self.conn.fetchval(
+                    "SELECT outcome FROM public.booking_provider_observations WHERE booking_id=$1",
+                    booking_id), "present")
+                await self.conn.execute("""
+                    UPDATE public.booking_provider_observations
+                    SET checked_at=CURRENT_TIMESTAMP-INTERVAL '61 seconds'
+                    WHERE booking_id=$1
+                """, booking_id)
+
+                class BrokenClient:
+                    async def observe(self, provider_id, start):
+                        raise RuntimeError("PRIVATE_SECRET PRIVATE_CONTACT")
+
+                broken = ObservationPoller(pool, settings, client=BrokenClient())
+                with self.assertLogs("services.scheduling.provider_observations") as captured:
+                    self.assertEqual(await broken.tick(), 0)
+                self.assertNotIn("PRIVATE_SECRET", str(captured.output))
+                self.assertNotIn("PRIVATE_CONTACT", str(captured.output))
+                self.assertEqual(await second.tick(), 1)
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+    async def test_concurrent_local_change_rejects_in_flight_observation(self):
+        from services.calendar.booking_readback import ProviderResult
+        from services.scheduling.provider_observations import record_observation
+        await self.reset_public()
+        await self.prepare()
+        booking_id = await self.conn.fetchval("""
+            INSERT INTO public.bookings
+                (call_sid,appointment_time_utc,status,ms_booking_id)
+            VALUES ('synthetic-concurrent',TIMESTAMPTZ '2099-01-08 16:00:00+00',
+                    'confirmed','synthetic-concurrent-id') RETURNING id
+        """)
+        old = await self.conn.fetchrow(
+            "SELECT id,ms_booking_id,appointment_time_utc,status FROM public.bookings WHERE id=$1",
+            booking_id)
+        second = await self.driver.connect(self.dsn, timeout=10, command_timeout=15)
+        try:
+            for field, changed in (
+                ("ms_booking_id", "changed-identity"),
+                ("appointment_time_utc", old["appointment_time_utc"] + timedelta(hours=1)),
+                ("status", "cancelled"),
+            ):
+                with self.subTest(field=field):
+                    async with self.conn.transaction():
+                        await self.conn.execute(
+                            f"UPDATE public.bookings SET {field}=$1 WHERE id=$2",
+                            changed, booking_id)
+                        late = asyncio.create_task(record_observation(
+                            second, old, ProviderResult("unavailable", http_status=404)))
+                        await asyncio.sleep(0.05)
+                        self.assertFalse(late.done())
+                    self.assertFalse(await asyncio.wait_for(late, 5))
+                    self.assertEqual(await self.conn.fetchval(
+                        "SELECT count(*) FROM public.booking_provider_observations WHERE booking_id=$1",
+                        booking_id), 0)
+                    await self.conn.execute(
+                        f"UPDATE public.bookings SET {field}=$1 WHERE id=$2",
+                        old[field], booking_id)
+        finally:
+            await second.close()
+
+    async def test_shared_retry_after_survives_worker_replacement(self):
+        from services.calendar.booking_readback import BookingReadbackClient
+        from services.scheduling.provider_observations import ObservationPoller
+        from urllib.parse import unquote
+        await self.reset_public()
+        await self.prepare()
+        for suffix in ("first", "second"):
+            await self.conn.execute("""
+                INSERT INTO public.bookings
+                    (call_sid,appointment_time_utc,status,ms_booking_id)
+                VALUES ($1,TIMESTAMPTZ '2099-01-08 16:00:00+00','confirmed',$2)
+            """, "synthetic-pause-" + suffix, "synthetic-pause-" + suffix)
+        calls = []
+
+        class Response:
+            def __init__(self, status, body=None, headers=None):
+                self.status_code = status
+                self.body = body
+                self.headers = headers or {}
+
+            def json(self):
+                return self.body
+
+        class Transport:
+            def __init__(self, throttled):
+                self.throttled = throttled
+
+            async def post(self, url, **kwargs):
+                calls.append("token")
+                return Response(200, {"access_token": "synthetic-token", "expires_in": 300})
+
+            async def get(self, url, **kwargs):
+                calls.append("appointment")
+                if self.throttled:
+                    return Response(429, {}, {"Retry-After": "3600"})
+                provider_id = unquote(url.rsplit("/", 1)[-1])
+                return Response(200, {
+                    "id": provider_id,
+                    "startDateTime": {"dateTime": "2099-01-08T16:00:00Z", "timeZone": "UTC"},
+                    "endDateTime": {"dateTime": "2099-01-08T16:30:00Z", "timeZone": "UTC"},
+                })
+
+        settings = types.SimpleNamespace(
+            booking_observation_enabled=True, booking_observation_interval_seconds=60,
+            ms_bookings_tenant_id="synthetic", ms_bookings_client_id="synthetic",
+            ms_bookings_client_secret="synthetic", ms_bookings_business_id="synthetic")
+        async with self.driver.create_pool(self.dsn, min_size=2, max_size=2) as pool:
+            first = ObservationPoller(
+                pool, settings, client=BookingReadbackClient(settings, client=Transport(True)))
+            self.assertEqual(await first.tick(), 1)
+            pause_seconds = await self.conn.fetchval("""
+                SELECT EXTRACT(EPOCH FROM next_request_at-CURRENT_TIMESTAMP)
+                FROM public.booking_provider_observation_control WHERE singleton=1
+            """)
+            self.assertGreater(pause_seconds, 3590)
+            replacement = ObservationPoller(
+                pool, settings, client=BookingReadbackClient(settings, client=Transport(False)))
+            self.assertEqual(await replacement.tick(), 0)
+            self.assertEqual(calls.count("appointment"), 1)
+            await self.conn.execute("""
+                UPDATE public.booking_provider_observation_control
+                SET next_request_at=CURRENT_TIMESTAMP-INTERVAL '1 second'
+            """)
+            self.assertEqual(await replacement.tick(), 1)
+            self.assertEqual(calls.count("appointment"), 2)
+
+    async def test_slow_first_due_row_does_not_starve_second_on_real_selection(self):
+        from services.calendar.booking_readback import BookingReadbackClient
+        from services.scheduling import provider_observations as observations
+        await self.reset_public()
+        await self.prepare()
+        ids = []
+        for suffix in ("slow", "fast"):
+            ids.append(await self.conn.fetchval("""
+                INSERT INTO public.bookings
+                    (call_sid,appointment_time_utc,status,ms_booking_id)
+                VALUES ($1,TIMESTAMPTZ '2099-01-08 16:00:00+00','confirmed',$2)
+                RETURNING id
+            """, "synthetic-" + suffix, "synthetic-" + suffix))
+
+        class Response:
+            status_code = 200
+            headers = {}
+
+            def __init__(self, body):
+                self.body = body
+
+            def json(self):
+                return self.body
+
+        class Transport:
+            async def post(self, url, **kwargs):
+                return Response({"access_token": "synthetic-token", "expires_in": 300})
+
+            async def get(self, url, **kwargs):
+                if url.endswith("synthetic-slow"):
+                    await asyncio.sleep(1)
+                return Response({
+                    "id": "synthetic-fast",
+                    "startDateTime": {"dateTime": "2099-01-08T16:00:00Z", "timeZone": "UTC"},
+                    "endDateTime": {"dateTime": "2099-01-08T16:30:00Z", "timeZone": "UTC"},
+                })
+
+        settings = types.SimpleNamespace(
+            booking_observation_enabled=True, booking_observation_interval_seconds=60,
+            ms_bookings_tenant_id="synthetic", ms_bookings_client_id="synthetic",
+            ms_bookings_client_secret="synthetic", ms_bookings_business_id="synthetic")
+        async with self.driver.create_pool(self.dsn, min_size=1, max_size=1) as pool:
+            poller = observations.ObservationPoller(
+                pool, settings, client=BookingReadbackClient(settings, client=Transport()))
+            with mock.patch.object(observations, "TICK_DEADLINE_SECONDS", 1), \
+                 mock.patch.object(observations, "ROW_TIMEOUT_SECONDS", 0.01), \
+                 mock.patch.object(observations, "PERSIST_ALLOWANCE_SECONDS", 0.01), \
+                 mock.patch.object(observations, "CLEANUP_ALLOWANCE_SECONDS", 0.01):
+                self.assertEqual(await poller.tick(), 2)
+        outcomes = await self.conn.fetch("""
+            SELECT booking_id,outcome,error_category
+            FROM public.booking_provider_observations ORDER BY booking_id
+        """)
+        self.assertEqual([(row["booking_id"], row["outcome"], row["error_category"])
+                          for row in outcomes],
+                         [(ids[0], "check_failed", "timeout"),
+                          (ids[1], "present", None)])
 
 
 if __name__ == "__main__":

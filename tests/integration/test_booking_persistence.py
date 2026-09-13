@@ -219,6 +219,85 @@ class PostgreSQLBookingPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(legacy["time_verified"])
         self.assertEqual(legacy["time"], "2099-01-08T11:00:00")
 
+    async def test_observation_dashboard_badges_and_fresh_verified_count(self):
+        from datetime import timedelta
+        from services.scheduling.booking_records import persist_booking_record
+        row_id = await persist_booking_record(
+            self.conn, call_sid="synthetic-observed", phone_number="+14165550100",
+            client_name="Synthetic Caller", client_email="", accountant_name="Synthetic",
+            appointment_time=datetime(2099, 1, 8, 16, tzinfo=UTC),
+            client_type="individual", language="en",
+            provider_appointment_id="opaque-provider-id", notes="synthetic")
+        row = await self.conn.fetchrow(
+            "SELECT * FROM public.bookings WHERE id=$1", row_id)
+        dashboard = dashboard_routes
+
+        async def view():
+            with mock.patch.object(dashboard, "get_db_pool",
+                                   new=mock.AsyncMock(return_value=self.conn)), \
+                 mock.patch.object(dashboard, "get_settings", return_value=mock.Mock(
+                     booking_observation_freshness_seconds=180)):
+                return await dashboard.get_bookings(user={})
+
+        initial = await view()
+        self.assertEqual(initial["upcoming"], 1)
+        self.assertEqual(initial["microsoft_verified_upcoming"], 0)
+        self.assertEqual(initial["bookings"][0]["provider_state"], "not_checked")
+        await self.conn.execute("""
+            INSERT INTO public.booking_provider_observations
+                (booking_id,snapshot_provider_id,snapshot_start,snapshot_status,
+                 checked_at,outcome,provider_start,provider_end,observed_provider_id)
+            VALUES ($1,$2,$3,'confirmed',CURRENT_TIMESTAMP,'present',
+                    $3,$4,$2)
+        """, row_id, row["ms_booking_id"], row["appointment_time_utc"],
+            row["appointment_time_utc"] + timedelta(minutes=30))
+        present = await view()
+        self.assertEqual(present["microsoft_verified_upcoming"], 1)
+        self.assertEqual(present["bookings"][0]["provider_state"], "present")
+        self.assertNotIn("opaque-provider-id", str(present))
+        await self.conn.execute("""
+            UPDATE public.booking_provider_observations
+            SET outcome='unavailable',provider_start=NULL,provider_end=NULL,
+                observed_provider_id=NULL,http_status=404,checked_at=CURRENT_TIMESTAMP
+            WHERE booking_id=$1
+        """, row_id)
+        unavailable = await view()
+        self.assertEqual(unavailable["microsoft_verified_upcoming"], 0)
+        self.assertEqual(unavailable["bookings"][0]["provider_state"], "unavailable")
+        await self.conn.execute("""
+            UPDATE public.booking_provider_observations
+            SET outcome='changed',provider_start=$2,provider_end=$3,
+                observed_provider_id=$4,http_status=200,checked_at=CURRENT_TIMESTAMP
+            WHERE booking_id=$1
+        """, row_id, row["appointment_time_utc"] + timedelta(hours=1),
+            row["appointment_time_utc"] + timedelta(hours=1, minutes=30),
+            row["ms_booking_id"])
+        changed = await view()
+        self.assertEqual(changed["microsoft_verified_upcoming"], 0)
+        self.assertEqual(changed["bookings"][0]["provider_state"], "changed")
+        self.assertEqual(changed["bookings"][0]["time"], "2099-01-08T11:00:00-05:00")
+        self.assertEqual(changed["bookings"][0]["provider_observed_time"],
+                         "2099-01-08T12:00:00-05:00")
+        await self.conn.execute("""
+            UPDATE public.booking_provider_observations
+            SET checked_at=CURRENT_TIMESTAMP - INTERVAL '181 seconds'
+            WHERE booking_id=$1
+        """, row_id)
+        self.assertEqual((await view())["bookings"][0]["provider_state"], "stale")
+        await self.conn.execute("""
+            UPDATE public.booking_provider_observations
+            SET outcome='present',provider_start=$2,provider_end=$3,
+                checked_at=CURRENT_TIMESTAMP
+            WHERE booking_id=$1
+        """, row_id, row["appointment_time_utc"],
+            row["appointment_time_utc"] + timedelta(minutes=30))
+        self.assertEqual((await view())["microsoft_verified_upcoming"], 1)
+        await self.conn.execute(
+            "UPDATE public.bookings SET ms_booking_id='new-identity' WHERE id=$1", row_id)
+        mismatch = await view()
+        self.assertEqual(mismatch["microsoft_verified_upcoming"], 0)
+        self.assertEqual(mismatch["bookings"][0]["provider_state"], "stale")
+
 
 if __name__ == "__main__":
     unittest.main()

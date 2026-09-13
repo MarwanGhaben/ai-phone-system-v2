@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
     app.state.ready = False
     reminder_scheduler = None
     scheduler_started = False
+    observation_poller = None
     try:
         pool = await get_db_pool()
         await check_database_compatibility(pool)
@@ -60,6 +61,12 @@ async def lifespan(app: FastAPI):
         reminder_scheduler.start()
         scheduler_started = True
         logger.info("SMS reminder scheduler started")
+
+        if getattr(settings, "booking_observation_enabled", False):
+            from services.scheduling.provider_observations import ObservationPoller
+            observation_poller = ObservationPoller(pool, settings)
+            observation_poller.start()
+            logger.info("Booking provider observation poller started")
 
         # Pre-warm only after database startup has succeeded.
         try:
@@ -75,11 +82,15 @@ async def lifespan(app: FastAPI):
     finally:
         app.state.ready = False
         try:
-            if scheduler_started and reminder_scheduler is not None:
-                reminder_scheduler.stop()
+            if observation_poller is not None:
+                await observation_poller.stop()
         finally:
-            await close_db_pool()
-            logger.info("AI Voice Platform v2 shutting down...")
+            try:
+                if scheduler_started and reminder_scheduler is not None:
+                    reminder_scheduler.stop()
+            finally:
+                await close_db_pool()
+                logger.info("AI Voice Platform v2 shutting down...")
 
 
 # Create FastAPI app

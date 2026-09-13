@@ -1,5 +1,6 @@
 """Read-only structural compatibility contract shared by startup and migrations."""
 from __future__ import annotations
+import json
 
 BOOTSTRAP_VERSION = "bootstrap-v1"
 BOOTSTRAP_CHECKSUM = "1c72bbe0a120860902c565e5573c05ad1cd640891a42bb35cca2c6e0876f31e8"
@@ -7,6 +8,10 @@ REVISION_VERSION = "0001"
 REVISION_CHECKSUM = "53c861ac91cae5ecaf9f794b15563c88ee58bc0dafa5ae64fa81c89d907aa3a9"
 BOOKINGS_REVISION_VERSION = "0002"
 BOOKINGS_REVISION_CHECKSUM = "62addab700e047dff2a13973c881a874bfe6c7f88967d593f189987192782be6"
+OBSERVATION_REVISION_VERSION = "0003"
+OBSERVATION_REVISION_CHECKSUM = "b3abaa09c340f89c32778b0b17b5c2a584845983b13eb95dbb9c366f3d6c5830"
+OBSERVATION_TABLE = "booking_provider_observations"
+OBSERVATION_CONTROL_TABLE = "booking_provider_observation_control"
 
 
 class SchemaCompatibilityError(Exception):
@@ -74,6 +79,163 @@ LEDGER_COLUMNS = {
     "checksum": ("text", -1, True),
     "applied_at": ("timestamptz", -1, True),
 }
+OBSERVATION_COLUMNS = _parse_spec(
+    "booking_id:int4! snapshot_provider_id:varchar:255! snapshot_start:timestamptz! "
+    "snapshot_status:varchar:50! checked_at:timestamptz! outcome:varchar:20! "
+    "error_category:varchar:32 http_status:int4 provider_start:timestamptz "
+    "provider_end:timestamptz staff_member_ids:_text service_id:text is_location_online:bool "
+    "observed_provider_id:varchar:255"
+)
+OBSERVATION_CHECKS = frozenset({
+    "booking_observation_snapshot_status_check",
+    "booking_observation_outcome_check",
+    "booking_observation_error_check",
+    "booking_observation_error_category_check",
+    "booking_observation_interval_pair_check",
+    "booking_observation_interval_order_check",
+    "booking_observation_http_status_check",
+    "booking_observation_identity_presence_check",
+    "booking_observation_identity_match_check",
+})
+OBSERVATION_CONTROL_CHECK = "booking_observation_control_singleton_check"
+OBSERVATION_CONTROL_COLUMNS = _parse_spec(
+    "singleton:int4! next_request_at:timestamptz! check_definitions:jsonb!"
+)
+
+
+async def check_observation_schema(conn):
+    """Require the exact table shape, protective constraints and bounded index."""
+    oid = await relation(conn, OBSERVATION_TABLE)
+    actual = await columns(conn, oid)
+    check_columns(actual, OBSERVATION_COLUMNS)
+    if any(row["default_expr"] is not None for row in actual.values()):
+        raise SchemaCompatibilityError("incompatible schema")
+    rows = await conn.fetch("""
+        SELECT k.conname,k.contype::text,k.condeferrable,k.condeferred,
+               k.convalidated,k.connoinherit,
+               pg_catalog.pg_get_constraintdef(k.oid, false) AS definition,
+               rn.relname AS referenced_table,ns.nspname AS referenced_schema,
+               k.confdeltype::text,
+               ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(k.conkey)
+                     WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid=k.conrelid AND a.attnum=u.num ORDER BY u.ord) AS columns,
+               ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(k.confkey)
+                     WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid=k.confrelid AND a.attnum=u.num ORDER BY u.ord) AS ref_columns
+        FROM pg_catalog.pg_constraint k
+        LEFT JOIN pg_catalog.pg_class rn ON rn.oid=k.confrelid
+        LEFT JOIN pg_catalog.pg_namespace ns ON ns.oid=rn.relnamespace
+        WHERE k.conrelid=$1
+    """, oid)
+    expected_names = {
+        OBSERVATION_TABLE + "_pkey", OBSERVATION_TABLE + "_booking_id_fkey",
+        *OBSERVATION_CHECKS,
+    }
+    if {row["conname"] for row in rows} != expected_names or len(rows) != len(expected_names):
+        raise SchemaCompatibilityError("incompatible schema")
+    definitions = {}
+    for row in rows:
+        if (row["condeferrable"] or row["condeferred"]
+                or not row["convalidated"]):
+            raise SchemaCompatibilityError("incompatible schema")
+        name = row["conname"]
+        if name.endswith("_pkey"):
+            if row["contype"] != "p" or tuple(row["columns"]) != ("booking_id",):
+                raise SchemaCompatibilityError("incompatible schema")
+        elif name.endswith("_booking_id_fkey"):
+            if (row["contype"] != "f" or tuple(row["columns"]) != ("booking_id",)
+                    or row["referenced_schema"] != "public"
+                    or row["referenced_table"] != "bookings"
+                    or tuple(row["ref_columns"]) != ("id",)
+                    or row["confdeltype"] != "c"):
+                raise SchemaCompatibilityError("incompatible schema")
+        else:
+            if row["contype"] != "c" or row["connoinherit"]:
+                raise SchemaCompatibilityError("incompatible schema")
+            definitions[name] = row["definition"]
+    indexes = await conn.fetch("""
+        SELECT c.relname,i.indisvalid,i.indisready,i.indisunique,
+               i.indpred IS NOT NULL AS partial,i.indexprs IS NOT NULL AS expression,
+               ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(i.indkey)
+                     WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid=i.indrelid AND a.attnum=u.num ORDER BY u.ord) AS columns
+        FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid
+        WHERE i.indrelid=$1
+    """, oid)
+    by_name = {row["relname"]: row for row in indexes}
+    if set(by_name) != {OBSERVATION_TABLE + "_pkey", OBSERVATION_TABLE + "_checked_at_idx"}:
+        raise SchemaCompatibilityError("incompatible schema")
+    if (tuple(by_name[OBSERVATION_TABLE + "_pkey"]["columns"]) != ("booking_id",)
+            or not by_name[OBSERVATION_TABLE + "_pkey"]["indisunique"]
+            or tuple(by_name[OBSERVATION_TABLE + "_checked_at_idx"]["columns"])
+            != ("checked_at", "booking_id")
+            or by_name[OBSERVATION_TABLE + "_checked_at_idx"]["indisunique"]
+            or any(not row["indisvalid"] or not row["indisready"]
+                   or row["partial"] or row["expression"] for row in indexes)):
+        raise SchemaCompatibilityError("incompatible schema")
+
+    # PostgreSQL's own deparser captured these exact predicates when the
+    # checksum-pinned 0003 asset was applied. Compare the current definitions
+    # against that recorded migration-time baseline, not token vocabulary.
+    control_oid = await relation(conn, OBSERVATION_CONTROL_TABLE)
+    control_columns = await columns(conn, control_oid)
+    check_columns(control_columns, OBSERVATION_CONTROL_COLUMNS)
+    if any(row["default_expr"] is not None for row in control_columns.values()):
+        raise SchemaCompatibilityError("incompatible schema")
+    control_constraints = await conn.fetch("""
+        SELECT k.conname,k.contype::text,k.condeferrable,k.condeferred,
+               k.convalidated,k.connoinherit,
+               pg_catalog.pg_get_constraintdef(k.oid, false) AS definition,
+               ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(k.conkey)
+                     WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid=k.conrelid AND a.attnum=u.num ORDER BY u.ord) AS columns
+        FROM pg_catalog.pg_constraint k WHERE k.conrelid=$1
+    """, control_oid)
+    if ({row["conname"] for row in control_constraints}
+            != {OBSERVATION_CONTROL_TABLE + "_pkey", OBSERVATION_CONTROL_CHECK}
+            or len(control_constraints) != 2):
+        raise SchemaCompatibilityError("incompatible schema")
+    for row in control_constraints:
+        if (row["condeferrable"] or row["condeferred"]
+                or not row["convalidated"] or tuple(row["columns"]) != ("singleton",)):
+            raise SchemaCompatibilityError("incompatible schema")
+        if row["conname"] == OBSERVATION_CONTROL_CHECK:
+            if row["contype"] != "c" or row["connoinherit"]:
+                raise SchemaCompatibilityError("incompatible schema")
+            definitions[row["conname"]] = row["definition"]
+        elif row["contype"] != "p":
+            raise SchemaCompatibilityError("incompatible schema")
+    control_indexes = await conn.fetch("""
+        SELECT c.relname,i.indisvalid,i.indisready,i.indisunique,i.indimmediate,
+               i.indpred IS NOT NULL AS partial,i.indexprs IS NOT NULL AS expression,
+               i.indnatts,i.indnkeyatts,
+               ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(i.indkey)
+                     WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid=i.indrelid AND a.attnum=u.num ORDER BY u.ord) AS columns
+        FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid
+        WHERE i.indrelid=$1
+    """, control_oid)
+    if (len(control_indexes) != 1
+            or control_indexes[0]["relname"] != OBSERVATION_CONTROL_TABLE + "_pkey"
+            or tuple(control_indexes[0]["columns"]) != ("singleton",)
+            or not all(control_indexes[0][key] for key in
+                       ("indisvalid", "indisready", "indisunique", "indimmediate"))
+            or control_indexes[0]["partial"] or control_indexes[0]["expression"]
+            or control_indexes[0]["indnatts"] != 1
+            or control_indexes[0]["indnkeyatts"] != 1):
+        raise SchemaCompatibilityError("incompatible schema")
+    control_rows = await conn.fetch(
+        "SELECT singleton,check_definitions FROM public.booking_provider_observation_control")
+    if len(control_rows) != 1 or control_rows[0]["singleton"] != 1:
+        raise SchemaCompatibilityError("incompatible schema")
+    try:
+        baseline = control_rows[0]["check_definitions"]
+        if isinstance(baseline, str):
+            baseline = json.loads(baseline)
+    except (TypeError, ValueError):
+        raise SchemaCompatibilityError("incompatible schema") from None
+    if baseline != definitions:
+        raise SchemaCompatibilityError("incompatible schema")
 
 
 async def relation(conn, name, *, optional=False, allow_triggers=False):
@@ -178,10 +340,10 @@ async def admin(conn, *, required_updated=False):
 
 
 async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
-                 require_current=False):
+                 require_current=False, require_observation=False):
     oid = await relation(conn, "schema_migrations", optional=True)
     if oid is None:
-        if require_revision or require_current:
+        if require_revision or require_current or require_observation:
             raise SchemaCompatibilityError("incompatible schema")
         return False, frozenset()
     actual = await columns(conn, oid)
@@ -195,6 +357,7 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
     expected = {
         REVISION_VERSION: REVISION_CHECKSUM,
         BOOKINGS_REVISION_VERSION: BOOKINGS_REVISION_CHECKSUM,
+        OBSERVATION_REVISION_VERSION: OBSERVATION_REVISION_CHECKSUM,
     }
     if allow_bootstrap:
         expected[BOOTSTRAP_VERSION] = BOOTSTRAP_CHECKSUM
@@ -213,6 +376,9 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
         raise SchemaCompatibilityError("incompatible schema")
     if BOOKINGS_REVISION_VERSION in versions and REVISION_VERSION not in versions:
         raise SchemaCompatibilityError("incompatible schema")
+    if (OBSERVATION_REVISION_VERSION in versions
+            and BOOKINGS_REVISION_VERSION not in versions):
+        raise SchemaCompatibilityError("incompatible schema")
     if (BOOTSTRAP_VERSION in versions
             and applied[BOOTSTRAP_VERSION] > applied[REVISION_VERSION]):
         raise SchemaCompatibilityError("incompatible schema")
@@ -222,6 +388,11 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
             and applied[REVISION_VERSION] > applied[BOOKINGS_REVISION_VERSION]):
         raise SchemaCompatibilityError("incompatible schema")
     if require_current and BOOKINGS_REVISION_VERSION not in versions:
+        raise SchemaCompatibilityError("incompatible schema")
+    if (BOOKINGS_REVISION_VERSION in versions and OBSERVATION_REVISION_VERSION in versions
+            and applied[BOOKINGS_REVISION_VERSION] > applied[OBSERVATION_REVISION_VERSION]):
+        raise SchemaCompatibilityError("incompatible schema")
+    if require_observation and OBSERVATION_REVISION_VERSION not in versions:
         raise SchemaCompatibilityError("incompatible schema")
     return True, frozenset(versions)
 
@@ -237,6 +408,7 @@ async def relation_names(conn):
 
 async def check_application_schema(conn, *, allow_missing_admin_updated=False,
                                    allow_missing_booking_aware=False,
+                                   allow_missing_observations=False,
                                    ledger_optional=True):
     names = await relation_names(conn)
     expected_names = set(TABLE_COLUMNS)
@@ -244,11 +416,17 @@ async def check_application_schema(conn, *, allow_missing_admin_updated=False,
         expected_names.add("schema_migrations")
     elif not ledger_optional:
         raise SchemaCompatibilityError("incompatible schema")
+    if OBSERVATION_TABLE in names:
+        expected_names.update((OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE))
+    elif not allow_missing_observations:
+        raise SchemaCompatibilityError("incompatible schema")
     if names != expected_names:
         raise SchemaCompatibilityError("incompatible schema")
     lock_names = sorted(TABLE_COLUMNS)
     if "schema_migrations" in names:
         lock_names.append("schema_migrations")
+    if OBSERVATION_TABLE in names:
+        lock_names.extend((OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE))
     lock_targets = [
         'public."' + name.replace('"', '""') + '"' for name in lock_names
     ]
@@ -322,13 +500,19 @@ async def check_application_schema(conn, *, allow_missing_admin_updated=False,
             actual_constraints.add(item)
     if actual_constraints != expected_constraints:
         raise SchemaCompatibilityError("incompatible schema")
+    if OBSERVATION_TABLE in names:
+        await check_observation_schema(conn)
     if "schema_migrations" in names:
-        await ledger(conn, allow_bootstrap=True)
+        _, versions = await ledger(conn, allow_bootstrap=True)
+        if OBSERVATION_REVISION_VERSION in versions and OBSERVATION_TABLE not in names:
+            raise SchemaCompatibilityError("incompatible schema")
 
 
-async def check_runtime_compatibility(conn):
+async def check_runtime_compatibility(conn, *, require_observation=True):
     """Validate current structure and history using catalog reads only."""
-    await check_application_schema(conn, ledger_optional=False)
+    await check_application_schema(
+        conn, ledger_optional=False,
+        allow_missing_observations=not require_observation)
     await admin(conn, required_updated=True)
     await ledger(conn, allow_bootstrap=True, require_revision=True,
-                 require_current=True)
+                 require_current=True, require_observation=require_observation)
