@@ -916,11 +916,13 @@
                                 <th>Microsoft state</th>
                                 <th>Last checked</th>
                                 <th>Observed Microsoft time</th>
+                                <th>Reminder safety</th>
+                                <th>Removal notice / last attempt</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody id="bookingsBody">
-                            <tr><td colspan="11" style="text-align: center;">Loading...</td></tr>
+                            <tr><td colspan="13" style="text-align: center;">Loading...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1347,7 +1349,7 @@
 
                 const tbody = document.getElementById('bookingsBody');
                 if (data.bookings.length === 0) {
-                    renderEmptyTable(tbody, 11, 'No bookings yet');
+                    renderEmptyTable(tbody, 13, 'No bookings yet');
                     return;
                 }
 
@@ -1365,7 +1367,11 @@
                     row.appendChild(languageCell);
                     const statusCell = document.createElement('td');
                     const verified = booking.status === 'confirmed' && booking.provider_state === 'present';
-                    const localStatus = booking.status === 'confirmed' ? 'Confirmed locally' : (booking.status || 'Unknown local status');
+                    const localStatus = booking.status === 'removed_externally'
+                        ? (booking.reconciliation_last_result === 'reappeared'
+                            ? 'Removed from Microsoft (automatic reconciliation): reappeared, needs review'
+                            : 'Removed from Microsoft (automatic reconciliation)')
+                        : (booking.status === 'confirmed' ? 'Confirmed locally' : (booking.status || 'Unknown local status'));
                     statusCell.appendChild(createTextElement('span', localStatus, verified ? 'status-badge operational' : 'status-badge warning'));
                     row.appendChild(statusCell);
                     const providerLabels = {
@@ -1379,10 +1385,27 @@
                     appendTextCell(row, providerLabels[booking.provider_state] || 'Not checked');
                     appendTextCell(row, booking.provider_checked_at ? new Date(booking.provider_checked_at).toLocaleString() : '--');
                     appendTextCell(row, booking.provider_observed_time ? new Date(booking.provider_observed_time).toLocaleString() : '--');
+                    appendTextCell(row, booking.reminders_on_hold ? 'Reminders on hold' : '--');
+                    const noticeLabels = {
+                        pending: 'Notice queued', held: 'Notice held',
+                        dispatching: 'Notice submission in progress',
+                        accepted: 'Notice accepted by SMS provider (delivery unverified)',
+                        failed: 'Notice failed: needs review',
+                        unknown: 'Notice submission unknown: needs review',
+                        suppressed: 'Notice suppressed'
+                    };
+                    const noticeText = noticeLabels[booking.notice_state] || '--';
+                    const attempted = booking.notice_last_attempt_at
+                        ? `; last attempt ${new Date(booking.notice_last_attempt_at).toLocaleString()}` : '';
+                    appendTextCell(row, noticeText + attempted);
                     const actionCell = document.createElement('td');
-                    const deleteButton = createTextElement('button', 'Delete', 'btn-action delete');
-                    deleteButton.addEventListener('click', () => deleteBooking(booking.id));
-                    actionCell.appendChild(deleteButton);
+                    if (booking.reconciliation_disposition) {
+                        actionCell.appendChild(createTextElement('span', 'Retained audit'));
+                    } else {
+                        const deleteButton = createTextElement('button', 'Delete', 'btn-action delete');
+                        deleteButton.addEventListener('click', () => deleteBooking(booking.id));
+                        actionCell.appendChild(deleteButton);
+                    }
                     row.appendChild(actionCell);
                     return row;
                 });

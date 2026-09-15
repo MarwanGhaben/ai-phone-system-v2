@@ -8,7 +8,8 @@ import time
 from datetime import datetime, timedelta
 from typing import Mapping
 
-from services.calendar.booking_readback import BookingReadbackClient, ProviderResult
+from services.calendar.booking_readback import (
+    BookingReadbackClient, InventoryResult, ProviderResult)
 
 
 LOCK_KEY = int.from_bytes(
@@ -70,6 +71,17 @@ ON CONFLICT (booking_id) DO UPDATE SET
     is_location_online=EXCLUDED.is_location_online,
     observed_provider_id=EXCLUDED.observed_provider_id
 RETURNING booking_id
+"""
+
+SELECT_REMOVED = """
+SELECT b.id,b.ms_booking_id,b.appointment_time_utc,b.status
+FROM public.bookings AS b
+JOIN public.booking_notification_reconciliation AS r ON r.booking_id=b.id
+WHERE b.status='removed_externally' AND r.disposition='removed_externally'
+  AND r.last_result IS DISTINCT FROM 'reappeared'
+  AND b.appointment_time_utc > CURRENT_TIMESTAMP
+  AND r.updated_at <= CURRENT_TIMESTAMP - ($1::integer * INTERVAL '1 second')
+ORDER BY r.updated_at,b.id LIMIT 5
 """
 
 
@@ -185,6 +197,10 @@ class ObservationPoller:
                         rows = await conn.fetch(
                             SELECT_DUE, self.settings.booking_observation_interval_seconds
                         )
+                        if getattr(self.settings, 'automatic_notifications_enabled', False):
+                            rows = list(rows) + list(await conn.fetch(
+                                SELECT_REMOVED,
+                                self.settings.booking_observation_interval_seconds))
                         if self.client is None:
                             self.client = BookingReadbackClient(self.settings)
                         processed = 0
@@ -193,18 +209,37 @@ class ObservationPoller:
                                     < ROW_TIMEOUT_SECONDS + PERSIST_ALLOWANCE_SECONDS
                                     + CLEANUP_ALLOWANCE_SECONDS):
                                 break
+                            notifications_enabled = getattr(
+                                self.settings, 'automatic_notifications_enabled', False)
+                            read_started_at = (await conn.fetchval('SELECT clock_timestamp()')
+                                               if notifications_enabled else None)
                             try:
                                 async with asyncio.timeout(ROW_TIMEOUT_SECONDS):
-                                    result = await self.client.observe(
-                                        row["ms_booking_id"], row["appointment_time_utc"]
-                                    )
+                                    if notifications_enabled:
+                                        from services.calendar.provider_admission import observe
+                                        result, read_started_at = await observe(
+                                            conn, self.client, row['ms_booking_id'],
+                                            row['appointment_time_utc'])
+                                    else:
+                                        result = await self.client.observe(
+                                            row['ms_booking_id'], row['appointment_time_utc'])
+                                        read_started_at = None
                             except TimeoutError:
-                                result = ProviderResult("check_failed", "timeout")
+                                result = ProviderResult("check_failed", "timeout",
+                                                        retry_after=60 if notifications_enabled else 0,
+                                                        stop_batch=notifications_enabled)
                             if (_connection_closed(conn) or await conn.fetchval(
                                     "SELECT pg_catalog.pg_backend_pid()") != backend_pid):
                                 self._report_failure("session_lost")
                                 break
-                            if result.stop_batch:
+                            if notifications_enabled and read_started_at is None:
+                                # No new exact-ID observation was admitted.
+                                break
+                            if notifications_enabled and result.error_category == 'timeout':
+                                from services.calendar.provider_admission import publish_pause
+                                await publish_pause(conn, result.retry_after)
+                            if result.stop_batch and not getattr(
+                                    self.settings, 'automatic_notifications_enabled', False):
                                 pause = max(1, result.retry_after)
                                 if pause > MAX_FINITE_BACKOFF_SECONDS:
                                     updated = await conn.fetchval(
@@ -220,7 +255,68 @@ class ObservationPoller:
                                         "WHERE singleton=1 RETURNING next_request_at", float(pause))
                                 if updated is None:
                                     raise RuntimeError("observation control row missing")
-                            await record_observation(conn, row, result)
+                            if row['status'] == 'confirmed':
+                                await record_observation(conn, row, result)
+                            if getattr(self.settings, 'automatic_notifications_enabled', False):
+                                from services.scheduling.removal_reconciliation import (
+                                    finalize_inferred_removal, ingest_observation)
+                                missing_at = await ingest_observation(
+                                    conn, row, result,
+                                    self.settings.ms_bookings_tenant_id,
+                                    self.settings.ms_bookings_business_id,
+                                    read_started_at=read_started_at)
+                                if missing_at is not None:
+                                    from services.calendar.provider_admission import (
+                                        inventory_absent, publish_pause)
+                                    from services.scheduling.removal_reconciliation import (
+                                        invalidate_inventory_evidence)
+                                    remaining = min(30.0, deadline - time.monotonic()
+                                                    - PERSIST_ALLOWANCE_SECONDS
+                                                    - CLEANUP_ALLOWANCE_SECONDS)
+                                    try:
+                                        if remaining <= 0:
+                                            raise TimeoutError
+                                        async with asyncio.timeout(remaining):
+                                            inventory = await inventory_absent(
+                                                conn, self.client, row['ms_booking_id'],
+                                                self.settings.ms_bookings_tenant_id,
+                                                self.settings.ms_bookings_business_id)
+                                        manual_failure = False
+                                    except asyncio.CancelledError:
+                                        raise
+                                    except TimeoutError:
+                                        inventory = InventoryResult(None, 'timeout', 60, True)
+                                        manual_failure = True
+                                    except Exception:
+                                        inventory = InventoryResult(None, 'network', 60, True)
+                                        manual_failure = True
+                                    if _connection_closed(conn):
+                                        # A cancelled advisory-lock acquisition may have
+                                        # terminated this session. Use a fresh short
+                                        # transaction to invalidate the old 404 evidence.
+                                        async with self.pool.acquire() as recovery:
+                                            await publish_pause(recovery, 60)
+                                            await invalidate_inventory_evidence(
+                                                recovery, row['id'], missing_at,
+                                                self.settings.ms_bookings_tenant_id,
+                                                self.settings.ms_bookings_business_id,
+                                                inventory)
+                                        break
+                                    if manual_failure:
+                                        await publish_pause(conn, 60)
+                                    if inventory.absent is True:
+                                        await finalize_inferred_removal(
+                                            conn, row['id'], missing_at,
+                                            self.settings.ms_bookings_tenant_id,
+                                            self.settings.ms_bookings_business_id)
+                                    else:
+                                        await invalidate_inventory_evidence(
+                                            conn, row['id'], missing_at,
+                                            self.settings.ms_bookings_tenant_id,
+                                            self.settings.ms_bookings_business_id,
+                                            inventory)
+                                    if inventory.stop_batch:
+                                        break
                             processed += 1
                             if result.stop_batch:
                                 break

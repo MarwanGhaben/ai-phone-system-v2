@@ -153,12 +153,26 @@ class Settings(BaseSettings):
     booking_observation_freshness_seconds: int = Field(
         default=180, ge=11, le=7200, alias="BOOKING_OBSERVATION_FRESHNESS_SECONDS"
     )
+    automatic_notifications_enabled: bool = Field(
+        default=False, alias="AUTOMATIC_NOTIFICATIONS_ENABLED"
+    )
+    automatic_notification_workers_paused: bool = Field(
+        default=False, alias="AUTOMATIC_NOTIFICATION_WORKERS_PAUSED"
+    )
+    automatic_notifications_interval_seconds: int = Field(
+        default=60, ge=10, le=3600, alias="AUTOMATIC_NOTIFICATIONS_INTERVAL_SECONDS"
+    )
 
     @model_validator(mode="after")
     def validate_observation_freshness(self):
         if (self.booking_observation_freshness_seconds
                 <= self.booking_observation_interval_seconds):
             raise ValueError("observation freshness must exceed poll interval")
+        if self.automatic_notifications_enabled and not self.booking_observation_enabled:
+            raise ValueError("automatic notifications require provider observation")
+        if (self.automatic_notification_workers_paused
+                and not self.automatic_notifications_enabled):
+            raise ValueError("paused notification workers require automatic notifications")
         return self
 
     # =====================================================

@@ -44,6 +44,9 @@ class _Settings:
     api_host = "127.0.0.1"
     api_port = 8000
     debug = False
+    booking_observation_enabled = False
+    automatic_notifications_enabled = False
+    automatic_notification_workers_paused = False
 
     def model_dump(self):
         return {}
@@ -226,6 +229,159 @@ def test_observation_poller_start_failure_closes_pool(monkeypatch):
     assert module.app.state.ready is False
 
 
+def test_notification_mode_disables_legacy_sender_and_awaits_both_workers(monkeypatch):
+    events = []
+    module, _ = _load_main(monkeypatch, events)
+    module.settings.booking_observation_enabled = True
+    module.settings.automatic_notifications_enabled = True
+
+    class Poller:
+        def __init__(self, pool, settings):
+            events.append('poller-created')
+
+        def start(self):
+            events.append('poller-start')
+
+        async def stop(self):
+            events.append('poller-stop')
+
+    class Worker:
+        def __init__(self, pool, settings):
+            events.append('worker-created')
+
+        def start(self):
+            assert module.app.state.ready is True
+            events.append('worker-start')
+
+        async def stop(self):
+            events.append('worker-stop')
+
+    monkeypatch.setitem(sys.modules, 'services.scheduling.provider_observations',
+                        types.SimpleNamespace(ObservationPoller=Poller))
+    monkeypatch.setitem(sys.modules, 'services.sms.notification_worker',
+                        types.SimpleNamespace(NotificationWorker=Worker))
+    with TestClient(module.app) as client:
+        assert client.get('/ready').json() == {'status': 'ready'}
+        assert 'scheduler-start' not in events
+        assert events.index('check') < events.index('worker-start')
+    assert events.index('worker-stop') < events.index('poller-stop') < events.index('close')
+    assert 'scheduler-stop' not in events
+
+
+def test_notification_mode_requires_observation_before_pool_or_sender(monkeypatch):
+    events = []
+    module, _ = _load_main(monkeypatch, events)
+    module.settings.automatic_notifications_enabled = True
+    module.settings.booking_observation_enabled = False
+    with pytest.raises(RuntimeError, match='require provider observation'):
+        with TestClient(module.app):
+            pass
+    assert 'pool' not in events
+    assert 'scheduler-start' not in events
+    assert module.app.state.ready is False
+
+
+def test_paused_notification_mode_is_ready_without_any_background_sender(monkeypatch):
+    events = []
+    module, _ = _load_main(monkeypatch, events)
+    module.settings.booking_observation_enabled = True
+    module.settings.automatic_notifications_enabled = True
+    module.settings.automatic_notification_workers_paused = True
+
+    class Forbidden:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError('paused worker path was constructed')
+
+    monkeypatch.setitem(sys.modules, 'services.scheduling.provider_observations',
+                        types.SimpleNamespace(ObservationPoller=Forbidden))
+    monkeypatch.setitem(sys.modules, 'services.sms.notification_worker',
+                        types.SimpleNamespace(NotificationWorker=Forbidden))
+    with TestClient(module.app) as client:
+        assert client.get('/ready').json() == {'status': 'ready'}
+        assert events == ['pool', 'check', 'tts-prewarm', 'check']
+    assert events == ['pool', 'check', 'tts-prewarm', 'check', 'close']
+    assert not any('scheduler' in event or 'poller' in event or 'worker' in event
+                   for event in events)
+
+
+def test_paused_workers_require_enabled_mode_before_pool(monkeypatch):
+    events = []
+    module, _ = _load_main(monkeypatch, events)
+    module.settings.booking_observation_enabled = True
+    module.settings.automatic_notifications_enabled = False
+    module.settings.automatic_notification_workers_paused = True
+    with pytest.raises(RuntimeError, match='paused notification workers require'):
+        with TestClient(module.app):
+            pass
+    assert events == ['close']
+    assert module.app.state.ready is False
+
+
+def test_notification_pause_setting_validation_rejects_invalid_combinations():
+    from pydantic import ValidationError
+    from config.settings import Settings
+
+    required = {
+        'SECRET_KEY': 'synthetic-secret-key-0000000000000000',
+        'DATABASE_URL': 'postgresql://synthetic:synthetic@example.invalid/synthetic',
+        'TWILIO_ACCOUNT_SID': 'synthetic',
+        'TWILIO_AUTH_TOKEN': 'synthetic',
+        'TWILIO_PHONE_NUMBER': '+12025550100',
+        'DEEPGRAM_API_KEY': 'synthetic',
+        'ELEVENLABS_API_KEY': 'synthetic',
+        'OPENAI_API_KEY': 'synthetic',
+        'BOOKING_OBSERVATION_ENABLED': True,
+        'AUTOMATIC_NOTIFICATION_WORKERS_PAUSED': True,
+    }
+    with pytest.raises(ValidationError, match='paused notification workers require'):
+        Settings(**required)
+    valid = Settings(**required, AUTOMATIC_NOTIFICATIONS_ENABLED=True)
+    assert valid.automatic_notification_workers_paused is True
+    assert valid.automatic_notifications_enabled is True
+    with pytest.raises(ValidationError, match='require provider observation'):
+        Settings(**(required | {
+            'BOOKING_OBSERVATION_ENABLED': False,
+            'AUTOMATIC_NOTIFICATIONS_ENABLED': True,
+        }))
+
+
+def test_notification_worker_start_failure_awaits_poller_before_pool(monkeypatch):
+    events = []
+    module, _ = _load_main(monkeypatch, events)
+    module.settings.booking_observation_enabled = True
+    module.settings.automatic_notifications_enabled = True
+
+    class Poller:
+        def __init__(self, pool, settings):
+            pass
+
+        def start(self):
+            events.append('poller-start')
+
+        async def stop(self):
+            events.append('poller-stop')
+
+    class Worker:
+        def __init__(self, pool, settings):
+            pass
+
+        def start(self):
+            raise RuntimeError(SENTINEL)
+
+        async def stop(self):
+            events.append('worker-stop')
+
+    monkeypatch.setitem(sys.modules, 'services.scheduling.provider_observations',
+                        types.SimpleNamespace(ObservationPoller=Poller))
+    monkeypatch.setitem(sys.modules, 'services.sms.notification_worker',
+                        types.SimpleNamespace(NotificationWorker=Worker))
+    with pytest.raises(RuntimeError, match=SENTINEL):
+        with TestClient(module.app):
+            pass
+    assert events.index('worker-stop') < events.index('poller-stop') < events.index('close')
+    assert module.app.state.ready is False
+
+
 def test_incompatible_database_aborts_before_scheduler_or_tts_and_closes(monkeypatch):
     events = []
     module, _ = _load_main(monkeypatch, events, compatible=False)
@@ -327,6 +483,8 @@ def test_compose_declares_preparation_gate_and_readiness_ordering():
     assert app["depends_on"]["postgres"]["condition"] == "service_healthy"
     assert app["depends_on"]["redis"]["condition"] == "service_healthy"
     assert app["healthcheck"]["test"][-1].endswith("/ready")
+    assert app["environment"]["AUTOMATIC_NOTIFICATION_WORKERS_PAUSED"] == (
+        "${AUTOMATIC_NOTIFICATION_WORKERS_PAUSED:-false}")
     assert nginx["depends_on"] == {"app": {"condition": "service_healthy"}}
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "curl -f http://localhost:8000/ready" in dockerfile

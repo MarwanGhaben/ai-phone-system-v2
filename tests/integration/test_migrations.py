@@ -324,6 +324,28 @@ def auth_password_statements():
 
 
 class OfflineTests(unittest.TestCase):
+    def test_check_cast_equivalence_preserves_values_types_and_boolean_rules(self):
+        from migrations.schema_contract import check_definitions_match
+        original = "CHECK ((state)::text = ANY ((ARRAY['held'::character varying, 'pending'::character varying])::text[]))"
+        restored = "CHECK ((state)::text = ANY (ARRAY[('held'::character varying)::text, ('pending'::character varying)::text]))"
+        self.assertTrue(check_definitions_match({'rule': original}, {'rule': restored}))
+        self.assertTrue(check_definitions_match({'rule': restored}, {'rule': original}))
+        for changed in (
+            restored.replace('pending', 'accepted'),
+            restored.replace(' = ANY ', ' <> ALL '),
+            restored.replace('state', 'kind'),
+            restored.replace('::character varying', '::character varying(2)'),
+            restored[:-1] + ' OR true)',
+        ):
+            self.assertFalse(check_definitions_match({'rule': original}, {'rule': changed}))
+        for invalid in (None, [], {'other': original}, {'rule': None}):
+            self.assertFalse(check_definitions_match(invalid, {'rule': restored}))
+        nested = 'CHECK ((((missing_count >= 0) AND (missing_count <= 2)) AND (enrolled_at IS NOT NULL)))'
+        flat = 'CHECK (((missing_count >= 0) AND (missing_count <= 2) AND (enrolled_at IS NOT NULL)))'
+        self.assertTrue(check_definitions_match({'rule': nested}, {'rule': flat}))
+        self.assertFalse(check_definitions_match({'rule': nested}, {'rule': flat.replace('<= 2', '<= 3')}))
+        self.assertFalse(check_definitions_match({'rule': nested}, {'rule': flat.replace('AND (enrolled_at', 'OR (enrolled_at')}))
+
     def setUp(self):
         self.runner = importlib.import_module("migrations.runner")
 
@@ -437,6 +459,7 @@ class OfflineTests(unittest.TestCase):
             ("0001", "0001_admin_users_updated_at.sql"),
             ("0002", "0002_bookings_aware_time.sql"),
             ("0003", "0003_booking_provider_observations.sql"),
+            ("0004", "0004_appointment_notifications.sql"),
         ))
         revision = self.runner.MANIFEST[0]
         sql, checksum = self.runner._load_revision()
@@ -457,7 +480,8 @@ class OfflineTests(unittest.TestCase):
             [(version, checksum) for version, _, checksum in revisions],
             [("0001", contract.REVISION_CHECKSUM),
              ("0002", contract.BOOKINGS_REVISION_CHECKSUM),
-             ("0003", contract.OBSERVATION_REVISION_CHECKSUM)],
+             ("0003", contract.OBSERVATION_REVISION_CHECKSUM),
+             ("0004", contract.NOTIFICATION_REVISION_CHECKSUM)],
         )
         self.assertEqual(
             revisions[1][1],
@@ -466,6 +490,10 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(
             revisions[2][1],
             (ROOT / "migrations/0003_booking_provider_observations.sql").read_bytes().decode("utf-8"),
+        )
+        self.assertEqual(
+            revisions[3][1],
+            (ROOT / "migrations/0004_appointment_notifications.sql").read_bytes().decode("utf-8"),
         )
         self.assertEqual(bootstrap_checksum, contract.BOOTSTRAP_CHECKSUM)
         self.assertEqual(
@@ -615,6 +643,60 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
     async def reset_public(self):
         await self.conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
 
+    async def test_0004_dump_restore_preserves_contract_and_rejects_changed_checks(self):
+        from migrations.schema_contract import check_runtime_compatibility, SchemaCompatibilityError
+        await self.reset_public()
+        await self.prepare()
+        baseline = await self.conn.fetchrow("""SELECT
+            (SELECT check_definitions FROM public.booking_provider_observation_control) AS observation,
+            (SELECT check_definitions FROM public.booking_notification_contract) AS notification""")
+        command = [self.docker, '--context', 'desktop-linux', 'exec']
+        # Two round trips exercise the distributed-cast form on subsequent backups.
+        for _ in range(2):
+            dumped = subprocess.run([*command, self.name, 'pg_dump', '-U', 't005',
+                '-d', self.database, '-Fc'], capture_output=True, timeout=60)
+            self.assertEqual(dumped.returncode, 0)
+            await self.reset_public()
+            restored = subprocess.run([*command, '-i', self.name, 'pg_restore',
+                '--exit-on-error', '--single-transaction', '--no-owner', '--no-acl',
+                '-U', 't005', '-d', self.database], input=dumped.stdout,
+                capture_output=True, timeout=60)
+            self.assertEqual(restored.returncode, 0)
+            differences = await self.conn.fetch("""SELECT k.conname,
+                c.check_definitions->>k.conname AS recorded,
+                pg_catalog.pg_get_constraintdef(k.oid,false) AS actual
+                FROM pg_catalog.pg_constraint k CROSS JOIN public.booking_notification_contract c
+                WHERE k.contype='c' AND c.check_definitions ? k.conname
+                AND c.check_definitions->>k.conname IS DISTINCT FROM
+                    pg_catalog.pg_get_constraintdef(k.oid,false)""")
+            from migrations.schema_contract import check_definitions_match
+            for difference in differences:
+                self.assertTrue(check_definitions_match(
+                    {'rule': difference['recorded']}, {'rule': difference['actual']}),
+                    repr(dict(difference)))
+            async with self.conn.transaction(readonly=True):
+                await check_runtime_compatibility(self.conn, require_notification=True)
+            self.assertEqual(await self.prepare(), 'up-to-date 0004')
+        after = await self.conn.fetchrow("""SELECT
+            (SELECT check_definitions FROM public.booking_provider_observation_control) AS observation,
+            (SELECT check_definitions FROM public.booking_notification_contract) AS notification""")
+        self.assertEqual(dict(baseline), dict(after))
+        for table, name, definition in (
+            ('booking_provider_observations', 'booking_observation_outcome_check',
+             "outcome IN ('present','changed','unavailable','check_failed','unexpected')"),
+            ('booking_notification_outbox', 'booking_notification_outbox_state_check',
+             "state <> 'invalid'"),
+        ):
+            transaction = self.conn.transaction()
+            await transaction.start()
+            try:
+                await self.conn.execute(f'ALTER TABLE public.{table} DROP CONSTRAINT {name}; '
+                    f'ALTER TABLE public.{table} ADD CONSTRAINT {name} CHECK ({definition})')
+                with self.assertRaises(SchemaCompatibilityError):
+                    await check_runtime_compatibility(self.conn, require_notification=True)
+            finally:
+                await transaction.rollback()
+
     async def bootstrap(self):
         sql = BOOTSTRAP_SCHEMA_PATH.read_text(encoding="utf-8")
         async with self.conn.transaction():
@@ -624,11 +706,11 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
     async def test_prepare_empty_schema_is_atomic_idempotent_and_read_only_compatible(self):
         contract = importlib.import_module("migrations.schema_contract")
         await self.reset_public()
-        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001 0002 0003")
+        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001 0002 0003 0004")
         tables = await self.conn.fetchval(
             "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n "
             "ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r'")
-        self.assertEqual(tables, 20)
+        self.assertEqual(tables, 23)
         primary_key = await self.conn.fetchrow("""
             SELECT contype::text,convalidated,connoinherit
             FROM pg_catalog.pg_constraint
@@ -645,6 +727,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             [("0001", contract.REVISION_CHECKSUM),
              ("0002", contract.BOOKINGS_REVISION_CHECKSUM),
              ("0003", contract.OBSERVATION_REVISION_CHECKSUM),
+             ("0004", contract.NOTIFICATION_REVISION_CHECKSUM),
              ("bootstrap-v1", contract.BOOTSTRAP_CHECKSUM)],
         )
         self.assertTrue(all(row["applied_at"].tzinfo is not None for row in history))
@@ -655,9 +738,9 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         async with self.conn.transaction(isolation="repeatable_read", readonly=True):
             await contract.check_runtime_compatibility(self.conn)
         self.assertEqual(await self.snapshot(), before)
-        self.assertEqual(await self.prepare(), "up-to-date 0003")
+        self.assertEqual(await self.prepare(), "up-to-date 0004")
         self.assertEqual(await self.snapshot(), before)
-        self.assertEqual(await self.migrate(False), "up-to-date 0003")
+        self.assertEqual(await self.migrate(False), "up-to-date 0004")
         self.assertEqual(await self.migrate(), "up-to-date 0001")
         self.assertEqual(await self.snapshot(), before)
 
@@ -684,7 +767,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             SELECT pg_catalog.setval('public.bookings_id_seq',81,true);
         """)
         before = await self.snapshot()
-        self.assertEqual(await self.prepare(), "applied 0003")
+        self.assertEqual(await self.prepare(), "applied 0004")
         after = await self.snapshot()
         self.assertEqual(before["sequences"], after["sequences"])
         old_bookings = [json.loads(row["row"]) for row in before["rows"]["bookings"]]
@@ -697,7 +780,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new_admin, [dict(row, updated_at=None) for row in old_admin])
         history = await self.conn.fetch(
             "SELECT version FROM public.schema_migrations ORDER BY version")
-        self.assertEqual([row["version"] for row in history], ["0001", "0002", "0003"])
+        self.assertEqual([row["version"] for row in history], ["0001", "0002", "0003", "0004"])
 
     async def test_prepare_rejects_partial_or_unknown_empty_path_without_mutation(self):
         for sql in (
@@ -787,7 +870,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c "
             "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
             "WHERE n.nspname='public' AND c.relkind IN ('r','S'))"))
-        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001 0002 0003")
+        self.assertEqual(await self.prepare(), "prepared bootstrap-v1 0001 0002 0003 0004")
 
     async def test_prepare_upgrades_old_0001_histories_without_fabricating_bootstrap(self):
         contract = importlib.import_module("migrations.schema_contract")
@@ -816,10 +899,10 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
                 async with self.conn.transaction(readonly=True):
                     with self.assertRaises(contract.SchemaCompatibilityError):
                         await contract.check_runtime_compatibility(self.conn)
-                self.assertEqual(await self.prepare(), "applied 0003")
+                self.assertEqual(await self.prepare(), "applied 0004")
                 history = await self.conn.fetch(
                     "SELECT version FROM schema_migrations ORDER BY version")
-                expected = ["0001", "0002", "0003"]
+                expected = ["0001", "0002", "0003", "0004"]
                 if with_bootstrap:
                     expected.append("bootstrap-v1")
                 self.assertEqual([row["version"] for row in history], expected)
@@ -855,7 +938,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(self.runner.MigrationError, "migration failed"):
                 await self.prepare()
         self.assertEqual(await self.snapshot(), before)
-        self.assertEqual(await self.prepare(), "applied 0003")
+        self.assertEqual(await self.prepare(), "applied 0004")
 
     async def test_runtime_rejects_admin_drift_and_cross_schema_foreign_key(self):
         contract = importlib.import_module("migrations.schema_contract")
@@ -938,7 +1021,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(
             str(result) == "busy" for result in failures
         ))
-        self.assertEqual(await self.prepare(), "up-to-date 0003")
+        self.assertEqual(await self.prepare(), "up-to-date 0004")
 
     async def snapshot(self):
         # Complete synthetic row values and sequence states; no sequence calls.
@@ -1638,6 +1721,952 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.snapshot(), before)
         self.assertEqual(await self.migrate(), "applied 0001")
 
+    async def test_0004_fresh_presence_releases_valid_confirmation_without_reviving_stale_jobs(self):
+        from datetime import datetime, timezone
+        from services.calendar.booking_readback import AppointmentDetails, ProviderResult
+        from services.scheduling.booking_records import persist_booking_record
+        from services.scheduling.removal_reconciliation import ingest_observation
+        from services.sms.notification_worker import NotificationWorker
+        from services.sms.telnyx_submission import SubmissionResult
+        await self.reset_public()
+        await self.prepare()
+        pool = await self.driver.create_pool(self.dsn, min_size=1, max_size=2)
+        self.addAsyncCleanup(pool.close)
+        settings = types.SimpleNamespace(automatic_notifications_enabled=True,
+            ms_bookings_tenant_id='tenant', ms_bookings_business_id='business')
+
+        class Graph:
+            async def observe(self, provider_id, start):
+                return ProviderResult('present', http_status=200,
+                    details=AppointmentDetails(start, start + timedelta(minutes=30),
+                                               None, None, None),
+                    observed_provider_id=provider_id)
+
+        class SMS:
+            calls = 0
+            async def submit_notification(self, recipient, body):
+                self.calls += 1
+                return SubmissionResult('accepted', message_id='synthetic-confirmation')
+
+        graph, sms = Graph(), SMS()
+        worker = NotificationWorker(pool, settings, client=graph, sms=sms)
+        # Fresh due confirmation recovers; expired notices and past appointments do not.
+        for index, (kind, overdue_seconds, past, eligible) in enumerate((
+                ('confirmation', 120, False, True),
+                ('confirmation', 960, False, False),
+                ('reminder', 360, False, False),
+                ('confirmation', 0, True, False))):
+            with self.subTest(kind=kind, overdue_seconds=overdue_seconds, past=past):
+                start = datetime.now(timezone.utc) + (
+                    timedelta(minutes=-1) if past else timedelta(days=5))
+                provider_id = f'synthetic-confirmation-recovery-{index}'
+                booking_id = await persist_booking_record(pool, call_sid=provider_id,
+                    phone_number='+12025550100', client_name='Synthetic', client_email='',
+                    accountant_name='Synthetic consultant', appointment_time=start,
+                    client_type='individual', language='en', provider_appointment_id=provider_id,
+                    notes='', notifications_enabled=True, provider_tenant_id='tenant',
+                    provider_business_id='business')
+                job_id = await self.conn.fetchval("""
+                    UPDATE public.booking_notification_outbox
+                    SET state='held',due_at=CURRENT_TIMESTAMP
+                        - pg_catalog.make_interval(secs => $3::double precision),
+                        next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '1 hour',retry_count=6
+                    WHERE booking_id=$1 AND kind=$2 RETURNING id
+                """, booking_id, kind, float(overdue_seconds))
+                self.assertIsNotNone(job_id)
+                await ingest_observation(self.conn,
+                    dict(id=booking_id, ms_booking_id=provider_id,
+                         appointment_time_utc=start, status='confirmed'),
+                    await graph.observe(provider_id, start), 'tenant', 'business')
+                job = await self.conn.fetchrow("""SELECT state,
+                    next_attempt_at<=CURRENT_TIMESTAMP AS eligible
+                    FROM public.booking_notification_outbox WHERE id=$1""", job_id)
+                self.assertEqual((job['state'], job['eligible']),
+                                 ('pending', True) if eligible else ('held', False))
+                if not eligible:
+                    # Once its retry time arrives, it must expire rather than send.
+                    await self.conn.execute("""UPDATE public.booking_notification_outbox
+                        SET next_attempt_at=CURRENT_TIMESTAMP WHERE id=$1""", job_id)
+                self.assertEqual(await worker.process(job_id, booking_id), eligible)
+                self.assertEqual(await self.conn.fetchval("""SELECT state
+                    FROM public.booking_notification_outbox WHERE id=$1""", job_id),
+                    'accepted' if eligible else 'suppressed')
+                self.assertFalse(await worker.process(job_id, booking_id))
+        self.assertEqual(sms.calls, 1)
+
+    async def test_0004_upgrade_rolls_back_atomically_and_rejects_drift(self):
+        contract = importlib.import_module('migrations.schema_contract')
+        await self.reset_public()
+        await self.bootstrap()
+        await self.conn.execute(
+            'ALTER TABLE public.bookings ADD COLUMN appointment_time_utc TIMESTAMPTZ')
+        await self.conn.execute(LEDGER)
+        await self.conn.execute((ROOT / 'migrations/0003_booking_provider_observations.sql')
+                                .read_text(encoding='utf-8'))
+        for version, checksum in (
+            (contract.REVISION_VERSION, contract.REVISION_CHECKSUM),
+            (contract.BOOKINGS_REVISION_VERSION, contract.BOOKINGS_REVISION_CHECKSUM),
+            (contract.OBSERVATION_REVISION_VERSION, contract.OBSERVATION_REVISION_CHECKSUM),
+        ):
+            await self.conn.execute(
+                'INSERT INTO public.schema_migrations VALUES ($1,$2,CURRENT_TIMESTAMP)',
+                version, checksum)
+        await self.conn.execute("""
+            INSERT INTO public.bookings
+                (call_sid,appointment_time,appointment_time_utc,status,ms_booking_id)
+            VALUES ('synthetic-0003',TIMESTAMP '2026-09-14 11:00:00',
+                    TIMESTAMPTZ '2026-09-14 15:00:00+00','confirmed','synthetic-id')
+        """)
+        before = await self.snapshot()
+        original = self.runner._record_revision
+
+        async def fail_0004(conn, version, checksum):
+            if version == '0004':
+                self.assertIsNotNone(await conn.fetchval(
+                    "SELECT pg_catalog.to_regclass('public.booking_notification_outbox')"))
+                raise RuntimeError(SENTINEL)
+            return await original(conn, version, checksum)
+
+        with mock.patch.object(self.runner, '_record_revision', side_effect=fail_0004):
+            with self.assertRaisesRegex(self.runner.MigrationError, 'migration failed'):
+                await self.prepare()
+        self.assertEqual(await self.snapshot(), before)
+        self.assertEqual(await self.migrate(False), 'pending 0004')
+        self.assertEqual(await self.prepare(), 'applied 0004')
+        self.assertEqual(await self.conn.fetchval(
+            'SELECT count(*) FROM public.booking_notification_reconciliation'), 0)
+        self.assertEqual(await self.conn.fetchval(
+            'SELECT count(*) FROM public.booking_notification_outbox'), 0)
+        async with self.conn.transaction(readonly=True):
+            await contract.check_runtime_compatibility(
+                self.conn, require_notification=True)
+        self.assertEqual(await self.prepare(), 'up-to-date 0004')
+        await self.conn.execute("""
+            ALTER TABLE public.booking_notification_outbox
+            DROP CONSTRAINT booking_notification_outbox_state_check
+        """)
+        async with self.conn.transaction(readonly=True):
+            with self.assertRaises(contract.SchemaCompatibilityError):
+                await contract.check_runtime_compatibility(
+                    self.conn, require_notification=True)
+
+    async def test_0004_removal_is_atomic_and_scoped_to_one_booking(self):
+        from datetime import datetime, timezone
+        from services.calendar.booking_readback import ProviderResult
+        from services.scheduling.removal_reconciliation import (
+            finalize_inferred_removal, ingest_observation)
+        await self.reset_public()
+        await self.prepare()
+        start = datetime.now(timezone.utc) + timedelta(days=7)
+        ids = []
+        for provider in ('synthetic-a', 'synthetic-b'):
+            ids.append(await self.conn.fetchval("""
+                INSERT INTO public.bookings
+                    (call_sid,phone_number,accountant_name,appointment_time_utc,
+                     language,status,ms_booking_id)
+                VALUES ($1,'+12025550100','Synthetic consultant',$2,'en',
+                        'confirmed',$3) RETURNING id
+            """, provider, start, provider))
+        rows = [dict(id=bid,ms_booking_id=provider,
+                     appointment_time_utc=start,status='confirmed')
+                for bid, provider in zip(ids, ('synthetic-a', 'synthetic-b'))]
+        present = ProviderResult('present', http_status=200)
+        missing = ProviderResult('unavailable', http_status=404)
+        self.assertIsNone(await ingest_observation(
+            self.conn, rows[0], missing, 'tenant', 'business'))
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT missing_count FROM public.booking_notification_reconciliation
+            WHERE booking_id=$1 AND enrolled_at IS NULL
+        """, ids[0]), 0)
+        for row in rows:
+            await ingest_observation(self.conn, row, present, 'tenant', 'business')
+        self.assertIsNone(await ingest_observation(
+            self.conn, rows[0], missing, 'tenant', 'business'))
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT missing_count FROM public.booking_notification_reconciliation
+            WHERE booking_id=$1
+        """, ids[0]), 1)
+        self.assertEqual(await self.conn.fetchval(
+            'SELECT status FROM public.bookings WHERE id=$1', ids[0]), 'confirmed')
+        await self.conn.execute("""
+            UPDATE public.booking_notification_reconciliation
+            SET first_missing_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds',
+                last_missing_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+            WHERE booking_id=$1
+        """, ids[0])
+        missing_at = await ingest_observation(
+            self.conn, rows[0], missing, 'tenant', 'business')
+        self.assertIsNotNone(missing_at)
+        with mock.patch('services.sms.notification_outbox.enqueue',
+                        side_effect=RuntimeError(SENTINEL)):
+            with self.assertRaisesRegex(RuntimeError, SENTINEL):
+                await finalize_inferred_removal(
+                    self.conn, ids[0], missing_at, 'tenant', 'business')
+        self.assertEqual(await self.conn.fetchval(
+            'SELECT status FROM public.bookings WHERE id=$1', ids[0]), 'confirmed')
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT count(*) FROM public.booking_notification_outbox
+            WHERE booking_id=$1 AND kind='removal'
+        """, ids[0]), 0)
+        self.assertTrue(await finalize_inferred_removal(
+            self.conn, ids[0], missing_at, 'tenant', 'business'))
+        self.assertFalse(await finalize_inferred_removal(
+            self.conn, ids[0], missing_at, 'tenant', 'business'))
+        statuses = await self.conn.fetch(
+            'SELECT id,status FROM public.bookings WHERE id=ANY($1::integer[]) ORDER BY id', ids)
+        self.assertEqual([row['status'] for row in statuses],
+                         ['removed_externally', 'confirmed'])
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT count(*) FROM public.booking_notification_outbox
+            WHERE booking_id=$1 AND kind='removal'
+        """, ids[0]), 1)
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT state FROM public.booking_notification_outbox
+            WHERE booking_id=$1 AND kind='reminder'
+        """, ids[0]), 'suppressed')
+        self.assertIn(await self.conn.fetchval("""
+            SELECT state FROM public.booking_notification_outbox
+            WHERE booking_id=$1 AND kind='reminder'
+        """, ids[1]), ('held','pending'))
+
+    async def test_0004_dispatch_acceptance_and_uncertain_intent_are_not_reposted(self):
+        from datetime import datetime, timezone
+        from services.calendar.booking_readback import AppointmentDetails, ProviderResult
+        from services.scheduling.removal_reconciliation import ingest_observation
+        from services.sms.notification_worker import NotificationWorker
+        from services.sms.telnyx_submission import SubmissionResult
+        await self.reset_public()
+        await self.prepare()
+        pool = await self.driver.create_pool(self.dsn, min_size=1, max_size=2)
+        self.addAsyncCleanup(pool.close)
+        start = datetime.now(timezone.utc) + timedelta(days=2)
+        settings = types.SimpleNamespace(
+            automatic_notifications_enabled=True,
+            ms_bookings_tenant_id='tenant', ms_bookings_business_id='business')
+
+        class Graph:
+            async def observe(self, provider_id, expected_start):
+                return ProviderResult(
+                    'present', http_status=200,
+                    details=AppointmentDetails(expected_start,
+                                               expected_start + timedelta(minutes=30),
+                                               None, None, None))
+
+            async def close(self):
+                pass
+
+        class SMS:
+            def __init__(self, uncertain=False):
+                self.calls = 0
+                self.uncertain = uncertain
+
+            async def submit_notification(self, recipient, body):
+                self.calls += 1
+                if self.uncertain:
+                    raise TimeoutError('synthetic ambiguous POST')
+                return SubmissionResult('accepted', message_id='synthetic-message')
+
+        for provider, uncertain in (('synthetic-accepted', False),
+                                    ('synthetic-unknown', True)):
+            booking_id = await self.conn.fetchval("""
+                INSERT INTO public.bookings
+                    (call_sid,phone_number,accountant_name,appointment_time_utc,
+                     language,status,ms_booking_id)
+                VALUES ($1,'+12025550100','Synthetic consultant',$2,'en',
+                        'confirmed',$3) RETURNING id
+            """, provider, start, provider)
+            row = dict(id=booking_id,ms_booking_id=provider,
+                       appointment_time_utc=start,status='confirmed')
+            await ingest_observation(
+                self.conn, row, ProviderResult('present', http_status=200),
+                'tenant', 'business')
+            job_id = await self.conn.fetchval("""
+                UPDATE public.booking_notification_outbox
+                SET due_at=CURRENT_TIMESTAMP,next_attempt_at=CURRENT_TIMESTAMP,
+                    state='pending'
+                WHERE booking_id=$1 AND kind='reminder' RETURNING id
+            """, booking_id)
+            self.assertIsNotNone(job_id)
+            sms = SMS(uncertain)
+            worker = NotificationWorker(pool, settings, client=Graph(), sms=sms)
+            if uncertain:
+                with self.assertRaises(TimeoutError):
+                    await worker.process(job_id, booking_id)
+                self.assertEqual(await self.conn.fetchval(
+                    'SELECT state FROM public.booking_notification_outbox WHERE id=$1',
+                    job_id), 'dispatching')
+                await self.conn.execute("""
+                    UPDATE public.booking_notification_outbox
+                    SET dispatch_started_at=CURRENT_TIMESTAMP - INTERVAL '3 minutes'
+                    WHERE id=$1
+                """, job_id)
+                await worker.tick()
+                self.assertEqual(await self.conn.fetchval(
+                    'SELECT state FROM public.booking_notification_outbox WHERE id=$1',
+                    job_id), 'unknown')
+            else:
+                self.assertTrue(await worker.process(job_id, booking_id))
+                self.assertEqual(await self.conn.fetchval(
+                    'SELECT state FROM public.booking_notification_outbox WHERE id=$1',
+                    job_id), 'accepted')
+                self.assertFalse(await worker.process(job_id, booking_id))
+            self.assertEqual(sms.calls, 1)
+
+        provider = 'synthetic-duplicate-after-enrollment'
+        booking_id = await self.conn.fetchval("""
+            INSERT INTO public.bookings
+                (call_sid,phone_number,accountant_name,appointment_time_utc,
+                 language,status,ms_booking_id)
+            VALUES ($1,'+12025550100','Synthetic consultant',$2,'en',
+                    'confirmed',$3) RETURNING id
+        """, provider, start, provider)
+        await ingest_observation(
+            self.conn, dict(id=booking_id,ms_booking_id=provider,
+                            appointment_time_utc=start,status='confirmed'),
+            ProviderResult('present', http_status=200), 'tenant', 'business')
+        job_id = await self.conn.fetchval("""
+            UPDATE public.booking_notification_outbox
+            SET due_at=CURRENT_TIMESTAMP,next_attempt_at=CURRENT_TIMESTAMP,
+                state='pending'
+            WHERE booking_id=$1 AND kind='reminder' RETURNING id
+        """, booking_id)
+        await self.conn.execute("""
+            INSERT INTO public.bookings (call_sid,ms_booking_id)
+            VALUES ('synthetic-ambiguous-second-row',$1)
+        """, provider)
+        sms = SMS()
+        worker = NotificationWorker(pool, settings, client=Graph(), sms=sms)
+        self.assertFalse(await worker.process(job_id, booking_id))
+        self.assertEqual(sms.calls, 0)
+        self.assertEqual(await self.conn.fetchval(
+            'SELECT state FROM public.booking_notification_outbox WHERE id=$1',
+            job_id), 'held')
+
+    async def test_0004_new_booking_and_two_jobs_commit_or_rollback_together(self):
+        from datetime import datetime, timezone
+        from services.scheduling.booking_records import persist_booking_record
+        await self.reset_public()
+        await self.prepare()
+        pool = await self.driver.create_pool(self.dsn, min_size=1, max_size=2)
+        self.addAsyncCleanup(pool.close)
+        start = datetime.now(timezone.utc) + timedelta(days=7)
+        values = dict(
+            phone_number='+12025550100', client_name='Synthetic caller',
+            client_email='synthetic@example.invalid',
+            accountant_name='Synthetic consultant', appointment_time=start,
+            client_type='individual', language='en',
+            provider_appointment_id='synthetic-new-id', notes='synthetic only',
+            notifications_enabled=True, provider_tenant_id='tenant',
+            provider_business_id='business')
+        booking_id = await persist_booking_record(
+            pool, call_sid='synthetic-new', **values)
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT count(*) FROM public.booking_notification_outbox
+            WHERE booking_id=$1 AND kind IN ('confirmation','reminder')
+        """, booking_id), 2)
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT count(*) FROM public.booking_notification_reconciliation
+            WHERE booking_id=$1 AND enrolled_at IS NULL
+        """, booking_id), 1)
+        with self.assertRaises(self.driver.UniqueViolationError):
+            await self.conn.execute("""
+                UPDATE public.booking_notification_outbox
+                SET event_key=(SELECT event_key FROM public.booking_notification_outbox
+                               WHERE booking_id=$1 AND kind='confirmation')
+                WHERE booking_id=$1 AND kind='reminder'
+            """, booking_id)
+        with self.assertRaises(self.driver.CheckViolationError):
+            await self.conn.execute("""
+                UPDATE public.booking_notification_outbox SET state='accepted'
+                WHERE booking_id=$1 AND kind='reminder'
+            """, booking_id)
+        with mock.patch('services.sms.notification_outbox.create_new_booking_jobs',
+                        side_effect=RuntimeError(SENTINEL)):
+            with self.assertRaisesRegex(RuntimeError, SENTINEL):
+                await persist_booking_record(
+                    pool, call_sid='synthetic-rolled-back', **dict(
+                        values, provider_appointment_id='synthetic-rolled-back-id'))
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT count(*) FROM public.bookings WHERE call_sid='synthetic-rolled-back'
+        """), 0)
+
+    async def test_0004_caller_cancel_serializes_with_inflight_reminder(self):
+        from datetime import datetime, timezone
+        from services.calendar.booking_readback import AppointmentDetails, ProviderResult
+        from services.scheduling.removal_reconciliation import (
+            finalize_caller_cancellation, ingest_observation)
+        from services.sms.notification_worker import NotificationWorker
+        from services.sms.telnyx_submission import SubmissionResult
+        await self.reset_public()
+        await self.prepare()
+        pool = await self.driver.create_pool(self.dsn, min_size=1, max_size=3)
+        self.addAsyncCleanup(pool.close)
+        start = datetime.now(timezone.utc) + timedelta(days=2)
+        settings = types.SimpleNamespace(
+            automatic_notifications_enabled=True,
+            ms_bookings_tenant_id='tenant', ms_bookings_business_id='business')
+
+        class Graph:
+            async def observe(self, provider_id, expected_start):
+                return ProviderResult(
+                    'present', http_status=200,
+                    details=AppointmentDetails(
+                        expected_start, expected_start + timedelta(minutes=30),
+                        None, None, None))
+
+            async def close(self):
+                pass
+
+        class BlockingSMS:
+            def __init__(self):
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+                self.calls = 0
+
+            async def submit_notification(self, recipient, body):
+                self.calls += 1
+                self.entered.set()
+                await self.release.wait()
+                return SubmissionResult('accepted', message_id='synthetic-message')
+
+        async def booking(provider):
+            booking_id = await self.conn.fetchval("""
+                INSERT INTO public.bookings
+                    (call_sid,phone_number,accountant_name,appointment_time_utc,
+                     language,status,ms_booking_id)
+                VALUES ($1,'+12025550100','Synthetic consultant',$2,'en',
+                        'confirmed',$3) RETURNING id
+            """, provider, start, provider)
+            row = dict(id=booking_id,ms_booking_id=provider,
+                       appointment_time_utc=start,status='confirmed')
+            await ingest_observation(
+                self.conn, row, ProviderResult('present', http_status=200),
+                'tenant', 'business')
+            job_id = await self.conn.fetchval("""
+                UPDATE public.booking_notification_outbox
+                SET due_at=CURRENT_TIMESTAMP,next_attempt_at=CURRENT_TIMESTAMP,
+                    state='pending'
+                WHERE booking_id=$1 AND kind='reminder' RETURNING id
+            """, booking_id)
+            return booking_id, job_id
+
+        first_id, first_job = await booking('synthetic-inflight')
+        sms = BlockingSMS()
+        worker = NotificationWorker(pool, settings, client=Graph(), sms=sms)
+        sending = asyncio.create_task(worker.process(first_job, first_id))
+        await asyncio.wait_for(sms.entered.wait(), 5)
+        cancelling = asyncio.create_task(finalize_caller_cancellation(
+            pool, 'synthetic-inflight', '+12025550100', 'tenant', 'business'))
+        await asyncio.sleep(0.05)
+        self.assertFalse(cancelling.done())
+        sms.release.set()
+        self.assertTrue(await asyncio.wait_for(sending, 5))
+        self.assertEqual(await asyncio.wait_for(cancelling, 5), 'recorded')
+        self.assertEqual(sms.calls, 1)
+        self.assertEqual(await finalize_caller_cancellation(
+            pool, 'synthetic-inflight', '+12025550100',
+            'tenant', 'business'), 'already_finalized')
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT count(*) FROM public.booking_notification_outbox
+            WHERE booking_id=$1 AND kind='removal'
+        """, first_id), 1)
+
+        second_id, second_job = await booking('synthetic-before-send')
+        self.assertEqual(await finalize_caller_cancellation(
+            pool, 'synthetic-before-send', '+12025550100',
+            'tenant', 'business'), 'recorded')
+        self.assertFalse(await worker.process(second_job, second_id))
+        self.assertEqual(sms.calls, 1)
+
+    async def test_0004_http_poller_to_accepted_removal_is_booking_scoped(self):
+        from datetime import datetime, timezone
+        from services.calendar.booking_readback import BookingReadbackClient
+        from services.scheduling.booking_records import persist_booking_record
+        from services.scheduling.provider_observations import ObservationPoller
+        from services.sms.notification_worker import NotificationWorker
+        from services.sms.telnyx_submission import SubmissionResult
+        await self.reset_public()
+        await self.prepare()
+        pool = await self.driver.create_pool(self.dsn, min_size=1, max_size=3)
+        self.addAsyncCleanup(pool.close)
+        start = datetime.now(timezone.utc) + timedelta(days=5)
+        settings = types.SimpleNamespace(
+            automatic_notifications_enabled=True,
+            booking_observation_enabled=True,booking_observation_interval_seconds=60,
+            ms_bookings_tenant_id='tenant',ms_bookings_business_id='business',
+            ms_bookings_client_id='synthetic-client',
+            ms_bookings_client_secret='synthetic-secret')
+
+        class HTTPResponse:
+            def __init__(self, status, body):
+                self.status_code,self.body,self.headers = status,body,{}
+
+            def json(self):
+                return self.body
+
+        class GraphHTTP:
+            def __init__(self):
+                self.mode = 'present'
+                self.calls = []
+
+            async def post(self, url, **kwargs):
+                self.calls.append('oauth')
+                return HTTPResponse(200, {'access_token': 'synthetic-token',
+                                          'expires_in': 3600})
+
+            async def get(self, url, **kwargs):
+                if url.endswith('/bookingBusinesses/business'):
+                    self.calls.append('business')
+                    return HTTPResponse(200, {'id': 'business'})
+                if url.endswith('/bookingBusinesses/business/appointments'):
+                    self.calls.append('inventory')
+                    return HTTPResponse(200, {'value': [{'id': 'synthetic-b'}]})
+                provider = url.rsplit('/', 1)[-1]
+                self.calls.append(provider)
+                if provider == 'synthetic-a' and self.mode == 'missing':
+                    return HTTPResponse(404, {})
+                instant = start.isoformat().replace('+00:00', 'Z')
+                end = (start + timedelta(minutes=30)).isoformat().replace('+00:00', 'Z')
+                return HTTPResponse(200, {'id': provider,
+                    'startDateTime': {'dateTime': instant, 'timeZone': 'UTC'},
+                    'endDateTime': {'dateTime': end, 'timeZone': 'UTC'}})
+
+        class SMS:
+            def __init__(self): self.calls = 0
+            async def submit_notification(self, recipient, body):
+                self.calls += 1
+                return SubmissionResult('accepted', message_id='synthetic-message')
+
+        ids = []
+        for provider in ('synthetic-a', 'synthetic-b'):
+            ids.append(await persist_booking_record(
+                pool, call_sid=provider, phone_number='+12025550100',
+                client_name='Synthetic',client_email='',
+                accountant_name='Synthetic consultant',appointment_time=start,
+                client_type='individual',language='en',provider_appointment_id=provider,
+                notes='synthetic only',notifications_enabled=True,
+                provider_tenant_id='tenant',provider_business_id='business'))
+        graph = GraphHTTP()
+        poller = ObservationPoller(pool, settings,
+                                   client=BookingReadbackClient(settings, client=graph))
+        self.assertEqual(await poller.tick(), 2)
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT count(*) FROM public.booking_notification_reconciliation
+            WHERE booking_id=ANY($1::integer[]) AND enrolled_at IS NOT NULL
+        """, ids), 2)
+        graph.mode = 'missing'
+        await self.conn.execute("""
+            UPDATE public.booking_provider_observations
+            SET checked_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+            WHERE booking_id=$1
+        """, ids[0])
+        self.assertEqual(await poller.tick(), 1)
+        self.assertEqual(await self.conn.fetchval(
+            'SELECT status FROM public.bookings WHERE id=$1', ids[0]), 'confirmed')
+        await self.conn.execute("""
+            UPDATE public.booking_provider_observations
+            SET checked_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+            WHERE booking_id=$1
+        """, ids[0])
+        await self.conn.execute("""
+            UPDATE public.booking_notification_reconciliation
+            SET first_missing_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds',
+                last_missing_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+            WHERE booking_id=$1
+        """, ids[0])
+        self.assertEqual(await poller.tick(), 1)
+        self.assertEqual(await self.conn.fetchval(
+            'SELECT status FROM public.bookings WHERE id=$1', ids[0]),
+            'removed_externally')
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT state FROM public.booking_notification_outbox
+            WHERE booking_id=$1 AND kind='reminder'
+        """, ids[0]), 'suppressed')
+        self.assertEqual(await self.conn.fetchval(
+            'SELECT status FROM public.bookings WHERE id=$1', ids[1]), 'confirmed')
+        self.assertIn('business', graph.calls)
+        self.assertIn('inventory', graph.calls)
+        notice_id = await self.conn.fetchval("""
+            SELECT id FROM public.booking_notification_outbox
+            WHERE booking_id=$1 AND kind='removal'
+        """, ids[0])
+        sms = SMS()
+        worker = NotificationWorker(pool, settings,
+            client=BookingReadbackClient(settings, client=graph), sms=sms)
+        before_fresh = graph.calls.count('synthetic-a')
+        self.assertTrue(await worker.process(notice_id, ids[0]))
+        self.assertEqual(graph.calls.count('synthetic-a'), before_fresh + 1)
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT state FROM public.booking_notification_outbox WHERE id=$1
+        """, notice_id), 'accepted')
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT provider_message_id FROM public.booking_notification_outbox
+            WHERE id=$1
+        """, notice_id), 'synthetic-message')
+        self.assertFalse(await worker.process(notice_id, ids[0]))
+        self.assertEqual(sms.calls, 1)
+
+    async def test_0004_inventory_errors_and_found_id_break_missing_sequence(self):
+        from datetime import datetime, timezone
+        from services.calendar.booking_readback import (
+            AppointmentDetails, InventoryResult, ProviderResult)
+        from services.scheduling.booking_records import persist_booking_record
+        from services.scheduling.provider_observations import ObservationPoller
+        for inventory_result in (InventoryResult(None, 'authorization', 60, True),
+                                 InventoryResult(False)):
+            with self.subTest(inventory=inventory_result):
+                await self.reset_public()
+                await self.prepare()
+                pool = await self.driver.create_pool(self.dsn, min_size=1, max_size=3)
+                try:
+                    start = datetime.now(timezone.utc) + timedelta(days=5)
+                    settings = types.SimpleNamespace(
+                        automatic_notifications_enabled=True,
+                        booking_observation_enabled=True,
+                        booking_observation_interval_seconds=60,
+                        ms_bookings_tenant_id='tenant',ms_bookings_business_id='business')
+                    booking_id = await persist_booking_record(
+                        pool,call_sid='synthetic-inventory',phone_number='+12025550100',
+                        client_name='Synthetic',client_email='',
+                        accountant_name='Synthetic consultant',appointment_time=start,
+                        client_type='individual',language='en',
+                        provider_appointment_id='synthetic-inventory',notes='',
+                        notifications_enabled=True,provider_tenant_id='tenant',
+                        provider_business_id='business')
+
+                    class Graph:
+                        mode = 'present'
+                        inventories = 0
+
+                        async def observe(self, provider_id, expected_start):
+                            if self.mode == 'present':
+                                return ProviderResult('present',http_status=200,
+                                    details=AppointmentDetails(expected_start,
+                                        expected_start + timedelta(minutes=30),
+                                        None,None,None),
+                                    observed_provider_id=provider_id)
+                            return ProviderResult('unavailable',http_status=404)
+
+                        async def inventory_absent(self, *args):
+                            self.inventories += 1
+                            return inventory_result
+
+                    graph = Graph()
+                    poller = ObservationPoller(pool,settings,client=graph)
+                    self.assertEqual(await poller.tick(),1)
+                    graph.mode = 'missing'
+                    await self.conn.execute("""
+                        UPDATE public.booking_provider_observations
+                        SET checked_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+                        WHERE booking_id=$1
+                    """, booking_id)
+                    self.assertEqual(await poller.tick(),1)
+                    await self.conn.execute("""
+                        UPDATE public.booking_provider_observations
+                        SET checked_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+                        WHERE booking_id=$1
+                    """, booking_id)
+                    await self.conn.execute("""
+                        UPDATE public.booking_notification_reconciliation
+                        SET first_missing_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds',
+                            last_missing_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+                        WHERE booking_id=$1
+                    """, booking_id)
+                    self.assertEqual(await poller.tick(),
+                                     0 if inventory_result.stop_batch else 1)
+                    self.assertEqual(graph.inventories,1)
+                    state = await self.conn.fetchrow("""
+                        SELECT missing_count,last_result,last_error_category
+                        FROM public.booking_notification_reconciliation
+                        WHERE booking_id=$1
+                    """, booking_id)
+                    self.assertEqual((state['missing_count'],state['last_result']),
+                                     (0,'check_failed'))
+                    self.assertTrue(state['last_error_category'].startswith('inventory_'))
+                    self.assertEqual(await self.conn.fetchval("""
+                        SELECT count(*) FROM public.booking_notification_outbox
+                        WHERE booking_id=$1 AND kind='removal'
+                    """, booking_id),0)
+                    self.assertEqual(await self.conn.fetchval("""
+                        SELECT state FROM public.booking_notification_outbox
+                        WHERE booking_id=$1 AND kind='reminder'
+                    """, booking_id),'held')
+                    await self.conn.execute("""
+                        UPDATE public.booking_provider_observation_control
+                        SET next_request_at='-infinity'::timestamptz WHERE singleton=1
+                    """)
+                    await self.conn.execute("""
+                        UPDATE public.booking_provider_observations
+                        SET checked_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+                        WHERE booking_id=$1
+                    """, booking_id)
+                    self.assertEqual(await poller.tick(),1)
+                    self.assertEqual(await self.conn.fetchval("""
+                        SELECT missing_count FROM public.booking_notification_reconciliation
+                        WHERE booking_id=$1
+                    """, booking_id),1)
+                    self.assertEqual(graph.inventories,1)
+                finally:
+                    await pool.close()
+
+    async def test_0004_held_notice_retry_is_fair_across_workers_and_restart(self):
+        from datetime import datetime, timezone
+        from services.calendar.booking_readback import ProviderResult
+        from services.scheduling.booking_records import persist_booking_record
+        from services.scheduling.removal_reconciliation import finalize_caller_cancellation
+        from services.sms.notification_worker import NotificationWorker
+        from services.sms.telnyx_submission import SubmissionResult
+        await self.reset_public()
+        await self.prepare()
+        pool = await self.driver.create_pool(self.dsn,min_size=1,max_size=4)
+        self.addAsyncCleanup(pool.close)
+        settings = types.SimpleNamespace(
+            automatic_notifications_enabled=True,
+            ms_bookings_tenant_id='tenant',ms_bookings_business_id='business')
+        start = datetime.now(timezone.utc) + timedelta(days=5)
+        ids = []
+        for n in range(11):
+            provider = f'synthetic-fair-{n}'
+            booking_id = await persist_booking_record(
+                pool,call_sid=provider,phone_number='+12025550100',
+                client_name='Synthetic',client_email='',
+                accountant_name='Synthetic consultant',appointment_time=start,
+                client_type='individual',language='en',provider_appointment_id=provider,
+                notes='',notifications_enabled=True,provider_tenant_id='tenant',
+                provider_business_id='business')
+            ids.append(booking_id)
+            self.assertEqual(await finalize_caller_cancellation(
+                pool,provider,'+12025550100','tenant','business'),'recorded')
+            await self.conn.execute("""
+                UPDATE public.booking_notification_outbox
+                SET due_at=CURRENT_TIMESTAMP - INTERVAL '1 minute'
+                    + ($2::integer * INTERVAL '1 second'),
+                    next_attempt_at=CURRENT_TIMESTAMP
+                WHERE booking_id=$1 AND kind='removal'
+            """, booking_id, n)
+
+        class Graph:
+            def __init__(self): self.calls = []
+            async def observe(self, provider_id, expected_start):
+                self.calls.append(provider_id)
+                if provider_id == 'synthetic-fair-10':
+                    return ProviderResult('unavailable',http_status=404)
+                return ProviderResult('check_failed','network')
+
+        class SMS:
+            def __init__(self): self.calls = 0
+            async def submit_notification(self, recipient, body):
+                self.calls += 1
+                return SubmissionResult('accepted',message_id='synthetic-message')
+
+        graph,sms = Graph(),SMS()
+        first = NotificationWorker(pool,settings,client=graph,sms=sms)
+        await first.tick()
+        restarted = NotificationWorker(pool,settings,client=graph,sms=sms)
+        for _ in range(5):
+            await asyncio.gather(first.tick(),restarted.tick())
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT state FROM public.booking_notification_outbox
+            WHERE booking_id=$1 AND kind='removal'
+        """, ids[-1]),'accepted')
+        self.assertEqual(sms.calls,1)
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT count(*) FROM public.booking_notification_outbox
+            WHERE booking_id=ANY($1::integer[]) AND kind='removal' AND state='held'
+        """, ids[:-1]),10)
+        self.assertEqual(await self.conn.fetchval("""
+            SELECT count(*) FROM public.booking_notification_outbox
+            WHERE booking_id=ANY($1::integer[]) AND kind='removal'
+              AND next_attempt_at > CURRENT_TIMESTAMP
+        """, ids[:-1]),10)
+
+    async def test_0004_shared_pause_stops_later_reads_and_inventory_pages(self):
+        from datetime import datetime, timezone
+        from services.calendar.booking_readback import (
+            AppointmentDetails, BookingReadbackClient, ProviderResult)
+        from services.calendar.provider_admission import inventory_absent
+        from services.scheduling.booking_records import persist_booking_record
+        from services.scheduling.provider_observations import ObservationPoller
+        await self.reset_public()
+        await self.prepare()
+        pool = await self.driver.create_pool(self.dsn,min_size=1,max_size=3)
+        self.addAsyncCleanup(pool.close)
+        start = datetime.now(timezone.utc) + timedelta(days=5)
+        settings = types.SimpleNamespace(
+            automatic_notifications_enabled=True,
+            booking_observation_enabled=True,booking_observation_interval_seconds=60,
+            ms_bookings_tenant_id='tenant',ms_bookings_business_id='business')
+        for n in range(2):
+            await persist_booking_record(
+                pool,call_sid=f'synthetic-pause-{n}',phone_number='+12025550100',
+                client_name='Synthetic',client_email='',
+                accountant_name='Synthetic consultant',appointment_time=start,
+                client_type='individual',language='en',
+                provider_appointment_id=f'synthetic-pause-{n}',notes='',
+                notifications_enabled=True,provider_tenant_id='tenant',
+                provider_business_id='business')
+
+        class Graph:
+            def __init__(self): self.calls = 0
+            async def observe(self, provider_id, expected_start):
+                self.calls += 1
+                await self_conn.execute("""
+                    UPDATE public.booking_provider_observation_control
+                    SET next_request_at=CURRENT_TIMESTAMP + INTERVAL '1 hour'
+                    WHERE singleton=1
+                """)
+                return ProviderResult('present',http_status=200,
+                    details=AppointmentDetails(expected_start,
+                        expected_start + timedelta(minutes=30),None,None,None),
+                    observed_provider_id=provider_id)
+
+        self_conn = self.conn
+        graph = Graph()
+        poller = ObservationPoller(pool,settings,client=graph)
+        self.assertEqual(await poller.tick(),1)
+        self.assertIsNone(poller.last_error_category)
+        self.assertEqual(graph.calls,1)
+        await self.conn.execute("""
+            UPDATE public.booking_provider_observation_control
+            SET next_request_at='-infinity'::timestamptz WHERE singleton=1
+        """)
+
+        class HTTPResponse:
+            status_code = 200
+            headers = {}
+            def json(self): return {'id': 'business'}
+
+        class HTTP:
+            def __init__(self): self.calls = []
+            async def get(self, url, **kwargs):
+                self.calls.append(url)
+                await self_conn.execute("""
+                    UPDATE public.booking_provider_observation_control
+                    SET next_request_at=CURRENT_TIMESTAMP + INTERVAL '1 hour'
+                    WHERE singleton=1
+                """)
+                return HTTPResponse()
+
+        http = HTTP()
+        reader = BookingReadbackClient(settings,client=http)
+        reader._token,reader._token_until = 'synthetic-token',float('inf')
+        async with pool.acquire() as conn:
+            result = await inventory_absent(
+                conn,reader,'synthetic-target','tenant','business')
+        self.assertIsNone(result.absent)
+        self.assertEqual(result.error_category,'throttled')
+        self.assertEqual(len(http.calls),1)  # business only; no collection page
+
+    async def test_0004_inventory_deadline_invalidates_qualifying_404s(self):
+        from datetime import datetime, timezone
+        from services.calendar.booking_readback import (
+            AppointmentDetails, ProviderResult)
+        from services.scheduling.booking_records import persist_booking_record
+        from services.scheduling import provider_observations as observation_module
+        await self.reset_public()
+        await self.prepare()
+        pool = await self.driver.create_pool(self.dsn,min_size=1,max_size=3)
+        self.addAsyncCleanup(pool.close)
+        start = datetime.now(timezone.utc) + timedelta(days=5)
+        settings = types.SimpleNamespace(
+            automatic_notifications_enabled=True,
+            booking_observation_enabled=True,booking_observation_interval_seconds=60,
+            ms_bookings_tenant_id='tenant',ms_bookings_business_id='business')
+        booking_id = await persist_booking_record(
+            pool,call_sid='synthetic-deadline',phone_number='+12025550100',
+            client_name='Synthetic',client_email='',
+            accountant_name='Synthetic consultant',appointment_time=start,
+            client_type='individual',language='en',
+            provider_appointment_id='synthetic-deadline',notes='',
+            notifications_enabled=True,provider_tenant_id='tenant',
+            provider_business_id='business')
+
+        class Graph:
+            mode = 'present'
+            async def observe(self, provider_id, expected_start):
+                if self.mode == 'present':
+                    return ProviderResult('present',http_status=200,
+                        details=AppointmentDetails(expected_start,
+                            expected_start + timedelta(minutes=30),None,None,None),
+                        observed_provider_id=provider_id)
+                return ProviderResult('unavailable',http_status=404)
+            async def inventory_absent(self, *args):
+                await asyncio.sleep(10)
+                raise AssertionError('inventory deadline was not enforced')
+
+        graph = Graph()
+        poller = observation_module.ObservationPoller(pool,settings,client=graph)
+        with (mock.patch.object(observation_module,'TICK_DEADLINE_SECONDS',5.0),
+              mock.patch.object(observation_module,'ROW_TIMEOUT_SECONDS',1.0),
+              mock.patch.object(observation_module,'PERSIST_ALLOWANCE_SECONDS',1.0),
+              mock.patch.object(observation_module,'CLEANUP_ALLOWANCE_SECONDS',1.0)):
+            self.assertEqual(await poller.tick(),1)
+            graph.mode = 'missing'
+            await self.conn.execute("""
+                UPDATE public.booking_provider_observations
+                SET checked_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+                WHERE booking_id=$1
+            """, booking_id)
+            self.assertEqual(await poller.tick(),1)
+            await self.conn.execute("""
+                UPDATE public.booking_provider_observations
+                SET checked_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+                WHERE booking_id=$1
+            """, booking_id)
+            await self.conn.execute("""
+                UPDATE public.booking_notification_reconciliation
+                SET first_missing_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds',
+                    last_missing_at=CURRENT_TIMESTAMP - INTERVAL '61 seconds'
+                WHERE booking_id=$1
+            """, booking_id)
+            self.assertEqual(await poller.tick(),0)
+        self.assertIsNone(poller.last_error_category)
+        state = await self.conn.fetchrow("""
+            SELECT missing_count,last_result,last_error_category
+            FROM public.booking_notification_reconciliation WHERE booking_id=$1
+        """, booking_id)
+        self.assertEqual((state['missing_count'],state['last_result'],
+                          state['last_error_category']),
+                         (0,'check_failed','inventory_timeout'))
+
+    async def test_0004_read_start_fence_and_worker_404_cannot_count(self):
+        from datetime import datetime, timezone
+        from services.calendar.booking_readback import ProviderResult
+        from services.scheduling.removal_reconciliation import ingest_observation
+        await self.reset_public()
+        await self.prepare()
+        start = datetime.now(timezone.utc) + timedelta(days=5)
+        booking_id = await self.conn.fetchval("""
+            INSERT INTO public.bookings
+                (call_sid,phone_number,accountant_name,appointment_time_utc,
+                 language,status,ms_booking_id)
+            VALUES ('synthetic-fence','+12025550100','Synthetic consultant',
+                    $1,'en','confirmed','synthetic-fence') RETURNING id
+        """, start)
+        row = dict(id=booking_id,ms_booking_id='synthetic-fence',
+                   appointment_time_utc=start,status='confirmed')
+        clock = await self.conn.fetchval('SELECT clock_timestamp()')
+        older = clock - timedelta(seconds=2)
+        newer = clock - timedelta(seconds=1)
+        await ingest_observation(self.conn,row,ProviderResult('present',http_status=200),
+                                 'tenant','business',read_started_at=newer)
+        await ingest_observation(self.conn,row,ProviderResult('unavailable',http_status=404),
+                                 'tenant','business',read_started_at=older)
+        state = await self.conn.fetchrow("""
+            SELECT missing_count,last_result FROM public.booking_notification_reconciliation
+            WHERE booking_id=$1
+        """, booking_id)
+        self.assertEqual((state['missing_count'],state['last_result']),(0,'present'))
+        later = clock + timedelta(seconds=1)
+        await ingest_observation(self.conn,row,ProviderResult('unavailable',http_status=404),
+                                 'tenant','business',read_started_at=later,
+                                 count_missing=False)
+        state = await self.conn.fetchrow("""
+            SELECT missing_count,last_result FROM public.booking_notification_reconciliation
+            WHERE booking_id=$1
+        """, booking_id)
+        self.assertEqual((state['missing_count'],state['last_result']),(0,'check_failed'))
+
     async def test_0003_upgrades_exact_0002_history_without_historical_backfill(self):
         contract = importlib.import_module("migrations.schema_contract")
         await self.reset_public()
@@ -1660,7 +2689,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         """)
         before = await self.conn.fetch("SELECT * FROM public.bookings")
         self.assertEqual(await self.migrate(False), "pending 0003")
-        self.assertEqual(await self.prepare(), "applied 0003")
+        self.assertEqual(await self.prepare(), "applied 0004")
         self.assertEqual(await self.conn.fetch("SELECT * FROM public.bookings"), before)
         self.assertEqual(await self.conn.fetchval(
             "SELECT count(*) FROM public.booking_provider_observations"), 0)
@@ -1669,9 +2698,9 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             "WHERE singleton=1 AND next_request_at < CURRENT_TIMESTAMP"), 1)
         history = await self.conn.fetch(
             "SELECT version FROM public.schema_migrations ORDER BY version")
-        self.assertEqual([row["version"] for row in history], ["0001", "0002", "0003"])
+        self.assertEqual([row["version"] for row in history], ["0001", "0002", "0003", "0004"])
         snapshot = await self.snapshot()
-        self.assertEqual(await self.prepare(), "up-to-date 0003")
+        self.assertEqual(await self.prepare(), "up-to-date 0004")
         self.assertEqual(await self.snapshot(), snapshot)
 
     async def test_0003_rollback_and_schema_history_drift_are_detected(self):
@@ -1702,7 +2731,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(self.runner.MigrationError, "migration failed"):
                 await self.prepare()
         self.assertEqual(await self.snapshot(), before)
-        self.assertEqual(await self.prepare(), "applied 0003")
+        self.assertEqual(await self.prepare(), "applied 0004")
         for change in (
             "ALTER TABLE public.booking_provider_observations DROP CONSTRAINT booking_observation_outcome_check",
             "ALTER TABLE public.booking_provider_observations ALTER checked_at DROP NOT NULL",

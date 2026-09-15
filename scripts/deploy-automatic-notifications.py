@@ -1,0 +1,949 @@
+"""Owner-run T049-B 0004 notification rollout; no action occurs on import.
+
+The script itself is fetched from an exact reviewed commit. Every staged source
+file is read from that same commit. Public output contains only fixed markers.
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import unquote, urlsplit
+
+
+ROOT = Path('/opt/ai-phone-system-v2')
+BASE_CHECKOUT = '1480eeb0e36596e26d0dedde77f08beee91aec5b'
+DEPLOYED_SOURCE = '424ee6ada7244bf7b8f89b2e3fbb50255b77a1de'
+OLD_IMAGE = 'sha256:2ac002d96da4541ed08e0f221bb559bc4c70d9762b3fab5735c81d92171459ea'
+NGINX_HASH = '59ac9bdaa9a86c1022a573c9709faddf7e93a53015da8acfcc4330b3e288f3ab'
+SQL_HASHES = {
+    'migrations/bootstrap_schema.sql': '1c72bbe0a120860902c565e5573c05ad1cd640891a42bb35cca2c6e0876f31e8',
+    'migrations/0001_admin_users_updated_at.sql': '53c861ac91cae5ecaf9f794b15563c88ee58bc0dafa5ae64fa81c89d907aa3a9',
+    'migrations/0002_bookings_aware_time.sql': '62addab700e047dff2a13973c881a874bfe6c7f88967d593f189987192782be6',
+    'migrations/0003_booking_provider_observations.sql': 'b3abaa09c340f89c32778b0b17b5c2a584845983b13eb95dbb9c366f3d6c5830',
+    'migrations/0004_appointment_notifications.sql': 'a1c66c7705adbd49918966c7d41d8bbbc5e80d3d5d0534fe641fd15579731a9e',
+}
+RUNTIME_PATHS = (
+    'api/main.py',
+    'config/settings.py',
+    'services/database.py',
+    'migrations/runner.py',
+    'migrations/schema_contract.py',
+    'migrations/0004_appointment_notifications.sql',
+    'services/calendar/booking_readback.py',
+    'services/calendar/provider_admission.py',
+    'services/scheduling/booking_records.py',
+    'services/scheduling/provider_observations.py',
+    'services/scheduling/removal_reconciliation.py',
+    'services/sms/notification_text.py',
+    'services/sms/notification_outbox.py',
+    'services/sms/notification_worker.py',
+    'services/sms/telnyx_submission.py',
+    'services/sms/telnyx_sms_service.py',
+    'services/conversation/orchestrator.py',
+    'services/dashboard/dashboard_routes.py',
+    'templates/dashboard.html',
+)
+SOURCE_SCOPE = frozenset((*RUNTIME_PATHS, 'docker-compose.yml'))
+OBSERVATION_ENV = {
+    'BOOKING_OBSERVATION_ENABLED': 'true',
+    'BOOKING_OBSERVATION_INTERVAL_SECONDS': '60',
+    'BOOKING_OBSERVATION_FRESHNESS_SECONDS': '180',
+}
+NOTIFICATION_ENV = {
+    'AUTOMATIC_NOTIFICATIONS_ENABLED': 'true',
+    'AUTOMATIC_NOTIFICATIONS_INTERVAL_SECONDS': '60',
+}
+OBSERVATION_SETTINGS = {
+    'booking_observation_enabled': True,
+    'booking_observation_interval_seconds': 60,
+    'booking_observation_freshness_seconds': 180,
+}
+NOTIFICATION_SETTINGS = {
+    'automatic_notifications_enabled': True,
+    'automatic_notifications_interval_seconds': 60,
+}
+PAUSED_ENV = 'AUTOMATIC_NOTIFICATION_WORKERS_PAUSED'
+PAUSED_SETTING = 'automatic_notification_workers_paused'
+SETTINGS_TARGET = '/app/config/settings.py'
+PRESERVED_TABLES = (
+    'admin_sessions', 'admin_users', 'analytics_events', 'api_usage',
+    'appointments', 'bookings', 'call_logs', 'callers', 'calls',
+    'conversation_turns', 'conversations', 'knowledge_articles', 'mfa_codes',
+    'sms_logs', 'system_metrics', 'tenants', 'users',
+    'booking_provider_observations', 'booking_provider_observation_control',
+)
+SETTINGS = ('import json; from config.settings import settings; '
+            'print(json.dumps(settings.model_dump(mode="json"),sort_keys=True))')
+
+# Read-only probes are deliberately separate: the running image knows only 0003.
+CHECK_0003 = '''import asyncio,os,asyncpg
+from migrations.schema_contract import check_runtime_compatibility
+async def check():
+ c=await asyncpg.connect(os.environ['MIGRATION_DATABASE_URL'],timeout=10,command_timeout=10)
+ try:
+  async with c.transaction(readonly=True):
+   await check_runtime_compatibility(c)
+   rows=await c.fetch('SELECT version,checksum FROM public.schema_migrations ORDER BY version')
+   if [(r['version'],r['checksum']) for r in rows]!=[
+    ('0001','53c861ac91cae5ecaf9f794b15563c88ee58bc0dafa5ae64fa81c89d907aa3a9'),
+    ('0002','62addab700e047dff2a13973c881a874bfe6c7f88967d593f189987192782be6'),
+    ('0003','b3abaa09c340f89c32778b0b17b5c2a584845983b13eb95dbb9c366f3d6c5830')]:
+    raise RuntimeError('0003 history differs')
+   if await c.fetchval("SELECT to_regclass('public.booking_notification_outbox')") is not None:
+    raise RuntimeError('0004 table already exists')
+ finally:
+  await c.close(timeout=5)
+asyncio.run(check())
+'''
+CHECK_0004 = '''import asyncio,os,asyncpg
+from migrations.schema_contract import check_runtime_compatibility
+async def check():
+ c=await asyncpg.connect(os.environ['MIGRATION_DATABASE_URL'],timeout=10,command_timeout=10)
+ try:
+  async with c.transaction(readonly=True):
+   await check_runtime_compatibility(c,require_notification=True)
+   rows=await c.fetch('SELECT version,checksum FROM public.schema_migrations ORDER BY version')
+   if [(r['version'],r['checksum']) for r in rows]!=[
+    ('0001','53c861ac91cae5ecaf9f794b15563c88ee58bc0dafa5ae64fa81c89d907aa3a9'),
+    ('0002','62addab700e047dff2a13973c881a874bfe6c7f88967d593f189987192782be6'),
+    ('0003','b3abaa09c340f89c32778b0b17b5c2a584845983b13eb95dbb9c366f3d6c5830'),
+    ('0004','a1c66c7705adbd49918966c7d41d8bbbc5e80d3d5d0534fe641fd15579731a9e')]:
+    raise RuntimeError('0004 history differs')
+ finally:
+  await c.close(timeout=5)
+asyncio.run(check())
+'''
+FINGERPRINT_CODE = '''import asyncio,json,os,asyncpg
+TABLES = ''' + repr(PRESERVED_TABLES) + '''
+async def check():
+ c=await asyncpg.connect(os.environ['MIGRATION_DATABASE_URL'],timeout=10,command_timeout=15)
+ try:
+  async with c.transaction(readonly=True):
+   hashes={}
+   row_counts={}
+   for table in TABLES:
+    sql="SELECT md5(COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text)::text,'[]')) FROM public."+chr(34)+table+chr(34)+" t"
+    hashes[table]=await c.fetchval(sql)
+    row_counts[table]=await c.fetchval('SELECT count(*) FROM public.'+chr(34)+table+chr(34))
+   counts=await c.fetchrow('SELECT count(*) FILTER (WHERE appointment_time_utc IS NOT NULL) AS aware, count(*) FILTER (WHERE appointment_time_utc IS NULL AND appointment_time IS NOT NULL) AS naive FROM public.bookings')
+   print(json.dumps({'hashes':hashes,'row_counts':row_counts,'aware':counts['aware'],'naive':counts['naive']},sort_keys=True))
+ finally:
+  await c.close(timeout=5)
+asyncio.run(check())
+'''
+CHECK_EMPTY_NOTIFICATIONS = '''import asyncio,os,asyncpg
+async def check():
+ c=await asyncpg.connect(os.environ['MIGRATION_DATABASE_URL'],timeout=10,command_timeout=10)
+ try:
+  async with c.transaction(readonly=True):
+   for table in ('booking_notification_reconciliation','booking_notification_outbox'):
+    if await c.fetchval('SELECT count(*) FROM public.'+table) != 0:
+     raise RuntimeError('notification rehearsal is not empty')
+ finally:
+  await c.close(timeout=5)
+asyncio.run(check())
+'''
+CHECK_PAUSED_BOOKING_PATH = '''import asyncio,os
+from datetime import datetime,timedelta,timezone
+import asyncpg
+from services.scheduling.booking_records import persist_booking_record
+async def check():
+ pool=await asyncpg.create_pool(os.environ['MIGRATION_DATABASE_URL'],min_size=1,max_size=2)
+ try:
+  async with pool.acquire() as c:
+   before=await c.fetchval('SELECT count(*) FROM public.sms_logs')
+   if await c.fetchval("SELECT count(*) FROM public.bookings WHERE call_sid='t049b-rehearsal-booking'"):
+    raise RuntimeError('synthetic booking identity already exists')
+  booking_id=await persist_booking_record(
+   pool,call_sid='t049b-rehearsal-booking',phone_number='+12025550100',
+   client_name='Synthetic',client_email='',accountant_name='Synthetic consultant',
+   appointment_time=datetime.now(timezone.utc)+timedelta(days=2),
+   client_type='individual',language='en',provider_appointment_id='t049b-rehearsal-provider',
+   notes='synthetic release rehearsal',notifications_enabled=True,
+   provider_tenant_id='synthetic-tenant',provider_business_id='synthetic-business')
+  async with pool.acquire() as c:
+   jobs=await c.fetch("SELECT kind,state FROM public.booking_notification_outbox WHERE booking_id=$1 ORDER BY kind",booking_id)
+   if [(r['kind'],r['state']) for r in jobs] != [('confirmation','held'),('reminder','held')]:
+    raise RuntimeError('paused booking jobs differ')
+   if await c.fetchval('SELECT count(*) FROM public.booking_notification_reconciliation WHERE booking_id=$1',booking_id)!=1:
+    raise RuntimeError('paused booking reconciliation missing')
+   if await c.fetchval('SELECT count(*) FROM public.sms_logs')!=before:
+    raise RuntimeError('legacy direct SMS path changed')
+ finally:
+  await pool.close()
+asyncio.run(check())
+'''
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def mount_fingerprint(mounts: list[dict]) -> list[str]:
+    """Docker may reorder mounts; preserve every field and duplicate count."""
+    return sorted(json.dumps(mount, sort_keys=True) for mount in mounts)
+
+
+def settings_for(previous: dict, *, paused: bool | None) -> dict:
+    expected = dict(previous)
+    if paused is not None:
+        if any(previous.get(key) != value for key, value in OBSERVATION_SETTINGS.items()):
+            raise RuntimeError('previous observation settings differ')
+        if NOTIFICATION_SETTINGS.keys() & previous.keys() or PAUSED_SETTING in previous:
+            raise RuntimeError('previous notification settings unexpectedly exist')
+        expected.update(NOTIFICATION_SETTINGS)
+        expected[PAUSED_SETTING] = paused
+    return expected
+
+
+def normalized_compose(config: dict, *, paused: bool | None,
+                       settings_source: str | Path) -> dict:
+    value = copy.deepcopy(config)
+    app = value['services']['app']
+    app['image'] = '<app-image>'
+    environment = app.get('environment') or {}
+    if not isinstance(environment, dict):
+        raise RuntimeError('rendered app environment is not a mapping')
+    if paused is not None:
+        for key, expected in NOTIFICATION_ENV.items():
+            if str(environment.pop(key, None)) != expected:
+                raise RuntimeError('notification environment differs')
+        if str(environment.pop(PAUSED_ENV, None)).lower() != str(paused).lower():
+            raise RuntimeError('notification pause environment differs')
+    app['environment'] = environment
+    mounts = app.get('volumes', [])
+    overlays = [m for m in mounts if m.get('target') == SETTINGS_TARGET]
+    if (len(overlays) != 1 or overlays[0].get('source') != str(settings_source)
+            or overlays[0].get('type') != 'bind'
+            or overlays[0].get('read_only') is not True):
+        raise RuntimeError('pinned settings mount differs')
+    overlays[0]['source'] = '<settings-source>'
+    app['volumes'] = sorted(mounts, key=lambda item: json.dumps(item, sort_keys=True))
+    value['services']['migrate']['image'] = '<migration-image>'
+    return value
+
+
+class Release:
+    def __init__(self, directory: Path, commit: str):
+        self.directory = directory
+        self.commit = commit
+        self.root = ROOT
+        self.old = None
+        self.previous_settings = None
+        self.network = None
+        self.pg_image = None
+        self.live_env = None
+        self.db = None
+        self.stage = 'preflight'
+        self.settings_overlay = self.directory / 'candidate-settings.py'
+        self.previous_settings_source = None
+
+    def private_write(self, name: str, data: bytes) -> Path:
+        path = self.directory / name
+        if path.is_symlink():
+            raise RuntimeError('private path is a symlink')
+        with path.open('xb') as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        path.chmod(0o600)
+        return path
+
+    def run(self, *args, timeout=60, check=True):
+        try:
+            result = subprocess.run(args, cwd=self.root, capture_output=True,
+                                    timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as error:
+            with (self.directory / 'private.log').open('ab') as log:
+                log.write((error.stdout or b'') + (error.stderr or b''))
+            raise RuntimeError('command timed out; protected log retained') from None
+        except OSError:
+            raise RuntimeError('command unavailable; protected log retained') from None
+        with (self.directory / 'private.log').open('ab') as log:
+            log.write(result.stdout + result.stderr)
+        if check and result.returncode:
+            raise RuntimeError('command failed; protected log retained')
+        return result
+
+    def inspect(self, name: str) -> dict:
+        return json.loads(self.run('docker', 'inspect', name).stdout)[0]
+
+    def compose(self, override: Path, *args, **kwargs):
+        return self.run('docker', 'compose', '--project-directory', str(self.root),
+                        '-p', 'ai-phone-system-v2', '-f', str(self.root / 'docker-compose.yml'),
+                        '-f', str(override), *args, **kwargs)
+
+    def settings(self, name: str = 'ai-voice-app') -> dict:
+        return json.loads(self.run('docker', 'exec', name,
+                                   'python', '-c', SETTINGS).stdout)
+
+    def public_health(self) -> None:
+        for _ in range(12):
+            result = self.run('curl', '-fsS', '--max-time', '5',
+                              'https://aiagent.ghaben.ca:8443/health', check=False)
+            if result.returncode == 0:
+                try:
+                    if json.loads(result.stdout).get('status') == 'healthy':
+                        return
+                except ValueError:
+                    pass
+            time.sleep(1)
+        raise RuntimeError('public certificate-validated HTTPS health failed')
+
+    def wait_ready(self, name: str = 'ai-voice-app') -> None:
+        for _ in range(60):
+            result = self.run('docker', 'exec', name, 'curl', '-fsS',
+                              '--max-time', '3', 'http://localhost:8000/ready', check=False)
+            if result.returncode == 0:
+                try:
+                    if json.loads(result.stdout).get('status') == 'ready':
+                        return
+                except ValueError:
+                    pass
+            time.sleep(2)
+        raise RuntimeError('application readiness deadline exceeded')
+
+    def verify_source(self) -> None:
+        if self.run('git', 'rev-parse', 'HEAD').stdout.decode().strip() != BASE_CHECKOUT:
+            raise RuntimeError('server checkout changed')
+        for revision in (DEPLOYED_SOURCE, self.commit):
+            if self.run('git', 'rev-parse', revision + '^{commit}').stdout.decode().strip() != revision:
+                raise RuntimeError('release source unavailable')
+            if self.run('git', 'merge-base', '--is-ancestor', BASE_CHECKOUT, revision,
+                        check=False).returncode != 0:
+                raise RuntimeError('release source is not descended from server baseline')
+        if self.run('git', 'merge-base', '--is-ancestor', DEPLOYED_SOURCE, self.commit,
+                    check=False).returncode != 0:
+            raise RuntimeError('release source is not descended from deployed app')
+        if self.run('git', 'status', '--porcelain', '--untracked-files=no').stdout.decode().strip() != 'M nginx/nginx.conf':
+            raise RuntimeError('unexpected server checkout modification')
+        if sha256((self.root / 'nginx/nginx.conf').read_bytes()) != NGINX_HASH:
+            raise RuntimeError('nginx hotfix changed')
+        paths = self.run('git', 'diff', '--name-only', DEPLOYED_SOURCE, self.commit, '--',
+                         'api', 'config', 'migrations', 'services', 'templates',
+                         'docker-compose.yml', 'requirements.txt', 'Dockerfile').stdout.decode().splitlines()
+        if len(paths) != len(SOURCE_SCOPE) or set(paths) != SOURCE_SCOPE:
+            raise RuntimeError('release source exceeds reviewed runtime scope')
+        for path, expected in SQL_HASHES.items():
+            data = self.run('git', 'show', self.commit + ':' + path).stdout
+            if b'\r' in data or sha256(data) != expected:
+                raise RuntimeError('release SQL differs from reviewed LF bytes')
+        compose_source = self.run('git', 'show', self.commit + ':docker-compose.yml').stdout
+        compose_keys = (*OBSERVATION_ENV, *NOTIFICATION_ENV, PAUSED_ENV)
+        if any(key.encode() not in compose_source for key in compose_keys):
+            raise RuntimeError('reviewed Compose notification mapping missing')
+        self.run('git', 'cat-file', '-e', self.commit + ':scripts/deploy-automatic-notifications.py')
+
+    def capacity(self) -> None:
+        if shutil.disk_usage(self.root).free < 1024 ** 3:
+            raise RuntimeError('insufficient release disk capacity')
+        meminfo = Path('/proc/meminfo').read_text()
+        match = re.search(r'^MemAvailable:\s+(\d+) kB$', meminfo, re.MULTILINE)
+        if match is None or int(match.group(1)) < 512 * 1024:
+            raise RuntimeError('insufficient release memory capacity')
+
+    def preflight(self) -> dict:
+        self.verify_source()
+        self.capacity()
+        override = self.root / 'docker-compose.override.yml'
+        if (override.is_symlink() or override.stat().st_uid != 0
+                or override.stat().st_mode & 0o077 or not stat.S_ISREG(override.stat().st_mode)):
+            raise RuntimeError('private override is not root protected')
+        original = override.read_bytes()
+        configuration = json.loads(original)
+        if configuration['services']['app']['image'] != OLD_IMAGE:
+            raise RuntimeError('private override does not pin running image')
+        old = self.inspect('ai-voice-app')
+        if (old['Image'] != OLD_IMAGE or not old['State']['Running']
+                or old['State'].get('Health', {}).get('Status') != 'healthy'
+                or old['Config']['Labels'].get('org.opencontainers.image.revision') != DEPLOYED_SOURCE
+                or old['Config']['Labels'].get('com.docker.compose.project') != 'ai-phone-system-v2'):
+            raise RuntimeError('running app does not match accepted image/source')
+        nginx = self.inspect('ai-voice-nginx')
+        if (not nginx['State']['Running']
+                or nginx['Config'].get('StopSignal', '').upper() not in ('SIGQUIT', 'QUIT', '3')):
+            raise RuntimeError('nginx is not ready for graceful stop')
+        if not self.inspect('ai-voice-redis')['State']['Running']:
+            raise RuntimeError('redis is not running')
+        self.run('docker', 'exec', 'ai-voice-nginx', 'nginx', '-t')
+        previous_settings = self.settings()
+        settings_for(previous_settings, paused=True)
+        required_provider = (
+            'ms_bookings_tenant_id', 'ms_bookings_client_id',
+            'ms_bookings_client_secret', 'ms_bookings_business_id',
+            'telnyx_api_key', 'telnyx_phone_number')
+        if any(not isinstance(previous_settings.get(key), str)
+               or not previous_settings[key].strip() for key in required_provider):
+            raise RuntimeError('required notification provider configuration missing')
+        if not re.fullmatch(r'\+[1-9][0-9]{7,14}',
+                            previous_settings['telnyx_phone_number']):
+            raise RuntimeError('notification sender number format invalid')
+        url = previous_settings['database_url']
+        if not isinstance(url, str) or '\r' in url or '\n' in url:
+            raise RuntimeError('invalid live database target')
+        parsed = urlsplit(url)
+        db = self.inspect('ai-voice-db')
+        db_env = dict(item.split('=', 1) for item in db['Config']['Env'])
+        expected_db = db_env.get('POSTGRES_DB', db_env.get('POSTGRES_USER', 'postgres'))
+        common = set(old['NetworkSettings']['Networks']) & set(db['NetworkSettings']['Networks'])
+        if (len(common) != 1 or not db['State']['Running']
+                or db['State'].get('Health', {}).get('Status') != 'healthy'):
+            raise RuntimeError('database network or health changed')
+        network, = common
+        network_info = db['NetworkSettings']['Networks'][network]
+        hosts = {'db', 'ai-voice-db', network_info['IPAddress'], *(network_info.get('Aliases') or [])}
+        if parsed.hostname not in hosts or unquote(parsed.path.lstrip('/')) != expected_db:
+            raise RuntimeError('application and database targets differ')
+        pg_image = db['Image']
+        if 'PG_MAJOR=16' not in self.inspect(pg_image)['Config']['Env']:
+            raise RuntimeError('PostgreSQL 16 image required')
+        self.run('docker', 'inspect', OLD_IMAGE)
+        self.public_health()
+        self.old, self.previous_settings = old, previous_settings
+        overlays = [mount for mount in old['Mounts']
+                    if mount['Destination'] == SETTINGS_TARGET]
+        if (len(overlays) != 1 or overlays[0].get('Type') != 'bind'
+                or overlays[0].get('RW')):
+            raise RuntimeError('existing settings overlay differs')
+        self.previous_settings_source = overlays[0]['Source']
+        configured_mounts = configuration['services']['app'].get('volumes', [])
+        configured_overlays = [mount for mount in configured_mounts
+                               if isinstance(mount, dict)
+                               and mount.get('target') == SETTINGS_TARGET]
+        if (len(configured_overlays) != 1
+                or configured_overlays[0].get('type') != 'bind'
+                or configured_overlays[0].get('source') != self.previous_settings_source
+                or configured_overlays[0].get('read_only') is not True):
+            raise RuntimeError('private settings overlay and running mount differ')
+        self.network, self.pg_image, self.db = network, pg_image, db
+        self.private_write('previous-override.json', original)
+        self.private_write('previous-settings.json', json.dumps(previous_settings).encode())
+        self.private_write('previous-app.json', json.dumps(old).encode())
+        self.private_write('compose.sha256', sha256((self.root / 'docker-compose.yml').read_bytes()).encode())
+        self.live_env = self.private_write('migration.env',
+                                           ('MIGRATION_DATABASE_URL=' + url + '\n').encode())
+        if not self.schema_matches(OLD_IMAGE, current=False):
+            raise RuntimeError('live database is not the exact 0003 predecessor')
+        print('PREFLIGHT_0003_AND_HTTPS_OK', flush=True)
+        return configuration
+
+    def remove_container(self, name: str) -> None:
+        self.run('docker', 'rm', '-f', name, check=False)
+        remaining = self.run('docker', 'ps', '-a', '--format', '{{.Names}}')
+        if name in remaining.stdout.decode().splitlines():
+            raise RuntimeError('tracked container cleanup unverified')
+
+    def remove_network(self, name: str) -> None:
+        self.run('docker', 'network', 'rm', name, check=False)
+        remaining = self.run('docker', 'network', 'ls', '--format', '{{.Name}}')
+        if name in remaining.stdout.decode().splitlines():
+            raise RuntimeError('tracked network cleanup unverified')
+
+    def one_shot(self, image: str, network: str, env_file: Path,
+                 arguments: list[str], *, check=True):
+        name = 't049b-job-' + self.directory.name
+        try:
+            return self.run('docker', 'run', '--name', name, '--pull', 'never',
+                            '--network', network, '--memory', '192m', '--cpus', '1',
+                            '--pids-limit', '96', '--env-file', str(env_file),
+                            '--entrypoint', 'python', image, *arguments,
+                            timeout=120, check=check)
+        finally:
+            self.remove_container(name)
+
+    def schema_matches(self, image: str, *, current: bool,
+                       network: str | None = None, env_file: Path | None = None) -> bool:
+        result = self.one_shot(image, network or self.network,
+                               env_file or self.live_env,
+                               ['-c', CHECK_0004 if current else CHECK_0003],
+                               check=False)
+        return result.returncode == 0
+
+    def fingerprint(self, image: str, network: str, env_file: Path) -> dict:
+        data = self.one_shot(image, network, env_file, ['-c', FINGERPRINT_CODE]).stdout
+        value = json.loads(data)
+        if (set(value['hashes']) != set(PRESERVED_TABLES)
+                or set(value.get('row_counts', {})) != set(PRESERVED_TABLES)
+                or any(not re.fullmatch('[0-9a-f]{32}', digest)
+                       for digest in value['hashes'].values())
+                or any(not isinstance(count, int) or count < 0
+                       for count in value['row_counts'].values())
+                or not isinstance(value['aware'], int)
+                or not isinstance(value['naive'], int)):
+            raise RuntimeError('business fingerprint invalid')
+        return value
+
+    def build(self, label: str, paths: tuple[str, ...]) -> str:
+        if label != 'candidate' or paths != RUNTIME_PATHS:
+            raise RuntimeError('image copy scope differs')
+        parent = 'ai-phone-t049b-parent:' + self.directory.name
+        self.run('docker', 'tag', OLD_IMAGE, parent)
+        if self.inspect(parent)['Id'] != OLD_IMAGE:
+            raise RuntimeError('build parent image changed')
+        context = self.directory / ('build-' + label)
+        context.mkdir(mode=0o700)
+        for path in paths:
+            target = context / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(self.run('git', 'show', self.commit + ':' + path).stdout)
+        dockerfile = 'FROM ' + parent + '\n' + ''.join(
+            'COPY ' + path + ' /app/' + path + '\n' for path in paths)
+        (context / 'Dockerfile').write_text(dockerfile, encoding='utf-8', newline='\n')
+        tag = 'ai-phone-t049b-' + label + ':' + self.directory.name
+        labels = ['--label', 'org.opencontainers.image.revision=' + self.commit]
+        self.run('docker', 'build', '--network', 'none', '--pull=false',
+                 *labels, '-t', tag, str(context), timeout=300)
+        built = self.inspect(tag)
+        image = built['Id']
+        if not image.startswith('sha256:'):
+            raise RuntimeError('built image has no immutable ID')
+        revision = built['Config']['Labels'].get('org.opencontainers.image.revision')
+        if revision != self.commit:
+            raise RuntimeError('built image source label differs')
+        return image
+
+    def settings_probe(self, override: Path, label: str) -> dict:
+        name = 't049b-settings-' + label + '-' + self.directory.name
+        try:
+            result = self.compose(override, 'run', '--rm', '--no-deps',
+                                  '--pull', 'never',
+                                  '--name', name, '--entrypoint', 'python',
+                                  'app', '-c', SETTINGS, timeout=90)
+            return json.loads(result.stdout)
+        finally:
+            self.remove_container(name)
+
+    def prepare_override(self, label: str, image: str, original: dict) -> Path:
+        if label not in ('active', 'paused'):
+            raise RuntimeError('unknown release variant')
+        paused = label == 'paused'
+        config = copy.deepcopy(original)
+        app = config['services']['app']
+        app['image'] = image
+        config['services']['migrate']['image'] = image
+        environment = app.setdefault('environment', {})
+        if not isinstance(environment, dict):
+            raise RuntimeError('private application environment differs')
+        for key, expected in OBSERVATION_ENV.items():
+            if str(environment.get(key, '')).lower() != expected:
+                raise RuntimeError('private observation environment differs')
+        if NOTIFICATION_ENV.keys() & environment.keys() or PAUSED_ENV in environment:
+            raise RuntimeError('private notification environment unexpectedly exists')
+        environment.update(NOTIFICATION_ENV)
+        environment[PAUSED_ENV] = str(paused).lower()
+        mounts = app.setdefault('volumes', [])
+        if not isinstance(mounts, list):
+            raise RuntimeError('private application mounts differ')
+        overlays = [m for m in mounts if isinstance(m, dict)
+                    and m.get('target') == SETTINGS_TARGET]
+        if (len(overlays) != 1 or overlays[0].get('type') != 'bind'
+                or overlays[0].get('source') != self.previous_settings_source
+                or overlays[0].get('read_only') is not True):
+            raise RuntimeError('private settings mount differs')
+        overlays[0]['source'] = str(self.settings_overlay)
+        path = self.private_write(label + '-override.json',
+                                  (json.dumps(config, indent=2) + '\n').encode())
+        previous = self.directory / 'previous-override.json'
+        baseline = json.loads(self.compose(previous, 'config', '--format', 'json').stdout)
+        rendered = json.loads(self.compose(path, 'config', '--format', 'json').stdout)
+        if (normalized_compose(rendered, paused=paused,
+                               settings_source=self.settings_overlay)
+                != normalized_compose(
+                    baseline, paused=None,
+                    settings_source=self.previous_settings_source)):
+            raise RuntimeError('effective Compose configuration changed')
+        rendered_app = rendered['services']['app']
+        old_mounts = sorted(
+            (str(self.settings_overlay) if m['Destination'] == SETTINGS_TARGET
+             else m['Source'], m['Destination'], not m['RW'])
+            for m in self.old['Mounts'])
+        new_mounts = sorted((m['source'], m['target'], m.get('read_only', False))
+                            for m in rendered_app['volumes'])
+        new_networks = {rendered['networks'][n]['name'] for n in rendered_app['networks']}
+        if (new_mounts != old_mounts
+                or new_networks != set(self.old['NetworkSettings']['Networks'])):
+            raise RuntimeError('effective mounts or networks changed')
+        if self.settings_probe(path, label) != settings_for(
+                self.previous_settings, paused=paused):
+            raise RuntimeError('effective application settings changed')
+        return path
+
+    def stream(self, command: list[str], *, source=None, destination=None,
+               timeout=180) -> None:
+        try:
+            with (self.directory / 'private.log').open('ab') as log:
+                result = subprocess.run(command, cwd=self.root, stdin=source,
+                                        stdout=destination or log, stderr=log,
+                                        timeout=timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeError('backup or restore command unavailable or timed out') from None
+        if result.returncode:
+            raise RuntimeError('backup or restore command failed')
+
+    def backup(self, name: str) -> Path:
+        path = self.directory / name
+        with path.open('xb') as output:
+            self.stream(['docker', 'exec', 'ai-voice-db', 'sh', '-c',
+                         'exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc'],
+                        destination=output)
+            output.flush()
+            os.fsync(output.fileno())
+        path.chmod(0o600)
+        if path.stat().st_size == 0:
+            raise RuntimeError('empty protected backup')
+        with path.open('rb') as source:
+            self.stream(['docker', 'exec', '-i', 'ai-voice-db', 'pg_restore', '--list'],
+                        source=source)
+        digest = hashlib.sha256()
+        with path.open('rb') as source:
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(block)
+        self.private_write(name + '.sha256', (digest.hexdigest() + '\n').encode())
+        print('PROTECTED_BACKUP_VERIFIED=' + name, flush=True)
+        return path
+
+    def wait_for_rehearsal_database(self, name: str) -> None:
+        for _ in range(60):
+            result = self.run('docker', 'exec', '-e', 'PGPASSWORD=synthetic',
+                              '-e', 'PGCONNECT_TIMEOUT=2', name,
+                              'psql', '-X', '-w', '-A', '-t', '-h', '127.0.0.1',
+                              '-U', 'rehearsal', '-d', 'rehearsal',
+                              '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT current_database()',
+                              timeout=5, check=False)
+            if result.returncode == 0 and result.stdout.strip() == b'rehearsal':
+                return
+            time.sleep(1)
+        raise RuntimeError('authenticated rehearsal database not ready')
+
+    def rehearsal(self, candidate: str, archive: Path) -> None:
+        network = 't049b-net-' + self.directory.name
+        db = 't049b-db-' + self.directory.name
+        app = 't049b-app-' + self.directory.name
+        env_file = self.private_write(
+            'synthetic.env',
+            ('MIGRATION_DATABASE_URL=postgresql://rehearsal:synthetic@'
+             + db + ':5432/rehearsal\n').encode())
+        try:
+            self.run('docker', 'network', 'create', '--internal', network)
+            self.run('docker', 'run', '-d', '--name', db, '--pull', 'never',
+                     '--network', network, '--memory', '192m', '--cpus', '0.5',
+                     '--pids-limit', '96', '--tmpfs',
+                     '/var/lib/postgresql/data:rw,noexec,nosuid,size=128m',
+                     '-e', 'PGDATA=/var/lib/postgresql/data/pgdata',
+                     '-e', 'POSTGRES_USER=rehearsal', '-e', 'POSTGRES_PASSWORD=synthetic',
+                     '-e', 'POSTGRES_DB=rehearsal', self.pg_image,
+                     '-c', 'shared_buffers=16MB', '-c', 'max_connections=12')
+            self.wait_for_rehearsal_database(db)
+            with archive.open('rb') as source:
+                self.stream(['docker', 'exec', '-i', '-e', 'PGPASSWORD=synthetic',
+                             db, 'pg_restore', '-h', '127.0.0.1', '--no-password',
+                             '--exit-on-error', '--single-transaction', '--no-owner',
+                             '--no-acl', '-U', 'rehearsal', '-d', 'rehearsal'], source=source)
+            before = self.fingerprint(OLD_IMAGE, network, env_file)
+            if before['aware'] < 1 or before['naive'] < 1:
+                raise RuntimeError('rehearsal lacks expected aware/naive booking history')
+            if (before['row_counts']['booking_provider_observations'] < 1
+                    or before['row_counts']['booking_provider_observation_control'] != 1):
+                raise RuntimeError('rehearsal lacks expected observation history')
+            # Candidate understands the equivalent CHECK serialization produced
+            # by pg_restore. Old live-image compatibility was checked preflight.
+            if not self.schema_matches(candidate, current=False,
+                                       network=network, env_file=env_file):
+                raise RuntimeError('restored predecessor schema differs')
+            self.one_shot(candidate, network, env_file,
+                          ['-m', 'migrations.runner', '--prepare'])
+            repeat = self.one_shot(candidate, network, env_file,
+                                   ['-m', 'migrations.runner', '--prepare'])
+            if repeat.stdout.strip() != b'up-to-date 0004':
+                raise RuntimeError('0004 migration repeat safety failed')
+            if not self.schema_matches(candidate, current=True,
+                                       network=network, env_file=env_file):
+                raise RuntimeError('candidate schema incompatible')
+            after = self.fingerprint(candidate, network, env_file)
+            if after != before:
+                raise RuntimeError('restored business or observation rows changed')
+            self.one_shot(candidate, network, env_file,
+                          ['-c', CHECK_EMPTY_NOTIFICATIONS])
+            app_env = self.private_write('synthetic-app.env', (
+                'DATABASE_URL=postgresql://rehearsal:synthetic@' + db + ':5432/rehearsal\n'
+                'SECRET_KEY=synthetic-release-secret-key-000000000000\n'
+                'TWILIO_ACCOUNT_SID=synthetic\nTWILIO_AUTH_TOKEN=synthetic\n'
+                'TWILIO_PHONE_NUMBER=+12025550100\nDEEPGRAM_API_KEY=synthetic\n'
+                'ELEVENLABS_API_KEY=synthetic\nOPENAI_API_KEY=synthetic\n'
+                'MS_BOOKINGS_TENANT_ID=synthetic-tenant\n'
+                'MS_BOOKINGS_CLIENT_ID=synthetic-client\n'
+                'MS_BOOKINGS_CLIENT_SECRET=synthetic-secret\n'
+                'MS_BOOKINGS_BUSINESS_ID=synthetic-business\n'
+                'BOOKING_OBSERVATION_ENABLED=true\n'
+                'BOOKING_OBSERVATION_INTERVAL_SECONDS=60\n'
+                'BOOKING_OBSERVATION_FRESHNESS_SECONDS=180\n'
+                'AUTOMATIC_NOTIFICATIONS_ENABLED=true\n'
+                'AUTOMATIC_NOTIFICATIONS_INTERVAL_SECONDS=60\n'
+                'AUTOMATIC_NOTIFICATION_WORKERS_PAUSED=true\n'
+                'TELNYX_API_KEY=synthetic\nTELNYX_PHONE_NUMBER=+12025550100\n'
+                'ENVIRONMENT=test\nLOG_LEVEL=INFO\n').encode())
+            self.run('docker', 'run', '-d', '--name', app, '--pull', 'never',
+                     '--network', network, '--memory', '512m', '--cpus', '1',
+                     '--pids-limit', '128', '--env-file', str(app_env), candidate)
+            self.wait_ready(app)
+            rehearsal_settings = self.settings(app)
+            if (rehearsal_settings.get(PAUSED_SETTING) is not True
+                    or rehearsal_settings.get('automatic_notifications_enabled') is not True
+                    or rehearsal_settings.get('automatic_notifications_interval_seconds') != 60
+                    or rehearsal_settings.get('booking_observation_enabled') is not True
+                    or rehearsal_settings.get('booking_observation_interval_seconds') != 60
+                    or rehearsal_settings.get('booking_observation_freshness_seconds') != 180):
+                raise RuntimeError('paused rehearsal settings differ')
+            self.one_shot(candidate, network, env_file,
+                          ['-c', CHECK_PAUSED_BOOKING_PATH])
+            print('RESTORED_0003_TO_0004_AND_PAUSED_READY_OK', flush=True)
+        finally:
+            try:
+                self.remove_container(app)
+            finally:
+                try:
+                    self.remove_container(db)
+                finally:
+                    self.remove_network(network)
+            print('REHEARSAL_RESOURCES_REMOVED', flush=True)
+
+    def recheck_before_stop(self) -> None:
+        previous = self.directory / 'previous-override.json'
+        live = self.root / 'docker-compose.override.yml'
+        if live.is_symlink() or live.read_bytes() != previous.read_bytes():
+            raise RuntimeError('private override changed before cutover')
+        if sha256((self.root / 'docker-compose.yml').read_bytes()) != (
+                self.directory / 'compose.sha256').read_text():
+            raise RuntimeError('base Compose changed before cutover')
+        if sha256((self.root / 'nginx/nginx.conf').read_bytes()) != NGINX_HASH:
+            raise RuntimeError('nginx hotfix changed before cutover')
+        old = self.inspect('ai-voice-app')
+        if (old['Image'] != OLD_IMAGE or not old['State']['Running']
+                or old['State'].get('Health', {}).get('Status') != 'healthy'
+                or mount_fingerprint(old['Mounts']) != mount_fingerprint(self.old['Mounts'])
+                or old['NetworkSettings']['Networks'] != self.old['NetworkSettings']['Networks']
+                or old['HostConfig'].get('PortBindings') != self.old['HostConfig'].get('PortBindings')
+                or old['Config']['Env'] != self.old['Config']['Env']
+                or self.settings() != self.previous_settings):
+            raise RuntimeError('running app changed before cutover')
+        db = self.inspect('ai-voice-db')
+        if (db['Image'] != self.pg_image or not db['State']['Running']
+                or db['State'].get('Health', {}).get('Status') != 'healthy'
+                or db['NetworkSettings']['Networks'] != self.db['NetworkSettings']['Networks']
+                or not self.inspect('ai-voice-redis')['State']['Running']
+                or not self.inspect('ai-voice-nginx')['State']['Running']):
+            raise RuntimeError('database, redis or ingress changed before cutover')
+        self.run('docker', 'exec', 'ai-voice-nginx', 'nginx', '-t')
+        if not self.schema_matches(OLD_IMAGE, current=False):
+            raise RuntimeError('live predecessor schema changed before cutover')
+        self.public_health()
+
+    def stop_writers(self, *, strict: bool) -> None:
+        for name, seconds in (('ai-voice-nginx', '120'), ('ai-voice-app', '60')):
+            self.run('docker', 'stop', '--time', seconds, name,
+                     timeout=int(seconds) + 15, check=strict)
+        if any(self.inspect(name)['State']['Running']
+               for name in ('ai-voice-nginx', 'ai-voice-app')):
+            raise RuntimeError('ingress or app stop could not be verified')
+
+    def install_override(self, source: Path) -> None:
+        live = self.root / 'docker-compose.override.yml'
+        if live.is_symlink() or source.is_symlink():
+            raise RuntimeError('override path is a symlink')
+        temporary = self.root / ('.t049b-override-' + self.directory.name)
+        with temporary.open('xb') as output:
+            output.write(source.read_bytes())
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, live)
+
+    def verify_replaced(self, image: str, *, paused: bool | None) -> None:
+        self.wait_ready()
+        current = self.inspect('ai-voice-app')
+        # Docker inspect may reorder mounts on recreation. Compare every field.
+        expected = copy.deepcopy(self.old['Mounts'])
+        if paused is not None:
+            overlays = [m for m in expected if m['Destination'] == SETTINGS_TARGET]
+            if len(overlays) != 1:
+                raise RuntimeError('baseline settings mount differs')
+            overlays[0]['Source'] = str(self.settings_overlay)
+        expected_mounts = mount_fingerprint(expected)
+        actual_mounts = mount_fingerprint(current['Mounts'])
+        if (current['Image'] != image or not current['State']['Running']
+                or actual_mounts != expected_mounts
+                or set(current['NetworkSettings']['Networks'])
+                != set(self.old['NetworkSettings']['Networks'])
+                or current['HostConfig'].get('PortBindings')
+                != self.old['HostConfig'].get('PortBindings')):
+            raise RuntimeError('replacement image, ports, networks or mounts differ')
+        old_env = dict(item.split('=', 1) for item in self.old['Config']['Env'])
+        new_env = dict(item.split('=', 1) for item in current['Config']['Env'])
+        if paused is not None:
+            for key, expected_value in NOTIFICATION_ENV.items():
+                if new_env.pop(key, None) != expected_value:
+                    raise RuntimeError('running notification environment differs')
+            if new_env.pop(PAUSED_ENV, None) != str(paused).lower():
+                raise RuntimeError('running notification pause differs')
+        if new_env != old_env or self.settings() != settings_for(
+                self.previous_settings, paused=paused):
+            raise RuntimeError('running effective settings changed')
+        revision = current['Config']['Labels'].get('org.opencontainers.image.revision')
+        if revision != (self.commit if paused is not None else DEPLOYED_SOURCE):
+            raise RuntimeError('running application source label differs')
+
+    def replace_app(self, image: str, *, paused: bool | None) -> None:
+        self.compose(self.root / 'docker-compose.override.yml',
+                     'up', '-d', '--no-deps', '--no-build', '--pull', 'never',
+                     '--force-recreate', 'app', timeout=120)
+        self.verify_replaced(image, paused=paused)
+
+    def recover(self, candidate: str, paused_override: Path) -> None:
+        self.stop_writers(strict=False)
+        if self.schema_matches(OLD_IMAGE, current=False):
+            image = OLD_IMAGE
+            override = self.directory / 'previous-override.json'
+            paused = None
+        elif self.schema_matches(candidate, current=True):
+            image = candidate
+            override = paused_override
+            paused = True
+        else:
+            print('RECOVERY_REQUIRES_REVIEW_INGRESS_LEFT_STOPPED', flush=True)
+            raise RuntimeError('schema does not match a verified recovery image')
+        self.install_override(override)
+        self.replace_app(image, paused=paused)
+        self.run('docker', 'start', 'ai-voice-nginx')
+        self.run('docker', 'exec', 'ai-voice-nginx', 'nginx', '-t')
+        self.public_health()
+        if paused:
+            print('RECOVERY_SMS_PAUSED_READY_HTTPS_OK', flush=True)
+        else:
+            print('RECOVERY_PRE_0004_READY_HTTPS_OK', flush=True)
+        print('RECOVERY_IMAGE=' + image, flush=True)
+
+    def deploy(self, candidate: str, active_override: Path,
+               paused_override: Path) -> None:
+        self.recheck_before_stop()
+        print('PRE_CUTOVER_FINGERPRINTS_OK', flush=True)
+        self.private_write('cutover-started', (self.commit + '\n').encode())
+        print('CUTOVER_STARTED_STOPPING_BETA_TRAFFIC', flush=True)
+        try:
+            self.stop_writers(strict=True)
+            before = self.fingerprint(OLD_IMAGE, self.network, self.live_env)
+            self.backup('final-after-writer-stop.dump')
+            self.one_shot(candidate, self.network, self.live_env,
+                          ['-m', 'migrations.runner', '--prepare'])
+            if not self.schema_matches(candidate, current=True):
+                raise RuntimeError('live 0004 contract did not pass')
+            if self.fingerprint(candidate, self.network, self.live_env) != before:
+                raise RuntimeError('live business or observation rows changed by migration')
+            self.one_shot(candidate, self.network, self.live_env,
+                          ['-c', CHECK_EMPTY_NOTIFICATIONS])
+            print('LIVE_0004_AND_PRESERVED_ROWS_OK', flush=True)
+            self.install_override(paused_override)
+            self.replace_app(candidate, paused=True)
+            self.run('docker', 'start', 'ai-voice-nginx')
+            self.run('docker', 'exec', 'ai-voice-nginx', 'nginx', '-t')
+            self.public_health()
+            print('PAUSED_CANDIDATE_READY_HTTPS_OK', flush=True)
+            self.stop_writers(strict=True)
+            self.install_override(active_override)
+            self.replace_app(candidate, paused=False)
+            self.run('docker', 'start', 'ai-voice-nginx')
+            self.run('docker', 'exec', 'ai-voice-nginx', 'nginx', '-t')
+            self.public_health()
+            self.private_write('deployed',
+                               (self.commit + '\n' + candidate + '\n'
+                                + str(self.directory) + '\n').encode())
+            print('AUTOMATIC_NOTIFICATIONS_0004_WORKERS_ACTIVE_READY_HTTPS_OK', flush=True)
+            print('DEPLOYED_COMMIT=' + self.commit, flush=True)
+            print('DEPLOYED_IMAGE=' + candidate, flush=True)
+        except BaseException:
+            print('CUTOVER_FAILED_CHECKING_COMPATIBLE_RECOVERY', flush=True)
+            try:
+                self.recover(candidate, paused_override)
+            except BaseException:
+                # Recovery can fail after nginx was restarted (for example on
+                # the HTTPS check). Close ingress again; attempt both stops even
+                # if one Docker command fails, without hiding the cutover error.
+                for name in ('ai-voice-nginx', 'ai-voice-app'):
+                    try:
+                        self.run('docker', 'stop', '--time', '30', name,
+                                 timeout=45, check=False)
+                    except BaseException:
+                        pass
+                print('RECOVERY_UNVERIFIED_INGRESS_MUST_REMAIN_STOPPED', flush=True)
+            raise
+
+    def execute(self) -> None:
+        self.stage = 'preflight'
+        original = self.preflight()
+        self.stage = 'build'
+        candidate = self.build('candidate', RUNTIME_PATHS)
+        self.stage = 'settings'
+        source = self.run('git', 'show', self.commit + ':config/settings.py').stdout
+        self.private_write('candidate-settings.py', source)
+        self.settings_overlay.chmod(0o644)
+        active_override = self.prepare_override('active', candidate, original)
+        paused_override = self.prepare_override('paused', candidate, original)
+        self.private_write('images.json',
+                           json.dumps({'candidate': candidate}).encode())
+        self.stage = 'rehearsal'
+        archive = self.backup('rehearsal.dump')
+        self.rehearsal(candidate, archive)
+        self.stage = 'cutover'
+        self.deploy(candidate, active_override, paused_override)
+
+
+def main(commit: str) -> None:
+    import fcntl  # Linux-only; importing this module for local tests is read-only.
+    if os.geteuid() != 0 or not re.fullmatch(r'[0-9a-f]{40}', commit):
+        raise RuntimeError('root and exact 40-hex release commit required')
+    os.umask(0o077)
+    lock_path = '/run/ai-phone-deployment.lock'
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'r+') as lock:
+        metadata = os.fstat(lock.fileno())
+        if (metadata.st_uid != 0 or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_mode & 0o077):
+            raise RuntimeError('deployment lock is not root protected')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for previous in Path('/opt').glob('ai-phone-notification-release.*'):
+            if (previous / 'cutover-started').exists() and not (previous / 'deployed').exists():
+                raise RuntimeError('prior cutover needs review before another attempt')
+        directory = Path(tempfile.mkdtemp(prefix='ai-phone-notification-release.', dir='/opt'))
+        if (directory.is_symlink() or directory.stat().st_uid != 0
+                or directory.stat().st_mode & 0o077):
+            raise RuntimeError('release directory is not root protected')
+        print('RELEASE_DIRECTORY=' + str(directory), flush=True)
+        release = Release(directory, commit)
+        try:
+            release.execute()
+        except BaseException as error:
+            print('RELEASE_STOPPED_STAGE=' + release.stage, flush=True)
+            print('RELEASE_STOPPED_TYPE=' + type(error).__name__, flush=True)
+            print('KEEP_PROTECTED_RELEASE_FILES_DO_NOT_PASTE_PRIVATE_LOGS', flush=True)
+            raise
+
+
+if __name__ == '__main__':
+    try:
+        if len(sys.argv) != 2:
+            raise RuntimeError('one exact release commit argument required')
+        main(sys.argv[1])
+    except BaseException as error:
+        # Also report failures before the release object exists (lock, argument,
+        # prior-cutover guard); never print exception text/private values.
+        print('RELEASE_EXIT_FAILURE_TYPE=' + type(error).__name__, flush=True)
+        sys.exit(1)

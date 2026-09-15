@@ -1,0 +1,38 @@
+{
+  "head": "424ee6ada7244bf7b8f89b2e3fbb50255b77a1de",
+  "branch": "codex/phase-3-safe-booking",
+  "kind": "accepted working-copy bytes; not published Git blob hashes",
+  "t049_b_allowed_modifications": [
+    "api/main.py",
+    "config/settings.py",
+    "docker-compose.yml",
+    "tests/integration/test_database_startup.py"
+  ],
+  "sha256": {
+    "api/main.py": "13f1081a71fd901883b8fd072775dd7c0cc8bdb08f3ce56b6f737ab0b1893a25",
+    "config/settings.py": "48e0af11854f756ba2e28311033e57094efd1390bd4ff0caa5c5d217fc938c2e",
+    "docker-compose.yml": "8f395736893b2869b70be01501f4465c7bf5423a970497299332be5f5a11fea9",
+    "services/database.py": "5ecd979ee1d8525ff110d03489e51d1198fbbb17ad03cf4f75741f95d1cb0048",
+    "migrations/runner.py": "3f873b1271b72b5a36ddffebdf5d11a2628ecff3d49e4d06a83a8030caba2f2b",
+    "migrations/schema_contract.py": "c31adce4d4b3c8a7f9326a945be4d5778ee4bf31c26bd4bfaeb04fa7e76476ba",
+    "migrations/0004_appointment_notifications.sql": "a1c66c7705adbd49918966c7d41d8bbbc5e80d3d5d0534fe641fd15579731a9e",
+    "services/calendar/booking_readback.py": "ff488254f45a52f3786f368972984f21bfa07cdc6d2f3ed2c02ce51bc745bfa5",
+    "services/calendar/provider_admission.py": "53e3525428944935fdc253f113a2966f1e5f665e5fd2e1b3f9d707d12d88a7e6",
+    "services/scheduling/booking_records.py": "71be9cb3eb55d8dcb17585c6ec40d7837c2a48061e225bdf928c1f7c48a341bc",
+    "services/scheduling/provider_observations.py": "9d43e116d8c9183cee09fcf5d676ded0d5d094ef7be73312be996e6fb91645ed",
+    "services/scheduling/removal_reconciliation.py": "740d720091662abf43649b1b1be04c8f5e4208f01c100bfd60add427f832f955",
+    "services/sms/notification_text.py": "740ad3e78d9843f4a4071531e239fd1f8c4568d6ee2cf6e6c8ed04292a29d141",
+    "services/sms/notification_outbox.py": "a7105c51b9fa7b810ca47c19fa3d345ae60a1c9a61420c3d9fb0f378f8271e86",
+    "services/sms/notification_worker.py": "41a9541e5a99bf0add51289fb177e2ad6449aaf5ed4c6f5ba8de4807a48796bc",
+    "services/sms/telnyx_submission.py": "9a82f7728e5d21591c43715b2590317804be0a907ba774ca6a9719a8b86c1ac4",
+    "services/sms/telnyx_sms_service.py": "4b3c1705cf8c5eae87ebc156058da391ed4ad1a4a0e2bbfd3479627dc61cc6f9",
+    "services/conversation/orchestrator.py": "bfdd77c6ae5546ec57914618fd21c46f32dc4ff0db1bc5a8611480cf79e1a686",
+    "services/dashboard/dashboard_routes.py": "f6c0be4c004b74cde1def672fe0e022a1e0a0e22aed7ba8172cceaa084f1dcf2",
+    "templates/dashboard.html": "5bab1977f9e7882d4669472d48a8fb00c66e1de8d38352d585716d5e43f321c5",
+    "tests/integration/test_automatic_notifications.py": "6b167e5a697f93e0371d5416986f2ee013b78baddbd54ddad872b76841f81e34",
+    "tests/integration/test_migrations.py": "b51aff860da58a7794f6ba418f6f9e62189b1795efd7af570034c7aef9130fd0",
+    "tests/integration/test_database_startup.py": "f633e0eefcd626a8b16611e6685bc331149d2f84a15078c68f00b153cd939073",
+    "tests/integration/test_image_contents.py": "88d6c727023bffbcea6d50e6b461abfa1f746c795b0d50ad1d50db36eead8d23",
+    "tests/dashboard/test_dashboard_metrics.py": "20356cda74abfad4d1551bb6c2d9e64211b003394fa4b253893a42fa590db841"
+  }
+}

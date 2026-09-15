@@ -2,7 +2,9 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
+from services.dashboard import dashboard_routes
 from services.dashboard.dashboard_routes import get_pipeline_latency
 from services.dashboard.dashboard_service import DashboardService
 from services.dashboard.metrics_service import fetch_call_statistics
@@ -104,3 +106,29 @@ def test_dashboard_labels_missing_average_duration_honestly() -> None:
 
     assert "data.avg_duration_seconds === null" in dashboard_html
     assert "Not available" in dashboard_html
+
+
+@pytest.mark.asyncio
+async def test_managed_booking_deletion_returns_conflict_without_delete(monkeypatch) -> None:
+    class Transaction:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+
+    class Pool:
+        def __init__(self): self.commands = []
+        def acquire(self): return self
+        def transaction(self): return Transaction()
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def fetchrow(self, query, *args): return {'id': 7}
+        async def fetchval(self, query, *args):
+            return True
+        async def execute(self, query, *args): self.commands.append(query)
+
+    pool = Pool()
+    async def get_pool(): return pool
+    monkeypatch.setattr(dashboard_routes, 'get_db_pool', get_pool)
+    with pytest.raises(HTTPException) as raised:
+        await dashboard_routes.delete_booking(7, user={'is_superuser': True})
+    assert raised.value.status_code == 409
+    assert pool.commands == []

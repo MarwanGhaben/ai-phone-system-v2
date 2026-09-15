@@ -537,8 +537,40 @@ async def get_bookings(user: dict = Depends(require_auth), limit: int = 50):
     pool = await get_db_pool()
     freshness = getattr(get_settings(), "booking_observation_freshness_seconds", 180)
     now = datetime.now(timezone.utc)
+    notifications_enabled = getattr(get_settings(), 'automatic_notifications_enabled', False)
 
     try:
+        notification_columns = """
+                   ,r.disposition AS reconciliation_disposition,
+                   r.reason AS reconciliation_reason,
+                   r.last_result AS reconciliation_last_result,
+                   r.last_present_at AS reconciliation_last_present_at,
+                   r.last_missing_at AS reconciliation_last_missing_at,
+                   j.state AS notice_state,j.last_attempt_at AS notice_last_attempt_at,
+                   j.error_category AS notice_error_category,
+                   EXISTS (SELECT 1 FROM public.booking_notification_outbox h
+                           WHERE h.booking_id=b.id AND h.kind='reminder'
+                             AND h.state='held') AS reminders_on_hold
+        """ if notifications_enabled else """
+                   ,NULL::text AS reconciliation_disposition,
+                   NULL::text AS reconciliation_reason,
+                   NULL::text AS reconciliation_last_result,
+                   NULL::timestamptz AS reconciliation_last_present_at,
+                   NULL::timestamptz AS reconciliation_last_missing_at,
+                   NULL::text AS notice_state,
+                   NULL::timestamptz AS notice_last_attempt_at,
+                   NULL::text AS notice_error_category,
+                   FALSE AS reminders_on_hold
+        """
+        notification_join = """
+            LEFT JOIN public.booking_notification_reconciliation AS r ON r.booking_id=b.id
+            LEFT JOIN LATERAL (
+                SELECT state,last_attempt_at,error_category
+                FROM public.booking_notification_outbox
+                WHERE booking_id=b.id AND kind='removal'
+                ORDER BY created_at DESC LIMIT 1
+            ) AS j ON TRUE
+        """ if notifications_enabled else ""
         rows = await pool.fetch(
             """
             SELECT b.id,b.client_name,b.client_email,b.phone_number,b.accountant_name,
@@ -546,8 +578,10 @@ async def get_bookings(user: dict = Depends(require_auth), limit: int = 50):
                    b.status,b.created_at,b.ms_booking_id,
                    o.snapshot_provider_id,o.snapshot_start,o.snapshot_status,
                    o.checked_at,o.outcome,o.provider_start,o.provider_end
+            """ + notification_columns + """
             FROM public.bookings AS b
             LEFT JOIN public.booking_provider_observations AS o ON o.booking_id=b.id
+            """ + notification_join + """
             ORDER BY b.appointment_time_utc DESC NULLS LAST,b.appointment_time DESC
             LIMIT $1
             """,
@@ -632,14 +666,46 @@ def _booking_observation_view(row: dict, now: datetime, freshness: int) -> dict:
             booking_time_for_dashboard(row['provider_start'])
             if state == 'changed' and row['provider_start'] is not None else None
         ),
+        "reconciliation_disposition": row.get('reconciliation_disposition'),
+        "reconciliation_reason": row.get('reconciliation_reason'),
+        "reconciliation_last_result": row.get('reconciliation_last_result'),
+        "reconciliation_last_present_at": (
+            row['reconciliation_last_present_at'].isoformat()
+            if row.get('reconciliation_last_present_at') else None),
+        "reconciliation_last_missing_at": (
+            row['reconciliation_last_missing_at'].isoformat()
+            if row.get('reconciliation_last_missing_at') else None),
+        "reminders_on_hold": bool(row.get('reminders_on_hold')),
+        "notice_state": row.get('notice_state'),
+        "notice_last_attempt_at": (
+            row['notice_last_attempt_at'].isoformat()
+            if row.get('notice_last_attempt_at') else None),
+        "notice_error_category": row.get('notice_error_category'),
     }
 
 
 @router.delete("/api/bookings/{booking_id}")
 async def delete_booking(booking_id: int, user: dict = Depends(require_auth)):
-    """Delete a booking"""
+    """Reject deletion of any booking with durable notification evidence."""
     pool = await get_db_pool()
-    await pool.execute("DELETE FROM bookings WHERE id = $1", booking_id)
+    has_tables = await pool.fetchval(
+        "SELECT to_regclass('public.booking_notification_reconciliation') IS NOT NULL")
+    if has_tables:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.fetchrow(
+                    'SELECT id FROM public.bookings WHERE id=$1 FOR UPDATE', booking_id)
+                managed = await conn.fetchval("""
+                    SELECT EXISTS (SELECT 1 FROM public.booking_notification_reconciliation
+                                   WHERE booking_id=$1)
+                        OR EXISTS (SELECT 1 FROM public.booking_notification_outbox
+                                   WHERE booking_id=$1)
+                """, booking_id)
+                if managed:
+                    raise HTTPException(status_code=409, detail='Managed booking cannot be deleted')
+                await conn.execute('DELETE FROM public.bookings WHERE id=$1', booking_id)
+    else:
+        await pool.execute("DELETE FROM bookings WHERE id = $1", booking_id)
     return {"success": True}
 
 
@@ -650,7 +716,21 @@ async def clear_all_bookings(user: dict = Depends(require_auth)):
         raise HTTPException(status_code=403, detail="Superuser required")
 
     pool = await get_db_pool()
-    await pool.execute("DELETE FROM bookings")
+    has_tables = await pool.fetchval(
+        "SELECT to_regclass('public.booking_notification_reconciliation') IS NOT NULL")
+    if has_tables:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute('LOCK TABLE public.bookings IN ACCESS EXCLUSIVE MODE')
+                managed = await conn.fetchval("""
+                    SELECT EXISTS (SELECT 1 FROM public.booking_notification_reconciliation)
+                        OR EXISTS (SELECT 1 FROM public.booking_notification_outbox)
+                """)
+                if managed:
+                    raise HTTPException(status_code=409, detail='Managed bookings cannot be cleared')
+                await conn.execute('DELETE FROM public.bookings')
+    else:
+        await pool.execute("DELETE FROM bookings")
     return {"success": True}
 
 

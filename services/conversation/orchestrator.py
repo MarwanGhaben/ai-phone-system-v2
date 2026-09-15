@@ -1799,6 +1799,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 try:
                     from services.database import get_db_pool
                     pool = await get_db_pool()
+                    notification_settings = get_settings()
                     await persist_booking_record(
                         pool,
                         call_sid=call_sid,
@@ -1814,6 +1815,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                         provider_appointment_id=result.appointment_id,
                         notes=("Booked via AI phone system. Client type: "
                                f"{pending.get('client_type', 'unknown')}"),
+                        notifications_enabled=getattr(
+                            notification_settings, 'automatic_notifications_enabled', False),
+                        provider_tenant_id=notification_settings.ms_bookings_tenant_id,
+                        provider_business_id=notification_settings.ms_bookings_business_id,
                     )
                     logger.info("Orchestrator: booking persistence completed")
                 except asyncio.CancelledError:
@@ -1840,14 +1845,15 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 display_customer = customer_name if customer_name != "Phone Caller" else "there"
                 caller_lang = context.language if context else "en"
 
-                asyncio.create_task(self._send_booking_sms(
-                    phone_number=context.phone_number,
-                    customer_name=display_customer,
-                    staff_name=display_staff,
-                    appointment_time_str=display_time,
-                    appointment_dt=appointment_time,
-                    language=caller_lang,
-                ))
+                if not getattr(notification_settings, 'automatic_notifications_enabled', False):
+                    asyncio.create_task(self._send_booking_sms(
+                        phone_number=context.phone_number,
+                        customer_name=display_customer,
+                        staff_name=display_staff,
+                        appointment_time_str=display_time,
+                        appointment_dt=appointment_time,
+                        language=caller_lang,
+                    ))
 
                 # Clear pending booking and set completion flag
                 context.pending_booking = None
@@ -2061,7 +2067,35 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             )
 
             if success:
-                logger.info(f"Orchestrator: Cancelled appointment {appointment_id}")
+                logger.info("Orchestrator: provider reported appointment cancellation")
+
+                if getattr(get_settings(), 'automatic_notifications_enabled', False):
+                    try:
+                        from services.scheduling.removal_reconciliation import (
+                            finalize_caller_cancellation)
+                        pool = await get_db_pool()
+                        policy = get_settings()
+                        outcome = await finalize_caller_cancellation(
+                            pool, appointment_id, context.phone_number,
+                            policy.ms_bookings_tenant_id,
+                            policy.ms_bookings_business_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning('Orchestrator: local notification finalization failed')
+                        outcome = 'unresolved'
+                    context.found_appointments = None
+                    if outcome == 'unresolved':
+                        return (
+                            'BOOKING_CANCELLED_NOTIFICATION_UNRESOLVED: Microsoft reported '
+                            'the cancellation, but the local booking and notification could '
+                            'not be uniquely verified. Offer human follow-up; do not promise SMS.'
+                        )
+                    return (
+                        'BOOKING_CANCELLED: The selected appointment was cancelled. '
+                        'The appointment-specific notification is queued or already recorded; '
+                        'do not promise SMS delivery.'
+                    )
 
                 # Update local database if we have the booking
                 try:

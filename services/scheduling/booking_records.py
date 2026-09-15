@@ -52,21 +52,24 @@ async def persist_booking_record(
     language: str,
     provider_appointment_id: object,
     notes: str,
+    notifications_enabled: bool = False,
+    provider_tenant_id: str = "",
+    provider_business_id: str = "",
 ) -> int:
     """Insert one provider-created booking and require its local record ID."""
     if (not isinstance(provider_appointment_id, str)
             or not provider_appointment_id.strip()):
         raise BookingPersistenceError("missing provider appointment id")
     legacy_wall_time, canonical = _booking_times(appointment_time)
-    record_id = await pool.fetchval(
-        """
+    statement = """
         INSERT INTO public.bookings (
             call_sid, phone_number, client_name, client_email,
             accountant_name, appointment_time, appointment_time_utc,
             client_type, language, status, ms_booking_id, notes
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmed',$10,$11)
         RETURNING id
-        """,
+        """
+    values = (
         call_sid,
         phone_number,
         client_name,
@@ -79,6 +82,25 @@ async def persist_booking_record(
         provider_appointment_id.strip(),
         notes,
     )
-    if record_id is None:
-        raise BookingPersistenceError("booking record not inserted")
-    return record_id
+    if not notifications_enabled:
+        record_id = await pool.fetchval(statement, *values)
+        if record_id is None:
+            raise BookingPersistenceError("booking record not inserted")
+        return record_id
+    if not provider_tenant_id or not provider_business_id:
+        raise BookingPersistenceError("notification provider scope unavailable")
+    from services.sms.notification_outbox import create_new_booking_jobs
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            record_id = await conn.fetchval(statement, *values)
+            if record_id is None:
+                raise BookingPersistenceError("booking record not inserted")
+            booking = {
+                'id': record_id, 'ms_booking_id': provider_appointment_id.strip(),
+                'appointment_time_utc': canonical, 'phone_number': phone_number,
+                'accountant_name': accountant_name, 'language': language,
+            }
+            await create_new_booking_jobs(
+                conn, booking, tenant_id=provider_tenant_id,
+                business_id=provider_business_id)
+            return record_id

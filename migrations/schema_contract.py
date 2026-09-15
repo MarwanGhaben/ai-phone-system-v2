@@ -1,6 +1,7 @@
 """Read-only structural compatibility contract shared by startup and migrations."""
 from __future__ import annotations
 import json
+import re
 
 BOOTSTRAP_VERSION = "bootstrap-v1"
 BOOTSTRAP_CHECKSUM = "1c72bbe0a120860902c565e5573c05ad1cd640891a42bb35cca2c6e0876f31e8"
@@ -12,10 +13,51 @@ OBSERVATION_REVISION_VERSION = "0003"
 OBSERVATION_REVISION_CHECKSUM = "b3abaa09c340f89c32778b0b17b5c2a584845983b13eb95dbb9c366f3d6c5830"
 OBSERVATION_TABLE = "booking_provider_observations"
 OBSERVATION_CONTROL_TABLE = "booking_provider_observation_control"
+NOTIFICATION_REVISION_VERSION = "0004"
+NOTIFICATION_REVISION_CHECKSUM = "a1c66c7705adbd49918966c7d41d8bbbc5e80d3d5d0534fe641fd15579731a9e"
+NOTIFICATION_STATE_TABLE = "booking_notification_reconciliation"
+NOTIFICATION_OUTBOX_TABLE = "booking_notification_outbox"
+NOTIFICATION_CONTRACT_TABLE = "booking_notification_contract"
+NOTIFICATION_TABLES = frozenset((NOTIFICATION_STATE_TABLE, NOTIFICATION_OUTBOX_TABLE,
+                                 NOTIFICATION_CONTRACT_TABLE))
 
 
 class SchemaCompatibilityError(Exception):
     """A fixed, safe compatibility classification."""
+
+
+_VARCHAR_LITERAL_ARRAY_CAST = re.compile(
+    r"\(ARRAY\[((?:'[a-z_]+'::character varying)(?:, '[a-z_]+'::character varying)*)\]\)::text\[\]")
+
+
+def check_definitions_match(baseline, actual):
+    """Allow the two proven PostgreSQL dump/restore serialization differences.
+
+    Casting an unbounded varchar literal array to text[] is equivalent to casting
+    each of its literal elements to text. pg_restore reparses the saved expression
+    into the latter form. It also flattens the leading BETWEEN expansion in the
+    notification missing-count conjunction. Keep all values, order, operators
+    and other text exact; this is not a general SQL equivalence normalizer.
+    """
+    if (not isinstance(baseline, dict) or not isinstance(actual, dict)
+            or baseline.keys() != actual.keys()
+            or any(not isinstance(v, str) for v in (*baseline.values(), *actual.values()))):
+        return False
+
+    def canonical(value):
+        value = _VARCHAR_LITERAL_ARRAY_CAST.sub(
+            lambda match: 'ARRAY[' + ', '.join(
+                '(' + item + ')::text' for item in match.group(1).split(', ')) + ']',
+            value)
+        nested = 'CHECK ((((missing_count >= 0) AND (missing_count <= 2)) AND '
+        flat = 'CHECK (((missing_count >= 0) AND (missing_count <= 2) AND '
+        # Restrict to this exact leading AND context: never strip arbitrary
+        # parentheses around OR/NOT or change a bound/column/operator.
+        if value.startswith(nested):
+            value = flat + value[len(nested):]
+        return value
+
+    return all(canonical(baseline[key]) == canonical(actual[key]) for key in baseline)
 
 
 # name:type[:varchar length][!] where ! means NOT NULL. This is an explicit,
@@ -101,6 +143,157 @@ OBSERVATION_CONTROL_CHECK = "booking_observation_control_singleton_check"
 OBSERVATION_CONTROL_COLUMNS = _parse_spec(
     "singleton:int4! next_request_at:timestamptz! check_definitions:jsonb!"
 )
+NOTIFICATION_STATE_COLUMNS = _parse_spec(
+    "booking_id:int4! snapshot_tenant_id:text! snapshot_business_id:text! "
+    "snapshot_provider_id:varchar:255! snapshot_start:timestamptz! "
+    "snapshot_version:int4! enrolled_at:timestamptz last_present_at:timestamptz "
+    "last_evidence_started_at:timestamptz "
+    "first_missing_at:timestamptz last_missing_at:timestamptz missing_count:int4! "
+    "last_result:varchar:20 disposition:varchar:32! reason:varchar:40 "
+    "transitioned_at:timestamptz last_error_category:varchar:32 updated_at:timestamptz!"
+)
+NOTIFICATION_OUTBOX_COLUMNS = _parse_spec(
+    "id:uuid! booking_id:int4! snapshot_version:int4! snapshot_tenant_id:text! "
+    "snapshot_business_id:text! snapshot_provider_id:varchar:255! "
+    "snapshot_start:timestamptz! event_key:text! kind:varchar:20! "
+    "due_at:timestamptz! next_attempt_at:timestamptz! state:varchar:20! "
+    "attempts:int4! retry_count:int4! recipient:varchar:50! "
+    "language:varchar:10! consultant:varchar:255! body:text! error_category:varchar:32 "
+    "provider_message_id:varchar:255 claim_token:uuid dispatch_started_at:timestamptz "
+    "last_attempt_at:timestamptz accepted_at:timestamptz created_at:timestamptz! "
+    "updated_at:timestamptz!"
+)
+NOTIFICATION_CONTRACT_COLUMNS = _parse_spec("singleton:int4! check_definitions:jsonb!")
+
+
+async def check_notification_schema(conn):
+    """Validate 0004 shape, keys, indexes and exact migration-time CHECKs."""
+    shapes = {
+        NOTIFICATION_STATE_TABLE: NOTIFICATION_STATE_COLUMNS,
+        NOTIFICATION_OUTBOX_TABLE: NOTIFICATION_OUTBOX_COLUMNS,
+        NOTIFICATION_CONTRACT_TABLE: NOTIFICATION_CONTRACT_COLUMNS,
+    }
+    expected_constraints = {
+        NOTIFICATION_STATE_TABLE: {
+            'booking_notification_reconciliation_pkey': ('p', ('booking_id',)),
+            'booking_notification_reconciliation_booking_id_fkey': ('f', ('booking_id',)),
+            **{name: ('c', ()) for name in (
+                'booking_notification_scope_check', 'booking_notification_missing_check',
+                'booking_notification_disposition_check', 'booking_notification_result_check')},
+        },
+        NOTIFICATION_OUTBOX_TABLE: {
+            'booking_notification_outbox_pkey': ('p', ('id',)),
+            'booking_notification_outbox_booking_id_fkey': ('f', ('booking_id',)),
+            'booking_notification_outbox_event_key_key': ('u', ('event_key',)),
+            'booking_notification_outbox_identity_unique':
+                ('u', ('booking_id', 'snapshot_version', 'kind')),
+            **{name: ('c', ()) for name in (
+                'booking_notification_outbox_scope_check',
+                'booking_notification_outbox_kind_check',
+                'booking_notification_outbox_state_check',
+                'booking_notification_outbox_attempts_check',
+                'booking_notification_outbox_claim_check',
+                'booking_notification_outbox_acceptance_check')},
+        },
+        NOTIFICATION_CONTRACT_TABLE: {
+            'booking_notification_contract_pkey': ('p', ('singleton',)),
+            'booking_notification_contract_singleton_check': ('c', ()),
+        },
+    }
+    expected_indexes = {
+        NOTIFICATION_STATE_TABLE: {
+            'booking_notification_reconciliation_pkey': ('booking_id',),
+            'booking_notification_reconciliation_scope_idx':
+                ('snapshot_tenant_id', 'snapshot_business_id', 'snapshot_provider_id')},
+        NOTIFICATION_OUTBOX_TABLE: {
+            'booking_notification_outbox_pkey': ('id',),
+            'booking_notification_outbox_event_key_key': ('event_key',),
+            'booking_notification_outbox_identity_unique':
+                ('booking_id', 'snapshot_version', 'kind'),
+            'booking_notification_outbox_due_idx':
+                ('state', 'next_attempt_at', 'due_at', 'id'),
+            'booking_notification_outbox_booking_idx': ('booking_id', 'state')},
+        NOTIFICATION_CONTRACT_TABLE: {
+            'booking_notification_contract_pkey': ('singleton',)},
+    }
+    definitions = {}
+    for table, shape in shapes.items():
+        oid = await relation(conn, table)
+        actual = await columns(conn, oid)
+        check_columns(actual, shape)
+        if any(row['default_expr'] is not None for row in actual.values()):
+            raise SchemaCompatibilityError('incompatible schema')
+        rows = await conn.fetch("""
+            SELECT k.conname,k.contype::text,k.condeferrable,k.condeferred,
+                   k.convalidated,k.connoinherit,
+                   pg_catalog.pg_get_constraintdef(k.oid,false) AS definition,
+                   rn.relname AS referenced_table,ns.nspname AS referenced_schema,
+                   k.confdeltype::text,
+                   ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(k.conkey)
+                         WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                         ON a.attrelid=k.conrelid AND a.attnum=u.num ORDER BY u.ord) AS columns,
+                   ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(k.confkey)
+                         WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                         ON a.attrelid=k.confrelid AND a.attnum=u.num ORDER BY u.ord) AS ref_columns
+            FROM pg_catalog.pg_constraint k
+            LEFT JOIN pg_catalog.pg_class rn ON rn.oid=k.confrelid
+            LEFT JOIN pg_catalog.pg_namespace ns ON ns.oid=rn.relnamespace
+            WHERE k.conrelid=$1
+        """, oid)
+        expected = expected_constraints[table]
+        if len(rows) != len(expected) or {r['conname'] for r in rows} != set(expected):
+            raise SchemaCompatibilityError('incompatible schema')
+        for row in rows:
+            kind, key = expected[row['conname']]
+            if (row['contype'] != kind or row['condeferrable'] or row['condeferred']
+                    or not row['convalidated']):
+                raise SchemaCompatibilityError('incompatible schema')
+            if kind == 'c':
+                if row['connoinherit']:
+                    raise SchemaCompatibilityError('incompatible schema')
+                definitions[row['conname']] = row['definition']
+            elif tuple(row['columns']) != key:
+                raise SchemaCompatibilityError('incompatible schema')
+            if kind == 'f' and (row['referenced_schema'] != 'public'
+                                or row['referenced_table'] != 'bookings'
+                                or tuple(row['ref_columns']) != ('id',)
+                                or row['confdeltype'] != 'r'):
+                raise SchemaCompatibilityError('incompatible schema')
+        indexes = await conn.fetch("""
+            SELECT c.relname,i.indisvalid,i.indisready,i.indisunique,i.indimmediate,
+                   i.indpred IS NOT NULL AS partial,i.indexprs IS NOT NULL AS expression,
+                   i.indnatts,i.indnkeyatts,
+                   ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(i.indkey)
+                         WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                         ON a.attrelid=i.indrelid AND a.attnum=u.num ORDER BY u.ord) AS columns
+            FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid
+            WHERE i.indrelid=$1
+        """, oid)
+        if len(indexes) != len(expected_indexes[table]) or {
+                r['relname'] for r in indexes} != set(expected_indexes[table]):
+            raise SchemaCompatibilityError('incompatible schema')
+        for index in indexes:
+            columns_expected = expected_indexes[table][index['relname']]
+            unique_expected = index['relname'] in expected and expected[index['relname']][0] in ('p', 'u')
+            if (tuple(index['columns']) != columns_expected
+                    or index['indisunique'] != unique_expected
+                    or not all(index[key] for key in ('indisvalid','indisready','indimmediate'))
+                    or index['partial'] or index['expression']
+                    or index['indnatts'] != len(columns_expected)
+                    or index['indnkeyatts'] != len(columns_expected)):
+                raise SchemaCompatibilityError('incompatible schema')
+    rows = await conn.fetch(
+        'SELECT singleton,check_definitions FROM public.booking_notification_contract')
+    if len(rows) != 1 or rows[0]['singleton'] != 1:
+        raise SchemaCompatibilityError('incompatible schema')
+    baseline = rows[0]['check_definitions']
+    if isinstance(baseline, str):
+        try:
+            baseline = json.loads(baseline)
+        except ValueError:
+            raise SchemaCompatibilityError('incompatible schema') from None
+    if not check_definitions_match(baseline, definitions):
+        raise SchemaCompatibilityError('incompatible schema')
 
 
 async def check_observation_schema(conn):
@@ -234,7 +427,7 @@ async def check_observation_schema(conn):
             baseline = json.loads(baseline)
     except (TypeError, ValueError):
         raise SchemaCompatibilityError("incompatible schema") from None
-    if baseline != definitions:
+    if not check_definitions_match(baseline, definitions):
         raise SchemaCompatibilityError("incompatible schema")
 
 
@@ -340,10 +533,11 @@ async def admin(conn, *, required_updated=False):
 
 
 async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
-                 require_current=False, require_observation=False):
+                 require_current=False, require_observation=False,
+                 require_notification=False):
     oid = await relation(conn, "schema_migrations", optional=True)
     if oid is None:
-        if require_revision or require_current or require_observation:
+        if require_revision or require_current or require_observation or require_notification:
             raise SchemaCompatibilityError("incompatible schema")
         return False, frozenset()
     actual = await columns(conn, oid)
@@ -358,6 +552,7 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
         REVISION_VERSION: REVISION_CHECKSUM,
         BOOKINGS_REVISION_VERSION: BOOKINGS_REVISION_CHECKSUM,
         OBSERVATION_REVISION_VERSION: OBSERVATION_REVISION_CHECKSUM,
+        NOTIFICATION_REVISION_VERSION: NOTIFICATION_REVISION_CHECKSUM,
     }
     if allow_bootstrap:
         expected[BOOTSTRAP_VERSION] = BOOTSTRAP_CHECKSUM
@@ -379,6 +574,9 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
     if (OBSERVATION_REVISION_VERSION in versions
             and BOOKINGS_REVISION_VERSION not in versions):
         raise SchemaCompatibilityError("incompatible schema")
+    if (NOTIFICATION_REVISION_VERSION in versions
+            and OBSERVATION_REVISION_VERSION not in versions):
+        raise SchemaCompatibilityError("incompatible schema")
     if (BOOTSTRAP_VERSION in versions
             and applied[BOOTSTRAP_VERSION] > applied[REVISION_VERSION]):
         raise SchemaCompatibilityError("incompatible schema")
@@ -393,6 +591,11 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
             and applied[BOOKINGS_REVISION_VERSION] > applied[OBSERVATION_REVISION_VERSION]):
         raise SchemaCompatibilityError("incompatible schema")
     if require_observation and OBSERVATION_REVISION_VERSION not in versions:
+        raise SchemaCompatibilityError("incompatible schema")
+    if (NOTIFICATION_REVISION_VERSION in versions and OBSERVATION_REVISION_VERSION in versions
+            and applied[OBSERVATION_REVISION_VERSION] > applied[NOTIFICATION_REVISION_VERSION]):
+        raise SchemaCompatibilityError("incompatible schema")
+    if require_notification and NOTIFICATION_REVISION_VERSION not in versions:
         raise SchemaCompatibilityError("incompatible schema")
     return True, frozenset(versions)
 
@@ -409,6 +612,7 @@ async def relation_names(conn):
 async def check_application_schema(conn, *, allow_missing_admin_updated=False,
                                    allow_missing_booking_aware=False,
                                    allow_missing_observations=False,
+                                   allow_missing_notifications=True,
                                    ledger_optional=True):
     names = await relation_names(conn)
     expected_names = set(TABLE_COLUMNS)
@@ -420,6 +624,10 @@ async def check_application_schema(conn, *, allow_missing_admin_updated=False,
         expected_names.update((OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE))
     elif not allow_missing_observations:
         raise SchemaCompatibilityError("incompatible schema")
+    if NOTIFICATION_TABLES.issubset(names):
+        expected_names.update(NOTIFICATION_TABLES)
+    elif not allow_missing_notifications:
+        raise SchemaCompatibilityError("incompatible schema")
     if names != expected_names:
         raise SchemaCompatibilityError("incompatible schema")
     lock_names = sorted(TABLE_COLUMNS)
@@ -427,6 +635,8 @@ async def check_application_schema(conn, *, allow_missing_admin_updated=False,
         lock_names.append("schema_migrations")
     if OBSERVATION_TABLE in names:
         lock_names.extend((OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE))
+    if NOTIFICATION_TABLES.issubset(names):
+        lock_names.extend(sorted(NOTIFICATION_TABLES))
     lock_targets = [
         'public."' + name.replace('"', '""') + '"' for name in lock_names
     ]
@@ -502,17 +712,27 @@ async def check_application_schema(conn, *, allow_missing_admin_updated=False,
         raise SchemaCompatibilityError("incompatible schema")
     if OBSERVATION_TABLE in names:
         await check_observation_schema(conn)
+    if NOTIFICATION_TABLES.issubset(names):
+        await check_notification_schema(conn)
     if "schema_migrations" in names:
         _, versions = await ledger(conn, allow_bootstrap=True)
         if OBSERVATION_REVISION_VERSION in versions and OBSERVATION_TABLE not in names:
             raise SchemaCompatibilityError("incompatible schema")
+        if NOTIFICATION_REVISION_VERSION in versions and not NOTIFICATION_TABLES.issubset(names):
+            raise SchemaCompatibilityError("incompatible schema")
+        if NOTIFICATION_TABLES.issubset(names) and NOTIFICATION_REVISION_VERSION not in versions:
+            raise SchemaCompatibilityError("incompatible schema")
 
 
-async def check_runtime_compatibility(conn, *, require_observation=True):
+async def check_runtime_compatibility(conn, *, require_observation=True,
+                                      require_notification=False):
     """Validate current structure and history using catalog reads only."""
     await check_application_schema(
         conn, ledger_optional=False,
-        allow_missing_observations=not require_observation)
+        allow_missing_observations=not require_observation,
+        allow_missing_notifications=not require_notification)
     await admin(conn, required_updated=True)
     await ledger(conn, allow_bootstrap=True, require_revision=True,
                  require_current=True, require_observation=require_observation)
+    if require_notification:
+        await ledger(conn, allow_bootstrap=True, require_notification=True)

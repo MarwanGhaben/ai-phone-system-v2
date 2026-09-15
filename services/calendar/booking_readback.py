@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import math
 import re
 import time
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 
 TOKEN_HOST = "https://login.microsoftonline.com"
@@ -53,6 +55,37 @@ class ProviderResult:
     retry_after: int = 0
     stop_batch: bool = False
     observed_provider_id: str | None = None
+
+
+@dataclass(frozen=True)
+class InventoryResult:
+    absent: bool | None
+    error_category: str | None = None
+    retry_after: int = 0
+    stop_batch: bool = False
+
+
+def _safe_inventory_next_link(value: object, collection_url: str) -> str:
+    """Accept only a same-business Graph collection continuation, no filters."""
+    if not isinstance(value, str) or not value:
+        raise ReadbackFailure('malformed')
+    try:
+        current, original = urlsplit(value), urlsplit(collection_url)
+        port = current.port
+    except ValueError:
+        raise ReadbackFailure('malformed') from None
+    if (current.scheme != 'https' or current.hostname != 'graph.microsoft.com'
+            or port is not None or current.username is not None
+            or current.password is not None or current.fragment
+            or unquote(current.path) != unquote(original.path)):
+        raise ReadbackFailure('malformed')
+    query = parse_qsl(current.query, keep_blank_values=True)
+    keys = [key for key, token in query]
+    if (not query or len(keys) != len(set(keys))
+            or any(key not in ('$skiptoken', '$top') for key in keys)
+            or any(not token for _, token in query)):
+        raise ReadbackFailure('malformed')
+    return value
 
 
 def _utc(value: object) -> datetime:
@@ -146,6 +179,15 @@ class BookingReadbackClient:
         self._owns_client = client is None
         self._token: str | None = None
         self._token_until = 0.0
+        self._admission_conn = ContextVar('booking_readback_admission', default=None)
+
+    @contextmanager
+    def _bind_admission(self, conn):
+        token = self._admission_conn.set(conn)
+        try:
+            yield
+        finally:
+            self._admission_conn.reset(token)
 
     async def close(self) -> None:
         if self._client is not None and self._owns_client:
@@ -159,6 +201,30 @@ class BookingReadbackClient:
             self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=False)
         return self._client
 
+    async def _request(self, method: str, url: str, *, token: bool = False, **kwargs):
+        """Check the shared pause before every OAuth/Graph request and page."""
+        conn = self._admission_conn.get()
+        if conn is not None:
+            from services.calendar.provider_admission import is_paused
+            if await is_paused(conn):
+                raise ReadbackFailure('throttled', stop_batch=True)
+        client = await self._transport()
+        try:
+            response = await getattr(client, method)(url, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if conn is not None:
+                from services.calendar.provider_admission import publish_pause
+                await publish_pause(conn, 60)
+            raise
+        if conn is not None and (response.status_code in (401, 403, 429)
+                                 or response.status_code >= 500):
+            from services.calendar.provider_admission import publish_pause
+            failure = _http_failure(response.status_code, response.headers, token=token)
+            await publish_pause(conn, failure.retry_after)
+        return response
+
     async def _access_token(self) -> str:
         if self._token is not None and time.monotonic() < self._token_until:
             return self._token
@@ -166,15 +232,17 @@ class BookingReadbackClient:
         if not all((s.ms_bookings_tenant_id, s.ms_bookings_client_id,
                     s.ms_bookings_client_secret, s.ms_bookings_business_id)):
             raise ReadbackFailure("configuration", stop_batch=True)
-        client = await self._transport()
         try:
-            response = await client.post(
+            response = await self._request('post',
                 TOKEN_HOST + "/" + quote(s.ms_bookings_tenant_id, safe="") + "/oauth2/v2.0/token",
+                token=True,
                 data={"grant_type": "client_credentials", "client_id": s.ms_bookings_client_id,
                       "client_secret": s.ms_bookings_client_secret,
                       "scope": "https://graph.microsoft.com/.default"},
             )
         except asyncio.CancelledError:
+            raise
+        except ReadbackFailure:
             raise
         except Exception as error:
             try:
@@ -192,14 +260,15 @@ class BookingReadbackClient:
             token = body["access_token"]
             lifetime = body.get("expires_in", 300)
         except (ValueError, TypeError, KeyError):
-            raise ReadbackFailure("malformed", stop_batch=True) from None
+            raise ReadbackFailure("malformed", retry_after=60,
+                                  stop_batch=True) from None
         try:
             finite_lifetime = math.isfinite(lifetime) and lifetime > 0
         except (TypeError, ValueError, OverflowError):
             finite_lifetime = False
         if (not isinstance(token, str) or not token or not isinstance(lifetime, (int, float))
                 or isinstance(lifetime, bool) or not finite_lifetime):
-            raise ReadbackFailure("malformed", stop_batch=True)
+            raise ReadbackFailure("malformed", retry_after=60, stop_batch=True)
         self._token = token
         self._token_until = time.monotonic() + max(1, min(float(lifetime), 3600) - 60)
         return token
@@ -211,11 +280,11 @@ class BookingReadbackClient:
                     or not isinstance(local_start, datetime) or local_start.utcoffset() is None):
                 raise ReadbackFailure("configuration", stop_batch=True)
             token = await self._access_token()
-            client = await self._transport()
             url = (GRAPH_HOST + "/v1.0/solutions/bookingBusinesses/"
                    + quote(self.settings.ms_bookings_business_id, safe="")
                    + "/appointments/" + quote(saved_provider_id, safe=""))
-            response = await client.get(url, headers={"Authorization": "Bearer " + token})
+            response = await self._request(
+                'get', url, headers={"Authorization": "Bearer " + token})
             if response.status_code == 404:
                 return ProviderResult("unavailable", http_status=404)
             if response.status_code != 200:
@@ -245,3 +314,72 @@ class BookingReadbackClient:
             except ImportError:
                 timeout = isinstance(error, TimeoutError)
             return ProviderResult("check_failed", "timeout" if timeout else "network")
+
+    async def inventory_absent(self, saved_provider_id: str,
+                               tenant_id: str, business_id: str) -> InventoryResult:
+        """Read exact business and its complete unfiltered appointment collection."""
+        try:
+            if (not saved_provider_id or not tenant_id or not business_id
+                    or tenant_id != self.settings.ms_bookings_tenant_id
+                    or business_id != self.settings.ms_bookings_business_id):
+                raise ReadbackFailure('configuration', stop_batch=True)
+            business_url = (GRAPH_HOST + '/v1.0/solutions/bookingBusinesses/'
+                            + quote(business_id, safe=''))
+            collection = business_url + '/appointments'
+            token = await self._access_token()
+            headers = {'Authorization': 'Bearer ' + token}
+            seen_urls, seen_ids = set(), set()
+            url = collection
+            count = 0
+            async with asyncio.timeout(30):
+                business = await self._request('get', business_url, headers=headers)
+                if business.status_code != 200:
+                    raise _http_failure(business.status_code, business.headers, token=False)
+                try:
+                    identity = business.json()
+                except (TypeError, ValueError):
+                    raise ReadbackFailure('malformed') from None
+                if not isinstance(identity, dict) or identity.get('id') != business_id:
+                    raise ReadbackFailure('identity_mismatch')
+                for _ in range(20):
+                    if url in seen_urls:
+                        raise ReadbackFailure('malformed')
+                    seen_urls.add(url)
+                    response = await self._request('get', url, headers=headers)
+                    if response.status_code != 200:
+                        raise _http_failure(response.status_code, response.headers, token=False)
+                    try:
+                        page = response.json()
+                    except (TypeError, ValueError):
+                        raise ReadbackFailure('malformed') from None
+                    if not isinstance(page, dict) or not isinstance(page.get('value'), list):
+                        raise ReadbackFailure('malformed')
+                    for item in page['value']:
+                        if not isinstance(item, dict) or not isinstance(item.get('id'), str) or not item['id']:
+                            raise ReadbackFailure('malformed')
+                        identifier = item['id']
+                        if identifier in seen_ids:
+                            raise ReadbackFailure('malformed')
+                        seen_ids.add(identifier)
+                        count += 1
+                        if count > 2000:
+                            raise ReadbackFailure('malformed')
+                        if identifier == saved_provider_id:
+                            return InventoryResult(False)
+                    next_link = page.get('@odata.nextLink')
+                    if next_link is None:
+                        return InventoryResult(True)
+                    url = _safe_inventory_next_link(next_link, collection)
+                raise ReadbackFailure('malformed')
+        except asyncio.CancelledError:
+            raise
+        except ReadbackFailure as error:
+            if error.http_status == 401:
+                self._token = None
+                self._token_until = 0.0
+            return InventoryResult(None, error.category, error.retry_after,
+                                   error.stop_batch)
+        except TimeoutError:
+            return InventoryResult(None, 'timeout', 60, True)
+        except Exception:
+            return InventoryResult(None, 'network', 60, True)

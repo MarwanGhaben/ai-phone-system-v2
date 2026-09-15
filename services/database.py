@@ -63,7 +63,10 @@ async def check_database_compatibility(pool: Optional[asyncpg.Pool] = None) -> N
                             "SET LOCAL statement_timeout = '4000ms'; "
                             "SET LOCAL lock_timeout = '3000ms'; "
                             "SET LOCAL search_path = pg_catalog")
-                        await check_runtime_compatibility(conn)
+                        await check_runtime_compatibility(
+                            conn,
+                            require_notification=getattr(
+                                settings, 'automatic_notifications_enabled', False))
     except Exception:
         raise DatabaseReadinessError("database unavailable") from None
 

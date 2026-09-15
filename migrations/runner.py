@@ -16,6 +16,9 @@ from migrations.schema_contract import (
     OBSERVATION_REVISION_VERSION,
     OBSERVATION_TABLE,
     OBSERVATION_CONTROL_TABLE,
+    NOTIFICATION_REVISION_CHECKSUM,
+    NOTIFICATION_REVISION_VERSION,
+    NOTIFICATION_TABLES,
     BOOTSTRAP_CHECKSUM,
     BOOTSTRAP_VERSION,
     REVISION_CHECKSUM,
@@ -25,6 +28,7 @@ from migrations.schema_contract import (
     admin as contract_admin,
     check_application_schema,
     check_observation_schema,
+    check_notification_schema,
     check_runtime_compatibility,
     columns as contract_columns,
     ledger as contract_ledger,
@@ -36,6 +40,7 @@ MANIFEST = (
     ("0001", "0001_admin_users_updated_at.sql"),
     ("0002", "0002_bookings_aware_time.sql"),
     ("0003", "0003_booking_provider_observations.sql"),
+    ("0004", "0004_appointment_notifications.sql"),
 )
 # Stable across processes/Python hash randomization; database-local project key.
 LOCK_KEY = int.from_bytes(
@@ -74,6 +79,7 @@ def _load_revisions():
         REVISION_VERSION: REVISION_CHECKSUM,
         BOOKINGS_REVISION_VERSION: BOOKINGS_REVISION_CHECKSUM,
         OBSERVATION_REVISION_VERSION: OBSERVATION_REVISION_CHECKSUM,
+        NOTIFICATION_REVISION_VERSION: NOTIFICATION_REVISION_CHECKSUM,
     }
     revisions = []
     for version, filename in MANIFEST:
@@ -84,7 +90,7 @@ def _load_revisions():
         revisions.append((version, raw.decode("utf-8"), checksum))
     if tuple(version for version, _, _ in revisions) != (
             REVISION_VERSION, BOOKINGS_REVISION_VERSION,
-            OBSERVATION_REVISION_VERSION):
+            OBSERVATION_REVISION_VERSION, NOTIFICATION_REVISION_VERSION):
         raise MigrationError("migration file")
     return tuple(revisions)
 
@@ -154,6 +160,12 @@ async def _ledger(conn, checksum):
             await check_runtime_compatibility(conn)
         elif BOOKINGS_REVISION_VERSION in versions:
             await check_runtime_compatibility(conn, require_observation=False)
+        for table in NOTIFICATION_TABLES:
+            if (await contract_relation(conn, table, optional=True) is not None
+                    and NOTIFICATION_REVISION_VERSION not in versions):
+                raise SchemaCompatibilityError("incompatible schema")
+        if NOTIFICATION_REVISION_VERSION in versions:
+            await check_runtime_compatibility(conn, require_notification=True)
     except SchemaCompatibilityError as exc:
         raise MigrationError(str(exc)) from None
     return exists, REVISION_VERSION in versions
@@ -219,7 +231,7 @@ async def _status(conn, *, revision_sql, revision_checksum):
     try:
         names = await relation_names(conn)
         allowed = set(TABLE_COLUMNS) | {
-            "schema_migrations", OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE}
+            "schema_migrations", OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE} | NOTIFICATION_TABLES
         if set(TABLE_COLUMNS).issubset(names):
             if not names.issubset(allowed):
                 raise SchemaCompatibilityError("incompatible schema")
@@ -231,11 +243,17 @@ async def _status(conn, *, revision_sql, revision_checksum):
             if ({OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE} & names
                     and OBSERVATION_REVISION_VERSION not in versions):
                 raise SchemaCompatibilityError("incompatible schema")
+            if (NOTIFICATION_TABLES & names
+                    and NOTIFICATION_REVISION_VERSION not in versions):
+                raise SchemaCompatibilityError("incompatible schema")
             await _admin(
                 conn, required_updated=REVISION_VERSION in versions)
+            if NOTIFICATION_REVISION_VERSION in versions:
+                await check_runtime_compatibility(conn, require_notification=True)
+                return "up-to-date 0004"
             if OBSERVATION_REVISION_VERSION in versions:
                 await check_runtime_compatibility(conn)
-                return "up-to-date 0003"
+                return "pending 0004"
             if BOOKINGS_REVISION_VERSION in versions:
                 await check_runtime_compatibility(conn, require_observation=False)
                 return "pending 0003"
@@ -249,6 +267,7 @@ async def _status(conn, *, revision_sql, revision_checksum):
 async def _prepare_execute(conn, *, revision_sql, revision_checksum,
                            bookings_sql, bookings_checksum,
                            observations_sql, observations_checksum,
+                           notifications_sql, notifications_checksum,
                            bootstrap_sql, bootstrap_checksum):
     if not await conn.fetchval(
         "SELECT pg_catalog.pg_try_advisory_xact_lock($1::bigint)", LOCK_KEY,
@@ -274,16 +293,18 @@ async def _prepare_execute(conn, *, revision_sql, revision_checksum,
         await _apply_bookings_revision(conn, bookings_sql, bookings_checksum)
         await _apply_observation_revision(
             conn, observations_sql, observations_checksum)
+        await _apply_notification_revision(
+            conn, notifications_sql, notifications_checksum)
         try:
-            await check_runtime_compatibility(conn)
+            await check_runtime_compatibility(conn, require_notification=True)
         except SchemaCompatibilityError as exc:
             raise MigrationError(str(exc)) from None
-        return "prepared bootstrap-v1 0001 0002 0003"
+        return "prepared bootstrap-v1 0001 0002 0003 0004"
 
     try:
         names = await relation_names(conn)
         allowed = set(TABLE_COLUMNS) | {
-            "schema_migrations", OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE}
+            "schema_migrations", OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE} | NOTIFICATION_TABLES
         if not set(TABLE_COLUMNS).issubset(names) or not names.issubset(allowed):
             raise SchemaCompatibilityError("incompatible schema")
         lock_targets = [
@@ -300,8 +321,15 @@ async def _prepare_execute(conn, *, revision_sql, revision_checksum,
         if ({OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE} & names
                 and OBSERVATION_REVISION_VERSION not in versions):
             raise SchemaCompatibilityError("incompatible schema")
+        if (NOTIFICATION_TABLES & names
+                and NOTIFICATION_REVISION_VERSION not in versions):
+            raise SchemaCompatibilityError("incompatible schema")
     except SchemaCompatibilityError as exc:
         raise MigrationError(str(exc)) from None
+
+    if NOTIFICATION_REVISION_VERSION in versions:
+        await check_runtime_compatibility(conn, require_notification=True)
+        return "up-to-date 0004"
 
     if OBSERVATION_REVISION_VERSION in versions:
         await _admin(conn, required_updated=True)
@@ -309,13 +337,17 @@ async def _prepare_execute(conn, *, revision_sql, revision_checksum,
             await check_runtime_compatibility(conn)
         except SchemaCompatibilityError as exc:
             raise MigrationError(str(exc)) from None
-        return "up-to-date 0003"
+        await _apply_notification_revision(
+            conn, notifications_sql, notifications_checksum)
+        return "applied 0004"
 
     if BOOKINGS_REVISION_VERSION in versions:
         await check_runtime_compatibility(conn, require_observation=False)
         await _apply_observation_revision(
             conn, observations_sql, observations_checksum)
-        return "applied 0003"
+        await _apply_notification_revision(
+            conn, notifications_sql, notifications_checksum)
+        return "applied 0004"
 
     if REVISION_VERSION not in versions:
         await _execute(
@@ -325,11 +357,12 @@ async def _prepare_execute(conn, *, revision_sql, revision_checksum,
     await _apply_bookings_revision(
         conn, bookings_sql, bookings_checksum)
     await _apply_observation_revision(conn, observations_sql, observations_checksum)
+    await _apply_notification_revision(conn, notifications_sql, notifications_checksum)
     try:
-        await check_runtime_compatibility(conn)
+        await check_runtime_compatibility(conn, require_notification=True)
     except SchemaCompatibilityError as exc:
         raise MigrationError(str(exc)) from None
-    return "applied 0003"
+    return "applied 0004"
 
 
 async def _apply_bookings_revision(conn, sql, checksum):
@@ -386,6 +419,30 @@ async def _apply_observation_revision(conn, sql, checksum):
         raise MigrationError(str(exc)) from None
 
 
+async def _apply_notification_revision(conn, sql, checksum):
+    if checksum != NOTIFICATION_REVISION_CHECKSUM:
+        raise MigrationError("migration file")
+    try:
+        _, versions = await contract_ledger(
+            conn, allow_bootstrap=True, require_revision=True,
+            require_current=True, require_observation=True)
+        if NOTIFICATION_REVISION_VERSION in versions:
+            await check_runtime_compatibility(conn, require_notification=True)
+            return "up-to-date 0004"
+        for table in NOTIFICATION_TABLES:
+            if await contract_relation(conn, table, optional=True) is not None:
+                raise SchemaCompatibilityError("incompatible schema")
+        await check_runtime_compatibility(conn)
+        await conn.execute(sql)
+        await check_notification_schema(conn)
+        await _record_revision(
+            conn, NOTIFICATION_REVISION_VERSION, NOTIFICATION_REVISION_CHECKSUM)
+        await check_runtime_compatibility(conn, require_notification=True)
+        return "applied 0004"
+    except SchemaCompatibilityError as exc:
+        raise MigrationError(str(exc)) from None
+
+
 async def run(*, apply=False, prepare=False):
     if apply and prepare:
         raise MigrationError(
@@ -399,6 +456,7 @@ async def run(*, apply=False, prepare=False):
         revisions = _load_revisions()
         _, bookings_sql, bookings_checksum = revisions[1]
         _, observations_sql, observations_checksum = revisions[2]
+        _, notifications_sql, notifications_checksum = revisions[3]
         if prepare:
             bootstrap_sql, bootstrap_checksum = _load_bootstrap()
     except Exception:
@@ -421,6 +479,8 @@ async def run(*, apply=False, prepare=False):
                     bookings_checksum=bookings_checksum,
                     observations_sql=observations_sql,
                     observations_checksum=observations_checksum,
+                    notifications_sql=notifications_sql,
+                    notifications_checksum=notifications_checksum,
                     bootstrap_sql=bootstrap_sql, bootstrap_checksum=bootstrap_checksum)
             if not apply:
                 return await _status(

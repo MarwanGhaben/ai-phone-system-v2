@@ -36,6 +36,12 @@ class TelnyxSMSService:
     def is_available(self) -> bool:
         return self._available
 
+    async def submit_notification(self, to_number: str, message: str):
+        """Outbox-only structured result; never log payloads or infer delivery."""
+        from services.sms.telnyx_submission import submit_message
+        return await submit_message(
+            self.api_key, self.from_number, to_number, message)
+
     async def send_sms(self, to_number: str, message: str) -> bool:
         """
         Send an SMS message.

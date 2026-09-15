@@ -50,19 +50,30 @@ async def lifespan(app: FastAPI):
     reminder_scheduler = None
     scheduler_started = False
     observation_poller = None
+    notification_worker = None
     try:
+        workers_paused = getattr(
+            settings, 'automatic_notification_workers_paused', False)
+        if (getattr(settings, 'automatic_notifications_enabled', False)
+                and not getattr(settings, 'booking_observation_enabled', False)):
+            raise RuntimeError('automatic notifications require provider observation')
+        if (workers_paused
+                and not getattr(settings, 'automatic_notifications_enabled', False)):
+            raise RuntimeError('paused notification workers require automatic notifications')
         pool = await get_db_pool()
         await check_database_compatibility(pool)
         logger.info("Database connection pool and schema initialized")
 
         # Start only after the database has passed the read-only compatibility gate.
-        from services.sms.reminder_scheduler import get_reminder_scheduler
-        reminder_scheduler = get_reminder_scheduler()
-        reminder_scheduler.start()
-        scheduler_started = True
-        logger.info("SMS reminder scheduler started")
+        if not getattr(settings, 'automatic_notifications_enabled', False):
+            from services.sms.reminder_scheduler import get_reminder_scheduler
+            reminder_scheduler = get_reminder_scheduler()
+            reminder_scheduler.start()
+            scheduler_started = True
+            logger.info("Legacy SMS reminder scheduler started")
 
-        if getattr(settings, "booking_observation_enabled", False):
+        if (getattr(settings, "booking_observation_enabled", False)
+                and not workers_paused):
             from services.scheduling.provider_observations import ObservationPoller
             observation_poller = ObservationPoller(pool, settings)
             observation_poller.start()
@@ -78,19 +89,30 @@ async def lifespan(app: FastAPI):
             logger.warning("TTS prewarm skipped")
 
         app.state.ready = True
+        if workers_paused:
+            logger.warning('Automatic notification workers paused for degraded recovery')
+        elif getattr(settings, 'automatic_notifications_enabled', False):
+            from services.sms.notification_worker import NotificationWorker
+            notification_worker = NotificationWorker(pool, settings)
+            notification_worker.start()
+            logger.info('Appointment notification outbox worker started')
         yield
     finally:
         app.state.ready = False
         try:
-            if observation_poller is not None:
-                await observation_poller.stop()
+            if notification_worker is not None:
+                await notification_worker.stop()
         finally:
             try:
-                if scheduler_started and reminder_scheduler is not None:
-                    reminder_scheduler.stop()
+                if observation_poller is not None:
+                    await observation_poller.stop()
             finally:
-                await close_db_pool()
-                logger.info("AI Voice Platform v2 shutting down...")
+                try:
+                    if scheduler_started and reminder_scheduler is not None:
+                        reminder_scheduler.stop()
+                finally:
+                    await close_db_pool()
+                    logger.info("AI Voice Platform v2 shutting down...")
 
 
 # Create FastAPI app
