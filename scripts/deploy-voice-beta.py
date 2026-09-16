@@ -1,4 +1,4 @@
-"""Owner-run T034-B app-only voice beta rollout.
+"""Owner-run T034-C app-only availability acknowledgement rollout.
 
 Importing this module is side-effect free. The executable script must be fetched
 from the exact reviewed commit passed on the command line. Public output uses only
@@ -24,11 +24,11 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path("/opt/ai-phone-system-v2")
 BASE_CHECKOUT = "1480eeb0e36596e26d0dedde77f08beee91aec5b"
-DEPLOYED_SOURCE = "3e1a7496dfd596a5294ab0124027dce3ac3724d5"
-OLD_IMAGE = "sha256:3ec973f4220e38d2a6a4636ed55c5eba22b355d6b8e7daca3936a0a9477488e5"
+DEPLOYED_SOURCE = "2f7e15e1b38f051615fc63c11f7bf6a66d827ad9"
+OLD_IMAGE = "sha256:9cecc2353a29f4fefdd95566a7c1365fca8cbd380e9db8777ce08914cf3b14f5"
 NGINX_HASH = "59ac9bdaa9a86c1022a573c9709faddf7e93a53015da8acfcc4330b3e288f3ab"
 PROJECT = "ai-phone-system-v2"
-MANIFEST_PATH = "docs/delegation/T034-B-accepted-hashes.json"
+MANIFEST_PATH = "docs/delegation/T034-C-accepted-hashes.json"
 PUBLIC_HEALTH_URL = "https://aiagent.ghaben.ca:8443/health"
 
 RUNTIME_PATHS = (
@@ -43,6 +43,7 @@ RUNTIME_PATHS = (
 )
 TEST_PATHS = (
     "tests/conftest.py",
+    "tests/conversation/test_availability_acknowledgement.py",
     "tests/conversation/test_booking_cancellation.py",
     "tests/conversation/test_booking_safety_guards.py",
     "tests/conversation/test_booking_time_validation.py",

@@ -112,7 +112,7 @@ class OfflineReleaseTests(unittest.TestCase):
                 )
                 self.assertEqual(actual, expected, relative)
                 observed[relative] = actual
-        self.assertEqual(len(observed), 25)
+        self.assertEqual(len(observed), 26)
 
     def test_verify_source_accepts_only_exact_runtime_scope(self):
         nginx = self.item.root / "nginx" / "nginx.conf"

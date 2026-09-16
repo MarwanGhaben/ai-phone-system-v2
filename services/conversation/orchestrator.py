@@ -42,6 +42,11 @@ from services.scheduling.booking_records import (
 
 _DATETIME_TYPE = datetime
 _MAX_CONSUMED_UTTERANCE_IDENTITIES = 256
+_ABORTED_RESPONSE = object()
+_AVAILABILITY_ACKNOWLEDGEMENTS = {
+    "en": "Certainly, I'll check availability.",
+    "ar": "حاضر، سأتحقق من المواعيد المتاحة.",
+}
 
 
 def _parse_booking_datetime(date_time_text: str) -> Optional[datetime]:
@@ -1219,6 +1224,11 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
         response = await self._get_ai_response(call_sid, transcript)
 
+        # This distinct marker carries no state transition. A progress-speech
+        # interruption or stale session already established the correct state.
+        if response is _ABORTED_RESPONSE:
+            return
+
         # Check if transfer was already handled (don't speak the marker)
         if response == "__TRANSFER_HANDLED__":
             async with state_lock:
@@ -2128,7 +2138,84 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             logger.error(traceback.format_exc())
             return f"CANCEL_ERROR: System error while cancelling: {str(e)}. Offer to transfer to a human."
 
-    async def _get_ai_response(self, call_sid: str, user_input: str) -> str:
+    @staticmethod
+    def _valid_availability_arguments(arguments: object) -> bool:
+        """Return whether a tool payload can reach an availability lookup."""
+        if not isinstance(arguments, dict):
+            return False
+        if arguments.get("client_type", "individual") not in (
+            "individual", "corporate"
+        ):
+            return False
+        for key in ("accountant_name", "customer_name", "customer_email"):
+            if key in arguments and not isinstance(arguments[key], str):
+                return False
+        date_time_text = arguments.get("date_time") or ""
+        if not isinstance(date_time_text, str):
+            return False
+        return _parse_booking_datetime(date_time_text) is not None
+
+    def _availability_session_is_current(
+        self,
+        call_sid: str,
+        context: ConversationContext,
+        handler: TwilioMediaStreamHandler,
+        state_lock: asyncio.Lock,
+    ) -> bool:
+        return (
+            self._conversations.get(call_sid) is context
+            and self._twilio_handlers.get(call_sid) is handler
+            and self._call_state_locks.get(call_sid) is state_lock
+            and context.state != ConversationState.ENDED
+        )
+
+    async def _acknowledge_availability_search(
+        self,
+        call_sid: str,
+        context: ConversationContext,
+        handler: TwilioMediaStreamHandler,
+        state_lock: asyncio.Lock,
+    ) -> bool:
+        """Speak one owned progress phrase and fence the new await boundary."""
+        if not self._availability_session_is_current(
+            call_sid, context, handler, state_lock
+        ):
+            return False
+
+        language = "ar" if context.language == "ar" else "en"
+        async with state_lock:
+            if not self._availability_session_is_current(
+                call_sid, context, handler, state_lock
+            ):
+                return False
+            context.state = ConversationState.SPEAKING
+            self._barge_in_speech_start[call_sid] = time.time()
+
+        tts_was_available = bool(self.tts)
+        played = await self._speak_to_caller(
+            call_sid, _AVAILABILITY_ACKNOWLEDGEMENTS[language], language
+        )
+        if (
+            not self._availability_session_is_current(
+                call_sid, context, handler, state_lock
+            )
+            or self._barge_in_reset_done.get(call_sid, False)
+            or (tts_was_available and played is not True)
+        ):
+            return False
+
+        async with state_lock:
+            if (
+                not self._availability_session_is_current(
+                    call_sid, context, handler, state_lock
+                )
+                or self._barge_in_reset_done.get(call_sid, False)
+            ):
+                return False
+            context.state = ConversationState.THINKING
+        return True
+
+    async def _get_ai_response(self, call_sid: str, user_input: str) -> str | object:
         """
         Get AI response for user input, with function calling support for bookings.
 
@@ -2305,6 +2392,7 @@ CRITICAL INSTRUCTIONS:
             tools=tools
         )
 
+        availability_session = None
         try:
             llm_response = await self.llm.chat_with_tools(request)
 
@@ -2466,7 +2554,29 @@ CRITICAL INSTRUCTIONS:
                     if tool_name in ("check_appointment", "confirm_appointment", "lookup_my_bookings", "cancel_booking"):
                         # Execute the appropriate booking step
                         if tool_name == "check_appointment":
+                            if self._valid_availability_arguments(arguments):
+                                handler = self._twilio_handlers.get(call_sid)
+                                state_lock = self._call_state_locks.get(call_sid)
+                                availability_session = (context, handler, state_lock)
+                                # A new request revokes the old proposal even if
+                                # progress speech is interrupted before lookup.
+                                context.pending_booking = None
+                                if (
+                                    handler is None
+                                    or state_lock is None
+                                    or not await self._acknowledge_availability_search(
+                                        call_sid, context, handler, state_lock
+                                    )
+                                ):
+                                    return _ABORTED_RESPONSE
                             booking_result = await self._check_booking(call_sid, arguments)
+                            if (
+                                availability_session is not None
+                                and not self._availability_session_is_current(
+                                    call_sid, *availability_session
+                                )
+                            ):
+                                return _ABORTED_RESPONSE
                         elif tool_name == "confirm_appointment":
                             booking_result = await self._confirm_booking(call_sid, arguments)
                         elif tool_name == "lookup_my_bookings":
@@ -2521,9 +2631,23 @@ CRITICAL INSTRUCTIONS:
                         )
                         full_response = ""
                         async for chunk in self.llm.chat_stream(follow_up_request):
+                            if (
+                                availability_session is not None
+                                and not self._availability_session_is_current(
+                                    call_sid, *availability_session
+                                )
+                            ):
+                                return _ABORTED_RESPONSE
                             full_response += chunk.delta
 
                         response = full_response.strip()
+                        if (
+                            availability_session is not None
+                            and not self._availability_session_is_current(
+                                call_sid, *availability_session
+                            )
+                        ):
+                            return _ABORTED_RESPONSE
                         context.add_assistant_message(response)
                         return response
 
@@ -2531,6 +2655,13 @@ CRITICAL INSTRUCTIONS:
             response = llm_response.content.strip()
 
         except Exception as e:
+            if (
+                availability_session is not None
+                and not self._availability_session_is_current(
+                    call_sid, *availability_session
+                )
+            ):
+                return _ABORTED_RESPONSE
             logger.error(f"Orchestrator: Function calling failed, falling back to streaming: {e}")
             # Fallback to streaming without tools
             request = LLMRequest(
@@ -2541,17 +2672,33 @@ CRITICAL INSTRUCTIONS:
             )
             full_response = ""
             async for chunk in self.llm.chat_stream(request):
+                if (
+                    availability_session is not None
+                    and not self._availability_session_is_current(
+                        call_sid, *availability_session
+                    )
+                ):
+                    return _ABORTED_RESPONSE
                 full_response += chunk.delta
             response = full_response.strip()
 
         # =====================================================
         # ADD ASSISTANT RESPONSE TO HISTORY (Phase 1.2)
         # =====================================================
+        # EOF itself can await; checking only yielded chunks misses teardown
+        # after the last chunk of a fallback response.
+        if (
+            availability_session is not None
+            and not self._availability_session_is_current(
+                call_sid, *availability_session
+            )
+        ):
+            return _ABORTED_RESPONSE
         context.add_assistant_message(response)
 
         return response
 
-    async def _speak_to_caller(self, call_sid: str, text: str, language: str) -> None:
+    async def _speak_to_caller(self, call_sid: str, text: str, language: str) -> bool:
         """
         Speak response to caller using streaming TTS.
 
@@ -2572,17 +2719,24 @@ CRITICAL INSTRUCTIONS:
         twilio_handler = self._twilio_handlers.get(call_sid)
         state_lock = self._call_state_locks.get(call_sid)
 
-        if not context or not twilio_handler:
+        if not context or not twilio_handler or not state_lock:
             logger.error(f"Orchestrator: Missing context or handler")
-            return
+            return False
 
         if not self.tts:
             logger.warning("TTS not available, cannot speak to caller")
             async with state_lock:
-                context.state = ConversationState.LISTENING
-            return
+                if (
+                    self._conversations.get(call_sid) is context
+                    and self._twilio_handlers.get(call_sid) is twilio_handler
+                    and self._call_state_locks.get(call_sid) is state_lock
+                    and context.state != ConversationState.ENDED
+                ):
+                    context.state = ConversationState.LISTENING
+            return False
 
         owner = None
+        speech_completed = False
         try:
             # Clear the barge-in reset flag at the start of each TTS turn
             # This ensures we track fresh barge-ins for this utterance
@@ -2615,7 +2769,7 @@ CRITICAL INSTRUCTIONS:
                     or self._twilio_handlers.get(call_sid) is not twilio_handler
                     or context.state == ConversationState.ENDED
                 ):
-                    return
+                    return False
 
                 previous = self._active_speech.pop(call_sid, None)
                 if previous is not None:
@@ -2630,7 +2784,7 @@ CRITICAL INSTRUCTIONS:
                     or not twilio_handler.is_current_playback(playback)
                 ):
                     twilio_handler.release_playback(playback)
-                    return
+                    return False
                 audio_stream = self.tts.create_stream(request)
                 owner = _SpeechOwner(context, twilio_handler, audio_stream, playback)
                 self._active_speech[call_sid] = owner
@@ -2647,7 +2801,7 @@ CRITICAL INSTRUCTIONS:
 
             if not stream_result.completed or stream_result.bytes_sent == 0:
                 logger.warning("Orchestrator: TTS streaming did not complete")
-                return
+                return False
 
             audio_duration = stream_result.bytes_sent / 8000.0
             playback_confirmed = await twilio_handler.wait_for_playback(
@@ -2661,7 +2815,7 @@ CRITICAL INSTRUCTIONS:
                 )
 
             if not self._speech_is_current(call_sid, owner):
-                return
+                return False
 
             # Reset STT for clean listening — reconnects to flush echo buffer
             # This gives STT a completely clean slate so the user's first words
@@ -2673,15 +2827,16 @@ CRITICAL INSTRUCTIONS:
             if call_stt and not barge_in_already_reset:
                 await call_stt.reset_for_listening()
                 if not self._speech_is_current(call_sid, owner):
-                    return
+                    return False
             elif barge_in_already_reset:
                 logger.info(f"Orchestrator: Skipping post-TTS STT reset (barge-in already did it)")
 
             # Set echo guard for residual phone speaker echo (shortened since STT is clean)
             if not self._speech_is_current(call_sid, owner):
-                return
+                return False
             self._echo_guard_until[call_sid] = time.time() + 0.15
             logger.info(f"Orchestrator: Playback complete, echo guard 0.15s")
+            speech_completed = playback_confirmed
 
         except Exception as exc:
             logger.error(
@@ -2708,28 +2863,37 @@ CRITICAL INSTRUCTIONS:
                         self._active_speech.pop(call_sid, None)
                         if (
                             self._conversations.get(call_sid) is context
+                            and self._twilio_handlers.get(call_sid) is twilio_handler
+                            and self._call_state_locks.get(call_sid) is state_lock
                             and context.state != ConversationState.ENDED
                         ):
                             async with state_lock:
                                 if (
                                     self._conversations.get(call_sid) is context
+                                    and self._twilio_handlers.get(call_sid) is twilio_handler
+                                    and self._call_state_locks.get(call_sid) is state_lock
                                     and call_sid not in self._active_speech
                                     and context.state == ConversationState.SPEAKING
                                 ):
                                     context.state = ConversationState.LISTENING
             elif (
                 self._conversations.get(call_sid) is context
+                and self._twilio_handlers.get(call_sid) is twilio_handler
+                and self._call_state_locks.get(call_sid) is state_lock
                 and call_sid not in self._active_speech
                 and context.state == ConversationState.SPEAKING
             ):
                 async with state_lock:
                     if (
                         self._conversations.get(call_sid) is context
+                        and self._twilio_handlers.get(call_sid) is twilio_handler
+                        and self._call_state_locks.get(call_sid) is state_lock
                         and call_sid not in self._active_speech
                         and context.state == ConversationState.SPEAKING
                     ):
                         context.state = ConversationState.LISTENING
             logger.info(f"Orchestrator: _speak_to_caller END (state={context.state.value})")
+        return speech_completed
 
     def _speech_is_current(self, call_sid: str, owner: _SpeechOwner) -> bool:
         return (

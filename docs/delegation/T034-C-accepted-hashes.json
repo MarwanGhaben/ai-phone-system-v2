@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "baseline_commit": "2f7e15e1b38f051615fc63c11f7bf6a66d827ad9",
+  "branch": "codex/phase-4-arabic-voice-quality",
+  "hash_convention": "SHA-256 over UTF-8 source bytes with CRLF converted to LF, no other transformation. Stage and verify exactly these normalized bytes.",
+  "runtime": {
+    "services/conversation/events.py": "f551ee7fc7d207e65f81b3a03a714f8f3c4815a7a914331d8d9acc1b94d04651",
+    "services/conversation/language_policy.py": "9ec8c2c349061ca39f3279fbfb9b89574e1a20d48e041eb800de1c1348ef39fa",
+    "services/conversation/orchestrator.py": "015b129220819ebd98ae2f943518907f0ab57db8fc6f39acf6484d6dce6f621a",
+    "services/conversation/turn_controller.py": "6bb1da8971a09a3e3f81e8061f96ae9db8095a1ba00f13d7f4b458a9d6798b4e",
+    "services/stt/elevenlabs_stt_service.py": "cd68501105959e5f73f1a07865ab25371282ccaaf29625032b6692bc0bab043b",
+    "services/stt/stt_base.py": "46e5b23daba1a6b0f6d4d3e19b092ba0ed592ec22a6de2083e72a29b622b2033",
+    "services/telephony/twilio_service.py": "28e6a75851620271d1e0244f74fb5dc3b3ce125cae54a3f3c482ddfde1399b3e",
+    "services/tts/elevenlabs_service.py": "9f673af85044995ed3bec238351f78cd690ba27086aa0397a7b7123ce7965fa0"
+  },
+  "tests": {
+    "tests/conftest.py": "5612921e2796a81fe8e7fe527a812c035195a959a3611cf6a41ef6e3f9c4a131",
+    "tests/conversation/test_booking_cancellation.py": "93a6e984a5c4d579f8b4dea9923422ad37656776dac9264fda602d382c0df9ea",
+    "tests/conversation/test_booking_safety_guards.py": "b15b1e565e30790c68f3bf149bbae42ddedeeca2727ed16089834cfe1eeb4771",
+    "tests/conversation/test_booking_time_validation.py": "1c28639993a7c161bc36de963bc908e1316bd9de8244ad3405fad579fed28124",
+    "tests/conversation/test_caller_language.py": "52ef808e05e8d702bafcdef7421b034ed3a697df17fddd3f093f64e6ef54a83a",
+    "tests/conversation/test_language_policy.py": "2f5100e9d33d9d7e77cef8a3e3bb6f9d54cd29d26a82eb4e726581f66dde410a",
+    "tests/conversation/test_playback_ownership.py": "2db54874a9ddf9bbbab0fda9bcdd2f5adc52232a4f16212b8cdf1daa64a97bb0",
+    "tests/conversation/test_transcript_identity.py": "9121a20f56fcba91fe6f3b4f790eba17886a5451345d4013b489adfdfed45bd2",
+    "tests/conversation/test_transfer_playback.py": "5a1c30445a6d092fb11a8310e50d683a85c5ac5b7b79310db749b6a2b4cfb123",
+    "tests/conversation/test_turn_controller.py": "405decc854a5d61de0db5a6e6bab965dc397215a3e2305d0f4784590b83dcb39",
+    "tests/stt/test_elevenlabs_reset.py": "c3b5080f16e6f0c89cba96d177015a263059c65f9f64115be95afe2241b45cb4",
+    "tests/stt/test_reset_preservation.py": "85d955c04d281cec0988bce570d9e092532a1c52ebe7c33cfd9352991f351cd1",
+    "tests/stt/test_utterance_events.py": "20dc164a9e5feb51f3ab838ea330d9e8f0df11f9a555f69a4dc305f77390b338",
+    "tests/stt/test_whisper_audio.py": "dd81931f3bd9be8a2d2f9d16271cba45a3b189a0f329dc757a31c8fbcba46228",
+    "tests/telephony/test_playback_generations.py": "afe7c0f336db40bb33c4b709fab64c2b703857ebfe89172329bbf1b9f5bc5bba",
+    "tests/telephony/test_twilio_stream.py": "39f90a01707f4e7702beefb390d3811a09f8b94fb1c61c65eb2508dc38a75650",
+    "tests/tts/test_call_isolation.py": "f6d74377dc9954c211599b184655bb473de1546dca8a47904e8c85938ed9db73",
+    "tests/conversation/test_availability_acknowledgement.py": "f01699f83232f34a9dd74c3436329d42efa45454919c7826c72eb975a55e417d"
+  }
+}
