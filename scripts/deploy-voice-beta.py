@@ -62,7 +62,9 @@ TEST_PATHS = (
     "tests/tts/test_call_isolation.py",
 )
 TEST_TARGETS = tuple(path for path in TEST_PATHS if path != "tests/conftest.py")
-SOURCE_SCOPE = frozenset(RUNTIME_PATHS)
+# The image retains all reviewed voice assets, but this incremental release
+# changes only the orchestrator relative to the already-deployed voice source.
+SOURCE_SCOPE = frozenset({"services/conversation/orchestrator.py"})
 APPLICATION_SCOPE = (
     "api",
     "clients",

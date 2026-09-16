@@ -130,7 +130,7 @@ class OfflineReleaseTests(unittest.TestCase):
             if arguments[:2] == ("git", "status"):
                 return completed(b"M nginx/nginx.conf\n")
             if arguments[:3] == ("git", "diff", "--name-only"):
-                return completed(("\n".join(release.RUNTIME_PATHS) + "\n").encode())
+                return completed(b"services/conversation/orchestrator.py\n")
             if arguments[:2] == ("git", "cat-file"):
                 return completed()
             self.fail("unexpected command: " + repr(arguments))
@@ -151,6 +151,64 @@ class OfflineReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "exceeds reviewed voice runtime scope"):
                 self.item.verify_source()
         self.assertEqual(expected_nginx, release.NGINX_HASH)
+
+    @unittest.skipUnless(shutil.which("git"), "real source-history regression requires Git")
+    def test_incremental_release_source_guard_with_real_git_history(self):
+        root = self.item.root
+
+        def git(*args):
+            return subprocess.run(
+                ["git", *args], cwd=root, capture_output=True, check=True, timeout=15,
+            )
+
+        git("init")
+        git("config", "user.name", "Synthetic Release Test")
+        git("config", "user.email", "synthetic@example.invalid")
+        git("config", "core.autocrlf", "false")
+        paths = (*release.RUNTIME_PATHS, release.MANIFEST_PATH,
+                 "scripts/deploy-voice-beta.py", "nginx/nginx.conf")
+        for relative in paths:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("baseline\n", encoding="utf-8")
+        git("add", ".")
+        git("-c", "commit.gpgsign=false", "commit", "-m", "baseline")
+        base = git("rev-parse", "HEAD").stdout.decode().strip()
+        for relative in release.RUNTIME_PATHS:
+            (root / relative).write_text("previous voice release\n", encoding="utf-8")
+        git("add", ".")
+        git("-c", "commit.gpgsign=false", "commit", "-m", "previous voice release")
+        deployed = git("rev-parse", "HEAD").stdout.decode().strip()
+        (root / "services/conversation/orchestrator.py").write_text(
+            "acknowledgement release\n", encoding="utf-8"
+        )
+        git("add", ".")
+        git("-c", "commit.gpgsign=false", "commit", "-m", "one runtime change")
+        candidate = git("rev-parse", "HEAD").stdout.decode().strip()
+        # An otherwise accepted voice file must not become an allowed change.
+        (root / "services/stt/stt_base.py").write_text("unreviewed change\n", encoding="utf-8")
+        git("add", ".")
+        git("-c", "commit.gpgsign=false", "commit", "-m", "extra runtime change")
+        extra = git("rev-parse", "HEAD").stdout.decode().strip()
+        git("checkout", "--detach", base)
+        (root / "nginx/nginx.conf").write_bytes(b"reviewed nginx\n")
+
+        def run(*arguments, **kwargs):
+            return subprocess.run(
+                arguments, cwd=root, capture_output=True,
+                check=kwargs.get("check", True), timeout=15,
+            )
+
+        self.item.run = run
+        self.item.commit = candidate
+        with mock.patch.multiple(
+            release, BASE_CHECKOUT=base, DEPLOYED_SOURCE=deployed,
+            NGINX_HASH=release.sha256(b"reviewed nginx\n"),
+        ):
+            self.item.verify_source()
+            self.item.commit = extra
+            with self.assertRaisesRegex(RuntimeError, "exceeds reviewed voice runtime scope"):
+                self.item.verify_source()
 
     def test_staging_rejects_any_hash_mismatch(self):
         self.item.git_bytes = lambda relative: (REPOSITORY / relative).read_bytes()

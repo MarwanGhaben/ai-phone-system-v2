@@ -1,5 +1,28 @@
 # T034-C independent review and release acceptance
 
+## Post-publication preflight correction
+
+Owner execution of2d6d23f stopped at preflight in
+`/opt/ai-phone-voice-release.gpq1nhql`, before any cutover marker. The lead found
+a deterministic packaging defect: SOURCE_SCOPE still equalled all8 packaged
+runtime paths, while the actual Git diff from deployed2f7e15e to2d6d23f contains
+only orchestrator.py. verify_source therefore rejects the intended release before
+capacity/settings/build/cutover. This was the lead's packaging error; the prior
+mock mirrored RUNTIME_PATHS and hid it, and image rehearsal did not exercise this
+host Git-history check. No private server logs were requested or read.
+
+Corrected SOURCE_SCOPE to exactly orchestrator.py, retaining all8 asset hash checks
+and rejecting changes to other voice files. Added a real temporary Git-history
+regression: baseline checkout plus nginx hotfix, prior8-file voice release,
+one-file candidate, then extra STT change. It accepts only the one-file candidate.
+Both the corrected mock fixture and real-history test failed before the fix and
+passed afterward. Focused release suite21 passed/1 Docker skip. Runtime, tests
+inside the candidate image, manifest and provider configuration are unchanged;
+repeating image rehearsal is unnecessary for this source-scope-only correction.
+The stopped release directory is retained. All normal preflight guards still run
+on the next owner attempt; no live server success is inferred from local tests.
+Final normal full suite:392 passed,50 optional skips,2 existing warnings.
+
 Baseline: phase4 HEAD `2f7e15e1b38f051615fc63c11f7bf6a66d827ad9`.
 Owner/server still runs that voice release until a separate manual rollout.
 
