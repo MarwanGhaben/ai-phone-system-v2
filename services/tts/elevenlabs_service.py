@@ -31,6 +31,208 @@ except ImportError:
 from .tts_base import TTSServiceBase, TTSRequest, TTSResponse, TTSChunk, TTSStatus
 
 
+_STREAM_DONE = object()
+
+
+class ElevenLabsStream:
+    """One independently cancellable use of the shared ElevenLabs HTTP pool.
+
+    Cancellation wakes a blocked consumer immediately.  HTTP response shutdown is
+    owned by the producer task and remains observable through ``cleanup_pending``
+    and ``wait_closed`` if an uncooperative transport outlives the 250 ms close
+    budget used by ``aclose``.
+    """
+
+    CLOSE_TIMEOUT_SECONDS = 0.25
+
+    def __init__(self, service: "ElevenLabsTTS", request: TTSRequest, *, scoped: bool = True):
+        self._service = service
+        self._request = request
+        self._scoped = scoped
+        self._cancelled = asyncio.Event()
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._producer_task: Optional[asyncio.Task] = None
+        self._child_tasks: set[asyncio.Task] = set()
+        self._consumer_done = False
+        self._cleanup_complete = asyncio.Event()
+        self.first_chunk = asyncio.Event()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._consumer_done or self._cancelled.is_set():
+            raise StopAsyncIteration
+        self._ensure_started()
+
+        queued = self._create_child(self._queue.get())
+        stopped = self._create_child(self._cancelled.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {queued, stopped}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            queued.cancel()
+            stopped.cancel()
+            raise
+        if stopped in done and self._cancelled.is_set():
+            self._consumer_done = True
+            queued.cancel()
+            raise StopAsyncIteration
+
+        stopped.cancel()
+        item = queued.result()
+        if item is _STREAM_DONE:
+            self._consumer_done = True
+            raise StopAsyncIteration
+        if isinstance(item, BaseException):
+            self._consumer_done = True
+            raise item
+        return item
+
+    @property
+    def cleanup_pending(self) -> bool:
+        return (
+            (self._producer_task is not None and not self._producer_task.done())
+            or any(not task.done() for task in self._child_tasks)
+        )
+
+    def cancel(self) -> None:
+        """Permanently retire this request without affecting any other request."""
+        self._consumer_done = True
+        self._cancelled.set()
+        if self._producer_task is None:
+            self._finish_cleanup()
+
+    async def aclose(self) -> None:
+        self.cancel()
+        try:
+            await self.wait_closed(timeout=self.CLOSE_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("ElevenLabs: scoped stream cleanup remains pending")
+
+    async def wait_closed(self, timeout: float | None = None) -> None:
+        if self._producer_task is None:
+            self._finish_cleanup()
+            return
+        if timeout is None:
+            await self._cleanup_complete.wait()
+        else:
+            async with asyncio.timeout(timeout):
+                await self._cleanup_complete.wait()
+
+    def _ensure_started(self) -> None:
+        if self._producer_task is None and not self._consumer_done:
+            self._service._active_streams.add(self)
+            if not self._scoped:
+                self._service._legacy_streams.add(self)
+            self._producer_task = asyncio.create_task(self._produce())
+            self._producer_task.add_done_callback(self._producer_done)
+
+    def _create_child(self, awaitable) -> asyncio.Task:
+        task = asyncio.create_task(awaitable)
+        self._child_tasks.add(task)
+        task.add_done_callback(self._child_done)
+        return task
+
+    def _child_done(self, task: asyncio.Task) -> None:
+        self._child_tasks.discard(task)
+        self._consume_task_result(task)
+        self._maybe_finish_cleanup()
+
+    def _producer_done(self, task: asyncio.Task) -> None:
+        self._consume_task_result(task)
+        self._maybe_finish_cleanup()
+
+    def _maybe_finish_cleanup(self) -> None:
+        if (
+            self._producer_task is not None
+            and self._producer_task.done()
+            and not self._child_tasks
+        ):
+            self._finish_cleanup()
+
+    def _finish_cleanup(self) -> None:
+        self._service._active_streams.discard(self)
+        self._service._legacy_streams.discard(self)
+        self._cleanup_complete.set()
+
+    async def _produce(self) -> None:
+        try:
+            if not HTTPX_AVAILABLE:
+                raise RuntimeError("ElevenLabs async streaming is unavailable")
+
+            client = await self._service._get_http_client()
+            if self._cancelled.is_set():
+                return
+            voice_id = self._service._get_voice_id(
+                self._request.voice_id or self._service.default_voice_id
+            )
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+            headers = {
+                "xi-api-key": self._service.api_key,
+                "Content-Type": "application/json",
+            }
+            params = {
+                "output_format": self._service.output_format,
+                "optimize_streaming_latency": "2",
+            }
+            body = {
+                "text": self._request.text,
+                "model_id": self._service.model,
+                "voice_settings": {
+                    "stability": self._service.stability,
+                    "similarity_boost": self._service.similarity_boost,
+                },
+            }
+
+            logger.info("ElevenLabs: Starting request-scoped async stream")
+            async with client.stream(
+                "POST", url, headers=headers, params=params, json=body, timeout=30.0
+            ) as response:
+                if self._cancelled.is_set():
+                    return
+                response.raise_for_status()
+                if self._cancelled.is_set():
+                    return
+                iterator = response.aiter_bytes(1024).__aiter__()
+                chunk_count = 0
+                while not self._cancelled.is_set():
+                    next_chunk = self._create_child(iterator.__anext__())
+                    stopped = self._create_child(self._cancelled.wait())
+                    done, _ = await asyncio.wait(
+                        {next_chunk, stopped}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if stopped in done and self._cancelled.is_set():
+                        next_chunk.cancel()
+                        break
+                    stopped.cancel()
+                    try:
+                        chunk = next_chunk.result()
+                    except StopAsyncIteration:
+                        break
+                    if self._cancelled.is_set():
+                        break
+                    chunk_count += 1
+                    self.first_chunk.set()
+                    await self._queue.put(chunk)
+                logger.info(
+                    f"ElevenLabs: Request-scoped stream ended ({chunk_count} chunks)"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not self._cancelled.is_set():
+                await self._queue.put(exc)
+        finally:
+            await self._queue.put(_STREAM_DONE)
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task) -> None:
+        if not task.cancelled():
+            task.exception()
+
+
 class ElevenLabsTTS(TTSServiceBase):
     """
     ElevenLabs Streaming TTS Service
@@ -95,6 +297,8 @@ class ElevenLabsTTS(TTSServiceBase):
         self._http_client: Optional[httpx.AsyncClient] = None
         self._voices_cache: Optional[List[dict]] = None
         self._stop_event = asyncio.Event()
+        self._active_streams: set[ElevenLabsStream] = set()
+        self._legacy_streams: set[ElevenLabsStream] = set()
 
     def _get_client(self) -> ElevenLabs:
         """Get ElevenLabs SDK client (reused)"""
@@ -258,75 +462,22 @@ class ElevenLabsTTS(TTSServiceBase):
         Yields:
             Raw audio bytes (ulaw_8000 format) as they arrive from ElevenLabs
         """
-        if not HTTPX_AVAILABLE:
-            logger.warning("ElevenLabs: httpx not available, falling back to blocking synthesize")
-            response = await self.synthesize(request)
-            yield response.audio_data
-            return
-
-        self._status = TTSStatus.SPEAKING
-        self._current_request = request
-        self._stop_event.clear()
-
-        voice_id = self._get_voice_id(request.voice_id or self.default_voice_id)
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
-
-        headers = {
-            "xi-api-key": self.api_key,
-            "Content-Type": "application/json",
-        }
-        params = {
-            "output_format": self.output_format,
-            "optimize_streaming_latency": "2",  # Level 2: balanced quality + speed (was 3 = max latency but lower quality)
-        }
-        body = {
-            "text": request.text,
-            "model_id": self.model,
-            "voice_settings": {
-                "stability": self.stability,
-                "similarity_boost": self.similarity_boost,
-            }
-        }
-
-        logger.info(f"ElevenLabs: Streaming async '{request.text[:50]}...' voice={voice_id} model={self.model}")
-
+        stream = ElevenLabsStream(self, request, scoped=False)
         try:
-            client = await self._get_http_client()
-            async with client.stream(
-                "POST", url,
-                headers=headers,
-                params=params,
-                json=body,
-                timeout=30.0,
-            ) as response:
-                response.raise_for_status()
-                chunk_count = 0
-                async for chunk in response.aiter_bytes(1024):
-                    if self._stop_event.is_set():
-                        self._status = TTSStatus.INTERRUPTED
-                        logger.info("ElevenLabs: Async stream interrupted by stop event")
-                        break
-                    chunk_count += 1
-                    if chunk_count == 1:
-                        logger.info(f"ElevenLabs: First audio chunk received ({len(chunk)} bytes)")
-                    yield chunk
+            async for chunk in stream:
+                yield chunk
+        finally:
+            await stream.aclose()
 
-            if not self._stop_event.is_set():
-                self._status = TTSStatus.IDLE
-                logger.info(f"ElevenLabs: Async stream complete ({chunk_count} chunks)")
-
-        except httpx.HTTPStatusError as e:
-            self._status = TTSStatus.ERROR
-            logger.error(f"ElevenLabs: HTTP streaming error {e.response.status_code}: {e.response.text[:200]}")
-            raise
-        except Exception as e:
-            self._status = TTSStatus.ERROR
-            logger.error(f"ElevenLabs: Async streaming error: {e}")
-            raise
+    def create_stream(self, request: TTSRequest) -> ElevenLabsStream:
+        """Create a stream whose cancellation belongs only to this invocation."""
+        return ElevenLabsStream(self, request, scoped=True)
 
     async def stop(self) -> None:
-        """Stop current synthesis"""
+        """Stop legacy synthesis without touching scoped live-call streams."""
         self._stop_event.set()
+        for stream in tuple(self._legacy_streams):
+            stream.cancel()
         self._status = TTSStatus.IDLE
 
     async def prewarm(self) -> bool:

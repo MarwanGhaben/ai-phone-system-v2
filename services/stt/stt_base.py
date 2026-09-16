@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import Enum
 import asyncio
 
+from services.conversation.events import UtteranceIdentity
+
 
 class STTStatus(Enum):
     """STT stream status"""
@@ -25,10 +27,11 @@ class STTResult:
     """Result from STT processing"""
     text: str
     language: str
-    confidence: float
+    confidence: Optional[float]
     is_final: bool = False
     alternatives: list = None
     metadata: Dict[str, Any] = None
+    utterance_id: Optional[UtteranceIdentity] = None
 
     def __post_init__(self):
         if self.alternatives is None:

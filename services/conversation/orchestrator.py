@@ -14,6 +14,7 @@ The orchestrator is the brain of the AI voice platform. It coordinates:
 """
 
 import asyncio
+from collections import deque
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -30,6 +31,7 @@ from services.tts.elevenlabs_service import create_elevenlabs_tts
 from services.llm.openai_service import create_openai_llm
 from services.llm.llm_base import Message, LLMRole
 from services.telephony.twilio_service import TwilioMediaStreamHandler
+from services.conversation.language_policy import explicit_language_request
 from services.calendar.calendar_base import TimeSlot
 from services.calendar.business_time import as_business_time, business_now
 from services.scheduling.booking_records import (
@@ -39,6 +41,7 @@ from services.scheduling.booking_records import (
 )
 
 _DATETIME_TYPE = datetime
+_MAX_CONSUMED_UTTERANCE_IDENTITIES = 256
 
 
 def _parse_booking_datetime(date_time_text: str) -> Optional[datetime]:
@@ -216,6 +219,17 @@ class ConversationContext:
         }
 
 
+@dataclass(eq=False)
+class _SpeechOwner:
+    """Binds one call invocation to its exact synthesis and playback handles."""
+
+    context: ConversationContext
+    handler: TwilioMediaStreamHandler
+    tts_stream: Any
+    playback: Any
+    active: bool = True
+
+
 class ConversationOrchestrator:
     """
     Main orchestrator for AI voice conversations
@@ -263,6 +277,8 @@ class ConversationOrchestrator:
         self._twilio_handlers: Dict[str, TwilioMediaStreamHandler] = {}
         self._call_stt_instances: Dict[str, Any] = {}  # Per-call STT instances
         self._call_state_locks: Dict[str, asyncio.Lock] = {}  # Per-call state locks
+        self._speech_setup_locks: Dict[str, asyncio.Lock] = {}
+        self._active_speech: Dict[str, _SpeechOwner] = {}
 
         # Barge-in detection (per-call)
         self._barge_in_consecutive: Dict[str, int] = {}  # Per-call consecutive high-energy frame count
@@ -878,14 +894,9 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                     # Clear echo guard so the caller's speech isn't blocked
                     self._echo_guard_until[call_sid] = 0
 
-                    # Stop TTS generation
-                    if self.tts:
-                        await self.tts.stop()
-
-                    # Stop audio playback on Twilio immediately
-                    twilio_handler = self._twilio_handlers.get(call_sid)
-                    if twilio_handler:
-                        await twilio_handler.clear_audio()
+                    # Stop only this call's owned synthesis/playback. The outer
+                    # dialogue/tool coroutine remains alive and resumes normally.
+                    await self._interrupt_call_speech(call_sid)
 
                     # Mark that barge-in will do the reset BEFORE starting it
                     # (prevents race condition where _speak_to_caller checks flag mid-reset)
@@ -932,10 +943,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
         logger.info(f"Orchestrator: Transcript consumer started for call {call_sid}")
 
-        # Track last processed final transcript to deduplicate
-        # ElevenLabs sends both committed_transcript and final_transcript
-        # for the same utterance, causing duplicate processing.
-        last_final_text = None
+        # Per-call, bounded duplicate suppression. Text is not identity: separate
+        # commits containing the same answer must both reach dialogue.
+        seen_utterance_ids = set()
+        seen_utterance_order = deque()
 
         try:
             # Outer loop: survives STT resets (disconnect + reconnect).
@@ -957,18 +968,43 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
                 try:
                     async for result in call_stt.get_transcript():
-                        if not result or not result.text:
+                        if not result or not result.text or not result.is_final:
                             continue
 
-                        # Deduplicate final transcripts
-                        if result.is_final:
-                            if result.text == last_final_text:
-                                logger.info(f"Orchestrator: Skipping duplicate transcript: '{result.text[:50]}'")
-                                continue
-                            last_final_text = result.text
+                        utterance_id = getattr(result, "utterance_id", None)
+                        if utterance_id is not None:
+                            try:
+                                if utterance_id in seen_utterance_ids:
+                                    logger.info(
+                                        "Orchestrator: Duplicate identified transcript ignored"
+                                    )
+                                    continue
+                                seen_utterance_ids.add(utterance_id)
+                                seen_utterance_order.append(utterance_id)
+                            except TypeError:
+                                # Preserve legacy forwarding for providers that
+                                # attach an invalid/unhashable identity value.
+                                logger.warning(
+                                    "Orchestrator: Invalid transcript identity; forwarding without deduplication"
+                                )
+                            else:
+                                while (
+                                    len(seen_utterance_order)
+                                    > _MAX_CONSUMED_UTTERANCE_IDENTITIES
+                                ):
+                                    expired = seen_utterance_order.popleft()
+                                    seen_utterance_ids.discard(expired)
 
-                        logger.info(f"Orchestrator: Got transcript: '{result.text}' (is_final={result.is_final})")
-                        await self.process_transcript(call_sid, result.text, result.language, result.is_final)
+                        logger.info(
+                            "Orchestrator: Actionable final transcript received (identified={})",
+                            utterance_id is not None,
+                        )
+                        await self.process_transcript(
+                            call_sid,
+                            result.text,
+                            result.language,
+                            True,
+                        )
 
                         if context.state == ConversationState.ENDED:
                             break
@@ -976,7 +1012,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 except asyncio.CancelledError:
                     raise  # Propagate cancellation
                 except Exception as e:
-                    logger.warning(f"Orchestrator: Transcript iterator error (will retry): {e}")
+                    logger.warning(
+                        "Orchestrator: Transcript iterator error category={} (will retry)",
+                        type(e).__name__,
+                    )
 
                 # get_transcript() ended — this should rarely happen now since
                 # reset_for_listening() keeps _is_listening=True.
@@ -988,9 +1027,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         except asyncio.CancelledError:
             logger.info(f"Orchestrator: Transcript consumer cancelled for call {call_sid}")
         except Exception as e:
-            logger.error(f"Orchestrator: Error in transcript consumer: {e}")
-            import traceback
-            logger.error(f"Orchestrator: Traceback:\n{traceback.format_exc()}")
+            logger.error(
+                "Orchestrator: Transcript consumer error category={}",
+                type(e).__name__,
+            )
         finally:
             logger.info(f"Orchestrator: Transcript consumer stopped for call {call_sid}")
 
@@ -1091,65 +1131,19 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
             return
 
-        # LANGUAGE KEYWORD DETECTION: If the caller says "Arabic" / "arabi" etc.
-        # in English, they're requesting Arabic — NOT speaking English.
-        # This must be checked BEFORE other language detection logic.
-        #
-        # Two detection modes:
-        # 1. SHORT phrases (<=5 words): keyword match (e.g. "Arabic please", "عربي")
-        # 2. LONGER sentences: explicit switch PHRASES that unambiguously request
-        #    a language change (e.g. "I want to talk in Arabic", "can you speak Arabic")
-        #    This avoids false positives on "I'm an English speaker" while still
-        #    catching "switch to Arabic" or "talk to me in Arabic".
-        transcript_lower = transcript.strip().lower().rstrip('.,!?؟')
-        word_count = len(transcript_lower.split())
-        arabic_keywords = ["arabic", "arabi", "arabik", "3arabi", "عربي"]
-        english_keywords = ["english", "inglish", "inglizi", "انجليزي", "انكليزي", "انجليش", "انجلش"]
-        is_arabic_request = any(kw in transcript_lower for kw in arabic_keywords)
-        is_english_request = any(kw in transcript_lower for kw in english_keywords)
-
-        # Explicit switch phrases — unambiguous even in long sentences
-        arabic_switch_phrases = [
-            "speak arabic", "talk arabic", "talk in arabic", "speak in arabic",
-            "switch to arabic", "change to arabic", "in arabic please",
-            "can you speak arabic", "want arabic", "prefer arabic",
-            "let's speak arabic", "let's talk arabic", "use arabic",
-            "respond in arabic", "answer in arabic", "reply in arabic",
-            "تكلم عربي", "كلمني عربي", "حكي عربي", "بالعربي",
-        ]
-        english_switch_phrases = [
-            "speak english", "talk english", "talk in english", "speak in english",
-            "switch to english", "change to english", "in english please",
-            "can you speak english", "want english", "prefer english",
-            "let's speak english", "let's talk english", "use english",
-            "respond in english", "answer in english", "reply in english",
-            "تكلم انجليزي", "كلمني انجليزي", "بالانجليزي",
-        ]
-        has_arabic_switch_phrase = any(phrase in transcript_lower for phrase in arabic_switch_phrases)
-        has_english_switch_phrase = any(phrase in transcript_lower for phrase in english_switch_phrases)
-
-        # Treat as language switch if: short phrase OR explicit switch phrase OR language not yet set
-        is_language_switch = (word_count <= 5 or has_arabic_switch_phrase or has_english_switch_phrase or context.language == "auto")
-
-        if is_arabic_request and not is_english_request and is_language_switch:
-            # Caller is requesting Arabic language (short phrase like "Arabic" or "عربي")
-            prev_language = context.language
-            context.language = "ar"
-            logger.info(f"Orchestrator: Detected Arabic language REQUEST from keyword: '{transcript}'")
-            # Reset garbled counter since we got a valid signal
+        requested_language = explicit_language_request(transcript)
+        if requested_language is not None:
+            context.language = requested_language
             self._garbled_drop_count[call_sid] = 0
-            # Skip reconnect if STT already started in Arabic (new callers start in ar)
-            if prev_language not in ("ar", "auto"):
-                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
-        elif is_english_request and is_language_switch:
-            # Caller explicitly requested English (short phrase like "English please")
-            # Check BEFORE has_arabic because "انجليش" contains Arabic chars but means "English"
-            prev_language = context.language
-            context.language = "en"
-            logger.info(f"Orchestrator: Detected English language REQUEST from keyword: '{transcript}'")
-            self._garbled_drop_count[call_sid] = 0
-            if prev_language != "en":
-                await self._reconnect_stt_with_language(call_sid, "en", force=True)
+            logger.info(
+                "Orchestrator: Accepted explicit caller language request target={}",
+                requested_language,
+            )
+            call_stt = self._call_stt_instances.get(call_sid)
+            if call_stt is not None and call_stt.language != requested_language:
+                await self._reconnect_stt_with_language(
+                    call_sid, requested_language, force=True
+                )
         elif has_arabic:
             prev_language = context.language
             context.language = "ar"
@@ -1161,32 +1155,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             if prev_language not in ("ar", "auto"):
                 await self._reconnect_stt_with_language(call_sid, "ar", force=True)
         elif context.language in ("auto", "en"):
-            # Check for romanized Arabic (STT romanizes Arabic speech when it is
-            # NOT in Arabic mode — both in auto-detect AND when stuck in English).
-            # Running this for "en" too is what lets a caller switch BACK to
-            # Arabic after an English turn instead of being stuck in English.
-            romanized_arabic_patterns = [
-                "allah", "inshallah", "yalla", "habibi", "habibti", "shukran",
-                "marhaba", "ahlan", "salam", "wallah", "khalas", "mashallah",
-                "bilawasamat", "bukra", "sabah", "masa", "aiwa", "naam",
-                "mumkin", "arabi", "araby",
-            ]
-            transcript_words = transcript_lower.split()
-            is_romanized_arabic = any(
-                any(pat in word for pat in romanized_arabic_patterns)
-                for word in transcript_words
-            )
-
-            if is_romanized_arabic:
-                # Romanized Arabic detected — switch to Arabic STT
-                context.language = "ar"
-                logger.info(f"Orchestrator: Detected romanized Arabic in: '{transcript}' — switching to Arabic")
-                self._garbled_drop_count[call_sid] = 0
-                await self._reconnect_stt_with_language(call_sid, "ar", force=True)
-                # Re-prompt in Arabic
-                await self._speak_to_caller(call_sid, "عذراً، ممكن تعيد من فضلك؟", "ar")
-                return
-            elif context.language == "auto" and language and language != "auto" and language == "en":
+            if context.language == "auto" and language and language != "auto" and language == "en":
                 # STT explicitly detected English from auto-detect — trust it
                 context.language = "en"
                 logger.info(f"Orchestrator: Auto-detected English from STT")
@@ -2173,6 +2142,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         context = self._conversations.get(call_sid)
         if not context:
             return "I apologize, I'm having technical difficulties."
+        explicit_preference_request = explicit_language_request(user_input)
 
         # =====================================================
         # REAL-TIME DATE INJECTION - Computed fresh for EVERY call
@@ -2390,8 +2360,30 @@ CRITICAL INSTRUCTIONS:
 
                     # --- Save language preference ---
                     if tool_name == "save_language_preference":
-                        language = arguments.get("language", "").strip().lower()
-                        if language in ("en", "ar") and context:
+                        raw_language = arguments.get("language")
+                        language = (
+                            raw_language.strip().lower()
+                            if isinstance(raw_language, str)
+                            else ""
+                        )
+                        if (
+                            language not in ("en", "ar")
+                            or language != explicit_preference_request
+                        ):
+                            logger.warning(
+                                "Orchestrator: Rejected language preference tool "
+                                "without matching current caller request"
+                            )
+                            clarification = (
+                                "عذراً، هل تفضل العربية أم الإنجليزية؟"
+                                if explicit_preference_request == "ar"
+                                or context.language == "ar"
+                                else "Would you like me to speak English or Arabic?"
+                            )
+                            context.add_assistant_message(clarification)
+                            return clarification
+
+                        if context:
                             # Update context
                             context.language = language
                             # Persist to database
@@ -2573,9 +2565,8 @@ CRITICAL INSTRUCTIONS:
             text: Text to speak
             language: Language code
         """
-        import traceback
         import time
-        logger.info(f"Orchestrator: _speak_to_caller START - text: '{text[:50]}...'")
+        logger.info("Orchestrator: _speak_to_caller START")
 
         context = self._conversations.get(call_sid)
         twilio_handler = self._twilio_handlers.get(call_sid)
@@ -2591,6 +2582,7 @@ CRITICAL INSTRUCTIONS:
                 context.state = ConversationState.LISTENING
             return
 
+        owner = None
         try:
             # Clear the barge-in reset flag at the start of each TTS turn
             # This ensures we track fresh barge-ins for this utterance
@@ -2616,24 +2608,60 @@ CRITICAL INSTRUCTIONS:
             logger.info(f"Orchestrator: Starting streaming TTS to Twilio...")
             tts_start = time.time()
 
-            audio_stream = self.tts.synthesize_stream_async(request)
-            total_bytes = await twilio_handler.stream_audio_chunks(audio_stream)
+            setup_lock = self._speech_setup_locks.setdefault(call_sid, asyncio.Lock())
+            async with setup_lock:
+                if (
+                    self._conversations.get(call_sid) is not context
+                    or self._twilio_handlers.get(call_sid) is not twilio_handler
+                    or context.state == ConversationState.ENDED
+                ):
+                    return
+
+                previous = self._active_speech.pop(call_sid, None)
+                if previous is not None:
+                    previous.active = False
+                    previous.tts_stream.cancel()
+
+                playback = await twilio_handler.begin_playback()
+                if (
+                    self._conversations.get(call_sid) is not context
+                    or self._twilio_handlers.get(call_sid) is not twilio_handler
+                    or context.state == ConversationState.ENDED
+                    or not twilio_handler.is_current_playback(playback)
+                ):
+                    twilio_handler.release_playback(playback)
+                    return
+                audio_stream = self.tts.create_stream(request)
+                owner = _SpeechOwner(context, twilio_handler, audio_stream, playback)
+                self._active_speech[call_sid] = owner
+
+            stream_result = await twilio_handler.stream_audio_chunks(
+                owner.playback, owner.tts_stream
+            )
 
             tts_elapsed = time.time() - tts_start
-            logger.info(f"Orchestrator: TTS streaming complete - {total_bytes} bytes in {tts_elapsed:.2f}s")
+            logger.info(
+                f"Orchestrator: TTS streaming complete - {stream_result.bytes_sent} "
+                f"bytes in {tts_elapsed:.2f}s, completed={stream_result.completed}"
+            )
 
-            if total_bytes == 0:
-                logger.error("Orchestrator: TTS streaming returned 0 bytes")
+            if not stream_result.completed or stream_result.bytes_sent == 0:
+                logger.warning("Orchestrator: TTS streaming did not complete")
                 return
 
-            audio_duration = total_bytes / 8000.0
+            audio_duration = stream_result.bytes_sent / 8000.0
             playback_confirmed = await twilio_handler.wait_for_playback(
+                owner.playback,
+                stream_result,
                 timeout=max(1.0, audio_duration + 2.0)
             )
             if not playback_confirmed:
                 logger.warning(
                     f"Orchestrator: Playback was not confirmed for call {call_sid}"
                 )
+
+            if not self._speech_is_current(call_sid, owner):
+                return
 
             # Reset STT for clean listening — reconnects to flush echo buffer
             # This gives STT a completely clean slate so the user's first words
@@ -2643,44 +2671,93 @@ CRITICAL INSTRUCTIONS:
             barge_in_already_reset = self._barge_in_reset_done.get(call_sid, False)
 
             if call_stt and not barge_in_already_reset:
-                # LANGUAGE SAFETY NET: Detect the ACTUAL language of the LLM response
-                # from its text content, and update STT if it differs.
-                # This catches cases where the user requested a language switch
-                # (e.g. "speak Arabic") but the keyword detection missed it —
-                # the LLM understood and responded in Arabic, but STT stayed English.
-                # We detect Arabic by character presence (definitive signal).
-                import re
-                response_has_arabic = bool(re.search(r'[\u0600-\u06FF]', text))
-
-                if response_has_arabic and call_stt.language != "ar":
-                    logger.info(f"Orchestrator: LLM responded in Arabic but STT is '{call_stt.language}' — switching STT to Arabic before reset")
-                    call_stt.language = "ar"
-                    if context:
-                        context.language = "ar"
-                elif not response_has_arabic and call_stt.language == "ar":
-                    # LLM responded in English (no Arabic chars) but STT is Arabic
-                    logger.info(f"Orchestrator: LLM responded in English but STT is 'ar' — switching STT to English before reset")
-                    call_stt.language = "en"
-                    if context:
-                        context.language = "en"
-
                 await call_stt.reset_for_listening()
+                if not self._speech_is_current(call_sid, owner):
+                    return
             elif barge_in_already_reset:
                 logger.info(f"Orchestrator: Skipping post-TTS STT reset (barge-in already did it)")
 
             # Set echo guard for residual phone speaker echo (shortened since STT is clean)
+            if not self._speech_is_current(call_sid, owner):
+                return
             self._echo_guard_until[call_sid] = time.time() + 0.15
             logger.info(f"Orchestrator: Playback complete, echo guard 0.15s")
 
-        except Exception as e:
-            logger.error(f"Orchestrator: Exception in _speak_to_caller: {e}")
-            logger.error(f"Orchestrator: Traceback:\n{traceback.format_exc()}")
+        except Exception as exc:
+            logger.error(
+                f"Orchestrator: Speech failed stage=pipeline ({type(exc).__name__})"
+            )
 
         finally:
-            async with state_lock:
-                if context.state == ConversationState.SPEAKING:
-                    context.state = ConversationState.LISTENING
+            if owner is not None:
+                owner.tts_stream.cancel()
+                try:
+                    await owner.tts_stream.aclose()
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Orchestrator: Speech cleanup failed "
+                        f"stage=stream_close ({type(cleanup_exc).__name__})"
+                    )
+                finally:
+                    # A second cancellation during aclose must still revoke the
+                    # invocation's authority, without swallowing CancelledError.
+                    owner.handler.release_playback(owner.playback)
+                    is_current = self._active_speech.get(call_sid) is owner
+                    owner.active = False
+                    if is_current:
+                        self._active_speech.pop(call_sid, None)
+                        if (
+                            self._conversations.get(call_sid) is context
+                            and context.state != ConversationState.ENDED
+                        ):
+                            async with state_lock:
+                                if (
+                                    self._conversations.get(call_sid) is context
+                                    and call_sid not in self._active_speech
+                                    and context.state == ConversationState.SPEAKING
+                                ):
+                                    context.state = ConversationState.LISTENING
+            elif (
+                self._conversations.get(call_sid) is context
+                and call_sid not in self._active_speech
+                and context.state == ConversationState.SPEAKING
+            ):
+                async with state_lock:
+                    if (
+                        self._conversations.get(call_sid) is context
+                        and call_sid not in self._active_speech
+                        and context.state == ConversationState.SPEAKING
+                    ):
+                        context.state = ConversationState.LISTENING
             logger.info(f"Orchestrator: _speak_to_caller END (state={context.state.value})")
+
+    def _speech_is_current(self, call_sid: str, owner: _SpeechOwner) -> bool:
+        return (
+            owner.active
+            and self._active_speech.get(call_sid) is owner
+            and self._conversations.get(call_sid) is owner.context
+            and self._twilio_handlers.get(call_sid) is owner.handler
+            and owner.context.state != ConversationState.ENDED
+            and owner.handler.is_current_playback(owner.playback)
+        )
+
+    async def _interrupt_call_speech(self, call_sid: str) -> bool:
+        setup_lock = self._speech_setup_locks.setdefault(call_sid, asyncio.Lock())
+        async with setup_lock:
+            owner = self._active_speech.pop(call_sid, None)
+            if owner is None:
+                return False
+            owner.active = False
+            owner.tts_stream.cancel()
+            await owner.handler.clear_audio(owner.playback)
+        try:
+            await owner.tts_stream.aclose()
+        except Exception as cleanup_exc:
+            logger.warning(
+                "Orchestrator: Speech cleanup failed "
+                f"stage=interrupt_close ({type(cleanup_exc).__name__})"
+            )
+        return True
 
 
     async def _detect_barge_in(self, audio_data: bytes, call_sid: str = None) -> bool:
@@ -2884,6 +2961,8 @@ CRITICAL INSTRUCTIONS:
 
         # Capture context data before cleanup for database logging
         context = self._conversations.get(call_sid)
+        call_stt = self._call_stt_instances.get(call_sid)
+        handler = self._twilio_handlers.get(call_sid)
         caller_name = context.caller_name if context else None
         language = context.language if context else "en"
         turn_count = context.turn_count if context else 0
@@ -2901,9 +2980,17 @@ CRITICAL INSTRUCTIONS:
                     transfer_requested = True
                     break
 
-        # Update context
+        # Update context and invalidate owned speech before any awaited cleanup.
         if call_sid in self._conversations:
             self._conversations[call_sid].state = ConversationState.ENDED
+        if handler is not None:
+            handler.invalidate_playback_session()
+        speech_owner = self._active_speech.get(call_sid)
+        if speech_owner is not None and speech_owner.context is context:
+            self._active_speech.pop(call_sid, None)
+            speech_owner.active = False
+            speech_owner.tts_stream.cancel()
+            speech_owner.handler.invalidate_playback(speech_owner.playback)
 
         # =====================================================
         # Log call end to database
@@ -2952,38 +3039,44 @@ CRITICAL INSTRUCTIONS:
         # =====================================================
         # CRITICAL: Disconnect and cleanup this call's STT instance
         # =====================================================
-        if call_sid in self._call_stt_instances:
+        if call_stt is not None:
             logger.info(f"Orchestrator: Disconnecting call-specific STT for {call_sid}")
-            await self._call_stt_instances[call_sid].disconnect()
-            del self._call_stt_instances[call_sid]
+            await call_stt.disconnect()
+            if self._call_stt_instances.get(call_sid) is call_stt:
+                del self._call_stt_instances[call_sid]
 
-        # Clean up echo guard
-        if call_sid in self._echo_guard_until:
-            del self._echo_guard_until[call_sid]
+        if speech_owner is not None and speech_owner.context is context:
+            try:
+                await speech_owner.tts_stream.aclose()
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "Orchestrator: Speech cleanup failed "
+                    f"stage=end_call_close ({type(cleanup_exc).__name__})"
+                )
 
-        # Clean up garbled counter
-        if call_sid in self._garbled_drop_count:
-            del self._garbled_drop_count[call_sid]
-
-        # Clean up barge-in per-call state
-        if call_sid in self._barge_in_consecutive:
-            del self._barge_in_consecutive[call_sid]
-        if call_sid in self._barge_in_speech_start:
-            del self._barge_in_speech_start[call_sid]
-        if call_sid in self._barge_in_reset_done:
-            del self._barge_in_reset_done[call_sid]
-
-        # Clean up state lock
-        if call_sid in self._call_state_locks:
-            del self._call_state_locks[call_sid]
+        if self._conversations.get(call_sid) is context:
+            self._echo_guard_until.pop(call_sid, None)
+            self._garbled_drop_count.pop(call_sid, None)
+            self._barge_in_consecutive.pop(call_sid, None)
+            self._barge_in_speech_start.pop(call_sid, None)
+            self._barge_in_reset_done.pop(call_sid, None)
+            self._call_state_locks.pop(call_sid, None)
+            self._speech_setup_locks.pop(call_sid, None)
 
         # Clean up handlers
-        if call_sid in self._twilio_handlers:
-            await self._twilio_handlers[call_sid].cleanup()
-            del self._twilio_handlers[call_sid]
+        if handler is not None:
+            try:
+                await handler.cleanup()
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "Orchestrator: Speech cleanup failed "
+                    f"stage=handler_close ({type(cleanup_exc).__name__})"
+                )
+            if self._twilio_handlers.get(call_sid) is handler:
+                del self._twilio_handlers[call_sid]
 
         # Remove from active conversations
-        if call_sid in self._conversations:
+        if self._conversations.get(call_sid) is context:
             del self._conversations[call_sid]
 
     def get_conversation_context(self, call_sid: str) -> Optional[ConversationContext]:

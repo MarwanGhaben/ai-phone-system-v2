@@ -8,11 +8,30 @@ Handles Twilio Media Streams for real-time bidirectional audio
 import asyncio
 import json
 import base64
+from dataclasses import dataclass
 from uuid import uuid4
 from typing import Callable, Optional, Any
 from fastapi import WebSocket, WebSocketDisconnect
 from loguru import logger
 import httpx
+
+
+@dataclass(eq=False)
+class PlaybackOwner:
+    """Opaque, permanently retireable playback identity for one handler session."""
+
+    session_id: str
+    generation: int
+    retired: bool = False
+
+
+@dataclass(frozen=True)
+class PlaybackStreamResult:
+    """Transport outcome kept separate from the useful diagnostic byte count."""
+
+    bytes_sent: int
+    completed: bool
+    error: str | None = None
 
 
 class TwilioMediaStreamHandler:
@@ -56,9 +75,15 @@ class TwilioMediaStreamHandler:
         # State
         self._is_connected = False
         self._is_streaming = False
-        self._interrupted = False  # Set to True to abort current audio playback
         self._send_lock = asyncio.Lock()
-        self._pending_marks: dict[str, asyncio.Future] = {}
+        self._handler_session_id = uuid4().hex
+        self._playback_generation = 0
+        self._active_playback: PlaybackOwner | None = None
+        self._playback_closed = False
+        self._pending_marks: dict[str, tuple[PlaybackOwner, asyncio.Future]] = {}
+        self._send_tasks: set[asyncio.Task] = set()
+        self._send_cleanup_complete = asyncio.Event()
+        self._send_cleanup_complete.set()
 
     async def handle_connection(self) -> None:
         """
@@ -203,7 +228,7 @@ class TwilioMediaStreamHandler:
     async def _on_disconnected(self, data: dict) -> None:
         """Handle disconnected event"""
         logger.info(f"Twilio: Disconnected event for call {self.call_sid}")
-        self._resolve_pending_marks(False)
+        self._retire_all_playback()
 
         # Notify registered handler
         if self._on_call_ended:
@@ -211,27 +236,96 @@ class TwilioMediaStreamHandler:
 
     def _on_mark(self, data: dict) -> None:
         mark_name = data.get("mark", {}).get("name", "")
-        playback_wait = self._pending_marks.get(mark_name)
-        if playback_wait and not playback_wait.done():
+        pending = self._pending_marks.get(mark_name)
+        if not pending:
+            return
+        owner, playback_wait = pending
+        if self.is_current_playback(owner) and not playback_wait.done():
             playback_wait.set_result(True)
 
-    async def clear_audio(self) -> None:
+    async def begin_playback(self) -> PlaybackOwner:
+        """Retire the prior generation and order its clear before new media."""
+        if self._playback_closed:
+            raise RuntimeError("Twilio playback handler is closed")
+
+        previous = self._active_playback
+        if previous is not None:
+            previous.retired = True
+            self._resolve_pending_marks(False, previous)
+
+        self._playback_generation += 1
+        owner = PlaybackOwner(self._handler_session_id, self._playback_generation)
+        self._active_playback = owner
+
+        try:
+            async with self._send_lock:
+                if self.is_current_playback(owner):
+                    await self.websocket.send_json({
+                        "event": "clear",
+                        "streamSid": self.stream_sid,
+                    })
+        except Exception:
+            self.release_playback(owner)
+            raise
+        return owner
+
+    def is_current_playback(self, owner: PlaybackOwner) -> bool:
+        return (
+            not self._playback_closed
+            and owner.session_id == self._handler_session_id
+            and self._active_playback is owner
+            and not owner.retired
+        )
+
+    def release_playback(self, owner: PlaybackOwner) -> None:
+        """Retire an exact completed owner without clearing a replacement."""
+        if self._active_playback is owner:
+            owner.retired = True
+            self._active_playback = None
+        self._resolve_pending_marks(False, owner)
+
+    def invalidate_playback(self, owner: PlaybackOwner) -> None:
+        """Synchronously invalidate an owner for terminal call teardown."""
+        self.release_playback(owner)
+
+    def invalidate_playback_session(self) -> None:
+        """Permanently invalidate installed and provisional handler ownership."""
+        self._retire_all_playback()
+
+    async def clear_audio(self, owner: PlaybackOwner | None = None) -> bool:
         """
         Clear all pending and currently playing audio (for barge-in).
         Sends a 'clear' event to Twilio to stop playback immediately.
         """
-        self._interrupted = True
-        self._resolve_pending_marks(False)
+        target = owner or self._active_playback
+        if target is None or not self.is_current_playback(target):
+            return False
+
+        # Permanent retirement happens before the first await.  A sender already
+        # queued on the lock will therefore fail its ownership check when released.
+        target.retired = True
+        self._active_playback = None
+        self._resolve_pending_marks(False, target)
 
         # Tell Twilio to stop playing any buffered audio
         try:
-            await self.send_event("clear")
-        except Exception as e:
-            logger.warning(f"Twilio: Failed to send clear event: {e}")
+            async with self._send_lock:
+                if not self._playback_closed:
+                    await self.websocket.send_json({
+                        "event": "clear",
+                        "streamSid": self.stream_sid,
+                    })
+        except Exception as exc:
+            logger.warning(
+                f"Twilio: Clear send failed ({type(exc).__name__})"
+            )
 
         logger.info(f"Twilio: Audio playback interrupted")
+        return True
 
-    async def stream_audio_chunks(self, audio_stream) -> int:
+    async def stream_audio_chunks(
+        self, owner: PlaybackOwner, audio_stream
+    ) -> PlaybackStreamResult:
         """
         Stream audio chunks directly to Twilio WebSocket in real-time.
 
@@ -247,12 +341,9 @@ class TwilioMediaStreamHandler:
         """
         if not self._is_streaming or not self.stream_sid:
             logger.warning("Twilio: Cannot stream audio - not streaming or no stream_sid")
-            return 0
-
-        self._interrupted = False
-
-        self._resolve_pending_marks(False)
-        await self.send_event("clear")
+            return PlaybackStreamResult(0, False, "not_streaming")
+        if not self.is_current_playback(owner):
+            return PlaybackStreamResult(0, False, "retired")
 
         CHUNK_SIZE = 160  # 20ms at 8kHz ulaw
         CHUNK_INTERVAL = 0.015  # Send slightly faster than real-time
@@ -267,9 +358,8 @@ class TwilioMediaStreamHandler:
 
         try:
             async for audio_data in audio_stream:
-                if self._interrupted:
+                if not self.is_current_playback(owner):
                     logger.info(f"Twilio: Stream interrupted by barge-in at {total_bytes} bytes")
-                    await self.send_event("clear")
                     break
 
                 buffer.extend(audio_data)
@@ -284,7 +374,7 @@ class TwilioMediaStreamHandler:
 
                 # Send complete 160-byte chunks as they accumulate
                 while len(buffer) >= CHUNK_SIZE:
-                    if self._interrupted:
+                    if not self.is_current_playback(owner):
                         break
 
                     chunk = bytes(buffer[:CHUNK_SIZE])
@@ -298,7 +388,8 @@ class TwilioMediaStreamHandler:
                             "payload": payload
                         }
                     }
-                    await self._send_message(media_event)
+                    if not await self._send_owned(owner, media_event):
+                        break
                     total_bytes += CHUNK_SIZE
                     chunks_sent += 1
 
@@ -310,7 +401,7 @@ class TwilioMediaStreamHandler:
                     await asyncio.sleep(CHUNK_INTERVAL)
 
             # Send any remaining bytes in the buffer
-            if buffer and not self._interrupted:
+            if buffer and self.is_current_playback(owner):
                 payload = base64.b64encode(bytes(buffer)).decode("utf-8")
                 media_event = {
                     "event": "media",
@@ -319,17 +410,23 @@ class TwilioMediaStreamHandler:
                         "payload": payload
                     }
                 }
-                await self._send_message(media_event)
-                total_bytes += len(buffer)
+                if await self._send_owned(owner, media_event):
+                    total_bytes += len(buffer)
+                else:
+                    return PlaybackStreamResult(total_bytes, False, "retired")
 
             logger.info(f"Twilio: Stream complete - {total_bytes} bytes in {chunks_sent} chunks")
-            return total_bytes
+            return PlaybackStreamResult(
+                total_bytes,
+                self.is_current_playback(owner),
+                None if self.is_current_playback(owner) else "retired",
+            )
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error(f"Twilio: Stream error: {e}")
-            import traceback
-            logger.error(f"Twilio: Traceback:\n{traceback.format_exc()}")
-            return total_bytes
+            logger.error(f"Twilio: Stream transport error ({type(e).__name__})")
+            return PlaybackStreamResult(total_bytes, False, "transport_error")
 
     async def send_event(self, event: str, **kwargs) -> None:
         """
@@ -351,24 +448,116 @@ class TwilioMediaStreamHandler:
         async with self._send_lock:
             await self.websocket.send_json(message)
 
-    async def wait_for_playback(self, timeout: float) -> bool:
+    async def _send_owned(self, owner: PlaybackOwner, message: dict) -> bool:
+        async with self._send_lock:
+            if not self.is_current_playback(owner):
+                return False
+            await self.websocket.send_json(message)
+            return True
+
+    async def wait_for_playback(
+        self,
+        owner: PlaybackOwner,
+        stream_result: PlaybackStreamResult,
+        timeout: float,
+    ) -> bool:
+        if not stream_result.completed or not self.is_current_playback(owner):
+            return False
         mark_name = f"playback-{uuid4().hex}"
         playback_wait = asyncio.get_running_loop().create_future()
-        self._pending_marks[mark_name] = playback_wait
+        self._pending_marks[mark_name] = (owner, playback_wait)
+        send_task: asyncio.Task | None = None
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
 
         try:
-            await self.send_event("mark", mark={"name": mark_name})
-            return await asyncio.wait_for(playback_wait, timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.warning(f"Twilio: Playback mark timed out for call {self.call_sid}")
-            return False
+            send_task = self._track_send_task(self._send_owned(owner, {
+                "event": "mark",
+                "streamSid": self.stream_sid,
+                "mark": {"name": mark_name},
+            }))
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            submitted_done, _ = await asyncio.wait({send_task}, timeout=remaining)
+            if send_task not in submitted_done:
+                self._expire_mark_wait(owner, playback_wait, send_task)
+                logger.warning(f"Twilio: Playback mark timed out for call {self.call_sid}")
+                return False
+            try:
+                submitted = send_task.result()
+            except Exception as exc:
+                self.release_playback(owner)
+                logger.warning(
+                    f"Twilio: Playback mark submission failed ({type(exc).__name__})"
+                )
+                return False
+            if not submitted:
+                return False
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            acknowledged, _ = await asyncio.wait({playback_wait}, timeout=remaining)
+            if playback_wait not in acknowledged:
+                self._expire_mark_wait(owner, playback_wait, send_task)
+                logger.warning(f"Twilio: Playback mark timed out for call {self.call_sid}")
+                return False
+            return playback_wait.result()
+        except asyncio.CancelledError:
+            self._expire_mark_wait(owner, playback_wait, send_task)
+            raise
         finally:
             self._pending_marks.pop(mark_name, None)
 
-    def _resolve_pending_marks(self, played: bool) -> None:
-        for playback_wait in self._pending_marks.values():
+    @property
+    def cleanup_pending(self) -> bool:
+        return any(not task.done() for task in self._send_tasks)
+
+    async def wait_for_cleanup(self, timeout: float | None = None) -> None:
+        if not self.cleanup_pending:
+            return
+        if timeout is None:
+            await self._send_cleanup_complete.wait()
+        else:
+            async with asyncio.timeout(timeout):
+                await self._send_cleanup_complete.wait()
+
+    def _track_send_task(self, awaitable) -> asyncio.Task:
+        task = asyncio.create_task(awaitable)
+        self._send_tasks.add(task)
+        self._send_cleanup_complete.clear()
+        task.add_done_callback(self._send_task_done)
+        return task
+
+    def _send_task_done(self, task: asyncio.Task) -> None:
+        self._send_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+        if not self._send_tasks:
+            self._send_cleanup_complete.set()
+
+    def _expire_mark_wait(
+        self,
+        owner: PlaybackOwner,
+        playback_wait: asyncio.Future,
+        send_task: asyncio.Task | None,
+    ) -> None:
+        self.release_playback(owner)
+        if not playback_wait.done():
+            playback_wait.set_result(False)
+        if send_task is not None and not send_task.done():
+            send_task.cancel()
+
+    def _resolve_pending_marks(
+        self, played: bool, owner: PlaybackOwner | None = None
+    ) -> None:
+        for mark_owner, playback_wait in self._pending_marks.values():
+            if owner is not None and mark_owner is not owner:
+                continue
             if not playback_wait.done():
                 playback_wait.set_result(played)
+
+    def _retire_all_playback(self) -> None:
+        self._playback_closed = True
+        if self._active_playback is not None:
+            self._active_playback.retired = True
+            self._active_playback = None
+        self._resolve_pending_marks(False)
 
     def set_media_handler(self, handler: Callable[[bytes], Any]) -> None:
         """Set handler for incoming audio"""
@@ -382,7 +571,9 @@ class TwilioMediaStreamHandler:
         """Cleanup resources"""
         self._is_connected = False
         self._is_streaming = False
-        self._resolve_pending_marks(False)
+        self.invalidate_playback_session()
+        for task in tuple(self._send_tasks):
+            task.cancel()
         logger.info(f"Twilio: Cleaned up handler for call {self.call_sid}")
 
 

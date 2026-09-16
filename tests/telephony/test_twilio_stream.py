@@ -57,10 +57,18 @@ async def test_control_messages_are_serialized() -> None:
 async def test_matching_mark_confirms_playback() -> None:
     websocket = RecordingWebSocket()
     handler = TwilioMediaStreamHandler("call-1", "stream-1", websocket)
+    handler._is_streaming = True
+    owner = await handler.begin_playback()
+    stream_result = await handler.stream_audio_chunks(owner, _audio_chunks(b"x" * 1600))
+    websocket.message_sent.clear()
 
-    playback_wait = asyncio.create_task(handler.wait_for_playback(timeout=1))
+    playback_wait = asyncio.create_task(handler.wait_for_playback(owner, stream_result, timeout=1))
     await websocket.message_sent.wait()
-    mark_name = websocket.messages[0]["mark"]["name"]
+    mark_name = next(
+        message["mark"]["name"]
+        for message in reversed(websocket.messages)
+        if message["event"] == "mark"
+    )
     await handler._process_message(
         json.dumps({"event": "mark", "mark": {"name": mark_name}})
     )
@@ -71,5 +79,12 @@ async def test_matching_mark_confirms_playback() -> None:
 @pytest.mark.asyncio
 async def test_missing_mark_has_bounded_timeout() -> None:
     handler = TwilioMediaStreamHandler("call-1", "stream-1", RecordingWebSocket())
+    handler._is_streaming = True
+    owner = await handler.begin_playback()
+    stream_result = await handler.stream_audio_chunks(owner, _audio_chunks(b"x" * 1600))
 
-    assert await handler.wait_for_playback(timeout=0.01) is False
+    assert await handler.wait_for_playback(owner, stream_result, timeout=0.01) is False
+
+
+async def _audio_chunks(audio: bytes):
+    yield audio
