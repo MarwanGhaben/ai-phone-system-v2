@@ -31,6 +31,13 @@ from services.tts.elevenlabs_service import create_elevenlabs_tts
 from services.llm.openai_service import create_openai_llm
 from services.llm.llm_base import Message, LLMRole
 from services.telephony.twilio_service import TwilioMediaStreamHandler
+from services.conversation.barge_in_diagnostics import (
+    BargeInDiagnostics,
+    bind_diagnostic_state,
+    bound_diagnostic_state,
+    bound_diagnostic_window,
+    reset_diagnostic_state,
+)
 from services.conversation.language_policy import explicit_language_request
 from services.calendar.calendar_base import TimeSlot
 from services.calendar.business_time import as_business_time, business_now
@@ -43,6 +50,7 @@ from services.scheduling.booking_records import (
 _DATETIME_TYPE = datetime
 _MAX_CONSUMED_UTTERANCE_IDENTITIES = 256
 _ABORTED_RESPONSE = object()
+_DIAGNOSTIC_CONTEXT_UNSET = object()
 _AVAILABILITY_ACKNOWLEDGEMENTS = {
     "en": "Certainly, I'll check availability.",
     "ar": "حاضر، سأتحقق من المواعيد المتاحة.",
@@ -139,6 +147,7 @@ class ConversationContext:
     ai_response: str = ""
     start_time: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    barge_in_diagnostics: Optional[Any] = field(default=None, repr=False, compare=False)
 
     # Caller recognition
     caller_name: Optional[str] = None
@@ -284,6 +293,15 @@ class ConversationOrchestrator:
         self._call_state_locks: Dict[str, asyncio.Lock] = {}  # Per-call state locks
         self._speech_setup_locks: Dict[str, asyncio.Lock] = {}
         self._active_speech: Dict[str, _SpeechOwner] = {}
+
+        self._barge_in_observer = None
+        if settings.barge_in_diagnostics_enabled:
+            try:
+                self._barge_in_observer = BargeInDiagnostics(
+                    emit=lambda summary: logger.info(summary)
+                )
+            except Exception:
+                self._barge_in_observer = None
 
         # Barge-in detection (per-call)
         self._barge_in_consecutive: Dict[str, int] = {}  # Per-call consecutive high-energy frame count
@@ -678,6 +696,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         import traceback
         logger.info(f"Orchestrator: ===== START CALL {call_sid} from {phone_number}, stream_sid={stream_sid}")
 
+        context = None
         try:
             # =====================================================
             # STEP 1: Create per-call STT instance
@@ -731,6 +750,12 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             )
             context.caller_name = caller_name
             context.is_known_caller = caller_name is not None
+            observer = getattr(self, "_barge_in_observer", None)
+            if observer is not None:
+                try:
+                    context.barge_in_diagnostics = observer.start_call()
+                except Exception:
+                    context.barge_in_diagnostics = None
             self._conversations[call_sid] = context
             logger.info(f"Orchestrator: Conversation context created")
 
@@ -850,7 +875,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             logger.error(f"Orchestrator: Traceback:\n{traceback.format_exc()}")
         finally:
             logger.info(f"Orchestrator: ===== END CALL {call_sid}")
-            await self.end_call(call_sid)
+            await self.end_call(call_sid, diagnostic_context=context)
 
     def _handle_incoming_audio(self, call_sid: str):
         """
@@ -862,6 +887,8 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         Args:
             call_sid: Call identifier
         """
+        diagnostic_context = self._conversations.get(call_sid)
+
         async def process_audio(audio_data: bytes):
             """Process audio chunk"""
             # Debug: Track audio chunks
@@ -890,8 +917,25 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 current_state = context.state
 
             if current_state == ConversationState.SPEAKING:
+                diagnostic_state = getattr(
+                    diagnostic_context, "barge_in_diagnostics", None
+                )
+                diagnostic_window = self._observe_barge_in(
+                    diagnostic_state, "observe_dispatch", len(audio_data)
+                )
                 # Check for barge-in (user speech during AI speech)
-                if await self._detect_barge_in(audio_data, call_sid):
+                observer = getattr(self, "_barge_in_observer", None)
+                if observer is None:
+                    detected = await self._detect_barge_in(audio_data, call_sid)
+                else:
+                    token = bind_diagnostic_state(
+                        diagnostic_state, diagnostic_window
+                    )
+                    try:
+                        detected = await self._detect_barge_in(audio_data, call_sid)
+                    finally:
+                        reset_diagnostic_state(token)
+                if detected:
                     logger.info("Orchestrator: === BARGE-IN DETECTED === User interrupted!")
                     async with state_lock:
                         context.state = ConversationState.LISTENING
@@ -901,13 +945,47 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
                     # Stop only this call's owned synthesis/playback. The outer
                     # dialogue/tool coroutine remains alive and resumes normally.
-                    await self._interrupt_call_speech(call_sid)
+                    try:
+                        interrupted = await self._interrupt_call_speech(call_sid)
+                    except BaseException:
+                        self._observe_barge_in(
+                            diagnostic_state,
+                            "observe_action",
+                            "interrupt",
+                            "failed",
+                            window=diagnostic_window,
+                        )
+                        raise
+                    self._observe_barge_in(
+                        diagnostic_state,
+                        "observe_action",
+                        "interrupt",
+                        "succeeded" if interrupted else "not_owned",
+                        window=diagnostic_window,
+                    )
 
                     # Mark that barge-in will do the reset BEFORE starting it
                     # (prevents race condition where _speak_to_caller checks flag mid-reset)
                     self._barge_in_reset_done[call_sid] = True
                     # Reset STT for clean listening after barge-in
-                    await call_stt.reset_for_listening()
+                    try:
+                        await call_stt.reset_for_listening()
+                    except BaseException:
+                        self._observe_barge_in(
+                            diagnostic_state,
+                            "observe_action",
+                            "reset",
+                            "failed",
+                            window=diagnostic_window,
+                        )
+                        raise
+                    self._observe_barge_in(
+                        diagnostic_state,
+                        "observe_action",
+                        "reset",
+                        "succeeded",
+                        window=diagnostic_window,
+                    )
                 else:
                     # SPEAKING and no barge-in: Do NOT feed audio to STT.
                     # The AI's voice comes back through the phone mic as echo.
@@ -915,15 +993,56 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                     # it to miss the user's first words after AI finishes speaking.
                     # STT will be reset with a clean connection when we transition
                     # to LISTENING (see _speak_to_caller).
+                    self._observe_barge_in(
+                        diagnostic_state,
+                        "observe_route",
+                        "dropped",
+                        len(audio_data),
+                        window=diagnostic_window,
+                    )
                     return
 
             # LISTENING state: feed audio to STT
             from services.stt.stt_base import AudioChunk
             await call_stt.stream_audio(AudioChunk(data=audio_data))
+            if current_state == ConversationState.SPEAKING:
+                self._observe_barge_in(
+                    diagnostic_state,
+                    "observe_route",
+                    "forwarded",
+                    len(audio_data),
+                    window=diagnostic_window,
+                )
             if process_audio._chunk_count == 1:
                 logger.info(f"Orchestrator: First audio chunk sent to STT")
 
         return process_audio
+
+    def _diagnostic_state_for(self, call_sid: str):
+        bound, state = bound_diagnostic_state()
+        if bound:
+            return state
+        context = self._conversations.get(call_sid)
+        return getattr(context, "barge_in_diagnostics", None)
+
+    def _diagnostic_window_for(self, state):
+        bound, window = bound_diagnostic_window()
+        if bound:
+            return window
+        return getattr(state, "current_window", None)
+
+    def _observe_barge_in(self, state, operation: str, *args, **kwargs):
+        observer = getattr(self, "_barge_in_observer", None)
+        if observer is None or state is None:
+            return None
+        try:
+            return getattr(observer, operation)(state, *args, **kwargs)
+        except Exception:
+            try:
+                observer.mark_failed(state)
+            except Exception:
+                pass
+            return None
 
     async def _consume_stt_transcripts(self, call_sid: str) -> None:
         """
@@ -2735,6 +2854,10 @@ CRITICAL INSTRUCTIONS:
                     context.state = ConversationState.LISTENING
             return False
 
+        diagnostic_state = getattr(context, "barge_in_diagnostics", None)
+        diagnostic_window = self._observe_barge_in(
+            diagnostic_state, "start_speaking"
+        )
         owner = None
         speech_completed = False
         try:
@@ -2825,7 +2948,24 @@ CRITICAL INSTRUCTIONS:
             barge_in_already_reset = self._barge_in_reset_done.get(call_sid, False)
 
             if call_stt and not barge_in_already_reset:
-                await call_stt.reset_for_listening()
+                try:
+                    await call_stt.reset_for_listening()
+                except BaseException:
+                    self._observe_barge_in(
+                        diagnostic_state,
+                        "observe_action",
+                        "reset",
+                        "failed",
+                        window=diagnostic_window,
+                    )
+                    raise
+                self._observe_barge_in(
+                    diagnostic_state,
+                    "observe_action",
+                    "reset",
+                    "succeeded",
+                    window=diagnostic_window,
+                )
                 if not self._speech_is_current(call_sid, owner):
                     return False
             elif barge_in_already_reset:
@@ -2892,6 +3032,13 @@ CRITICAL INSTRUCTIONS:
                         and context.state == ConversationState.SPEAKING
                     ):
                         context.state = ConversationState.LISTENING
+            diagnostic_outcome = "completed" if speech_completed else "failed"
+            self._observe_barge_in(
+                diagnostic_state,
+                "end_speaking",
+                diagnostic_window,
+                diagnostic_outcome,
+            )
             logger.info(f"Orchestrator: _speak_to_caller END (state={context.state.value})")
         return speech_completed
 
@@ -2943,8 +3090,16 @@ CRITICAL INSTRUCTIONS:
         """
         import time
 
+        diagnostic_state = self._diagnostic_state_for(call_sid or "_default")
+        diagnostic_window = self._diagnostic_window_for(diagnostic_state)
         sample_count = min(len(audio_data), 1000)
         if sample_count == 0:
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_detector",
+                "no_audio",
+                window=diagnostic_window,
+            )
             return False
 
         # Check grace period: skip barge-in detection for first 0.8s after speech starts
@@ -2953,6 +3108,12 @@ CRITICAL INSTRUCTIONS:
         now = time.time()
         grace_start = self._barge_in_speech_start.get(sid, 0)
         if grace_start > 0 and (now - grace_start) < 0.8:
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_detector",
+                "grace_suppressed",
+                window=diagnostic_window,
+            )
             return False
 
         # Decode μ-law to linear PCM to get real energy values
@@ -2965,6 +3126,13 @@ CRITICAL INSTRUCTIONS:
             # Calculate RMS energy from 16-bit linear PCM
             rms = audioop.rms(linear_data, 2)
         except Exception:
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_detector",
+                "decode_failed",
+                analyzed_bytes=sample_count,
+                window=diagnostic_window,
+            )
             return False
 
         # Initialize per-call consecutive counter
@@ -2992,10 +3160,38 @@ CRITICAL INSTRUCTIONS:
             self._barge_in_consecutive[sid] += 1
             if self._barge_in_consecutive[sid] >= required_consecutive:
                 logger.info(f"Orchestrator: Barge-in triggered - rms={rms}, threshold={threshold}, consecutive={self._barge_in_consecutive[sid]}")
+                self._observe_barge_in(
+                    diagnostic_state,
+                    "observe_detector",
+                    "gate_fired",
+                    analyzed_bytes=sample_count,
+                    rms=rms,
+                    consecutive=self._barge_in_consecutive[sid],
+                    window=diagnostic_window,
+                )
                 self._barge_in_consecutive[sid] = 0
                 return True
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_detector",
+                "above_threshold",
+                analyzed_bytes=sample_count,
+                rms=rms,
+                consecutive=self._barge_in_consecutive[sid],
+                window=diagnostic_window,
+            )
         else:
+            previous_consecutive = self._barge_in_consecutive[sid]
             self._barge_in_consecutive[sid] = 0
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_detector",
+                "below_threshold",
+                analyzed_bytes=sample_count,
+                rms=rms,
+                consecutive=previous_consecutive,
+                window=diagnostic_window,
+            )
 
         return False
 
@@ -3114,7 +3310,9 @@ CRITICAL INSTRUCTIONS:
             import traceback
             logger.error(traceback.format_exc())
 
-    async def end_call(self, call_sid: str) -> None:
+    async def end_call(
+        self, call_sid: str, diagnostic_context=_DIAGNOSTIC_CONTEXT_UNSET
+    ) -> None:
         """
         End a call and cleanup resources
 
@@ -3155,6 +3353,14 @@ CRITICAL INSTRUCTIONS:
             speech_owner.active = False
             speech_owner.tts_stream.cancel()
             speech_owner.handler.invalidate_playback(speech_owner.playback)
+
+        diagnostic_owner = (
+            context
+            if diagnostic_context is _DIAGNOSTIC_CONTEXT_UNSET
+            else diagnostic_context
+        )
+        diagnostic_state = getattr(diagnostic_owner, "barge_in_diagnostics", None)
+        self._observe_barge_in(diagnostic_state, "finish_call")
 
         # =====================================================
         # Log call end to database
@@ -3218,7 +3424,7 @@ CRITICAL INSTRUCTIONS:
                     f"stage=end_call_close ({type(cleanup_exc).__name__})"
                 )
 
-        if self._conversations.get(call_sid) is context:
+        if context is not None and self._conversations.get(call_sid) is context:
             self._echo_guard_until.pop(call_sid, None)
             self._garbled_drop_count.pop(call_sid, None)
             self._barge_in_consecutive.pop(call_sid, None)
@@ -3240,7 +3446,7 @@ CRITICAL INSTRUCTIONS:
                 del self._twilio_handlers[call_sid]
 
         # Remove from active conversations
-        if self._conversations.get(call_sid) is context:
+        if context is not None and self._conversations.get(call_sid) is context:
             del self._conversations[call_sid]
 
     def get_conversation_context(self, call_sid: str) -> Optional[ConversationContext]:

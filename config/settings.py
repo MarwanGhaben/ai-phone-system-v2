@@ -125,6 +125,12 @@ class Settings(BaseSettings):
     elevenlabs_stt_model: str = Field(default="scribe_v2_realtime", alias="ELEVENLABS_STT_MODEL")
     elevenlabs_stt_language: str = Field(default="", alias="ELEVENLABS_STT_LANGUAGE")  # Empty = auto-detect
     elevenlabs_stt_sample_rate: int = Field(default=8000, alias="ELEVENLABS_STT_SAMPLE_RATE")  # 8000 for Twilio ulaw
+    elevenlabs_stt_filter_background_audio: bool = Field(
+        default=False, alias="ELEVENLABS_STT_FILTER_BACKGROUND_AUDIO"
+    )
+    barge_in_diagnostics_enabled: bool = Field(
+        default=False, alias="BARGE_IN_DIAGNOSTICS_ENABLED"
+    )
 
     # =====================================================
     # OPENAI

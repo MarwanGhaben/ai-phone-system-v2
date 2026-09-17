@@ -14,6 +14,7 @@ import asyncio
 import base64
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from enum import Enum
 import hashlib
 import json
 import math
@@ -57,6 +58,19 @@ class _ReceiverState:
     correlation_disabled: bool = False
 
 
+class STTTransportOutcome(str, Enum):
+    """Bounded public outcome for the most recently owned provider transport."""
+
+    INACTIVE = "inactive"
+    TRANSPORT_OPEN = "transport_open"
+    SESSION_STARTED = "session_started"
+    PROVIDER_ERROR = "provider_error"
+    REMOTE_ENDED = "remote_ended"
+    REMOTE_CLOSED = "remote_closed"
+    RECEIVER_ERROR = "receiver_error"
+    LOCAL_DISCONNECT = "local_disconnect"
+
+
 class ElevenLabsSTT(STTServiceBase):
     """
     ElevenLabs Scribe v2 Realtime STT Service
@@ -84,6 +98,22 @@ class ElevenLabsSTT(STTServiceBase):
     CLEANUP_WAIT_SECONDS = 0.05
     _HISTORY_COMMIT = 1
     _HISTORY_ENRICHMENT = 2
+    PROVIDER_ERROR_TYPES = frozenset({
+        "auth_error",
+        "quota_exceeded",
+        "transcriber_error",
+        "input_error",
+        "invalid_request",
+        "error",
+        "commit_throttled",
+        "unaccepted_terms",
+        "rate_limited",
+        "queue_overflow",
+        "resource_exhausted",
+        "session_time_limit_exceeded",
+        "chunk_size_exceeded",
+        "insufficient_audio_activity",
+    })
 
     def __init__(
         self,
@@ -91,6 +121,7 @@ class ElevenLabsSTT(STTServiceBase):
         language: str = "",  # Empty = auto-detect
         model: str = "scribe_v2_realtime",
         sample_rate: int = 8000,  # Twilio native rate
+        filter_background_audio: bool = False,
     ):
         """
         Initialize ElevenLabs STT service
@@ -100,7 +131,10 @@ class ElevenLabsSTT(STTServiceBase):
             language: Language code (en, ar, etc.) or empty for auto-detect
             model: Model to use (scribe_v2_realtime)
             sample_rate: Sample rate for audio (8000 for Twilio μ-law)
+            filter_background_audio: Whether ElevenLabs should suppress background speech/noise
         """
+        if not isinstance(filter_background_audio, bool):
+            raise TypeError("filter_background_audio must be a bool")
         if not WEBSOCKETS_AVAILABLE:
             raise ImportError("websockets is not installed. Install with: pip install websockets")
 
@@ -108,6 +142,7 @@ class ElevenLabsSTT(STTServiceBase):
 
         self.model = model
         self.sample_rate = sample_rate
+        self.filter_background_audio = filter_background_audio
 
         self._websocket: Optional[websockets.WebSocketClientProtocol] = None
         self._transcript_queue: asyncio.Queue = None
@@ -121,6 +156,8 @@ class ElevenLabsSTT(STTServiceBase):
         self._session_active = False
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._current_receiver: Optional[_ReceiverState] = None
+        self._transport_outcome = STTTransportOutcome.INACTIVE
+        self._provider_error_category: Optional[str] = None
         self._metadata_events: Deque[UtteranceMetadataEvent] = deque(
             maxlen=self.MAX_METADATA_EVENTS
         )
@@ -135,6 +172,16 @@ class ElevenLabsSTT(STTServiceBase):
         """Number of commits retained only for possible metadata correlation."""
         receiver = self._current_receiver
         return len(receiver.pending_commits) if receiver else 0
+
+    @property
+    def transport_outcome(self) -> STTTransportOutcome:
+        """Return the bounded outcome for the latest owned transport."""
+        return self._transport_outcome
+
+    @property
+    def provider_error_category(self) -> Optional[str]:
+        """Return only a documented, allowlisted provider error category."""
+        return self._provider_error_category
 
     def _activate_receiver(self, websocket) -> _ReceiverState:
         """Create a connection epoch and bind it to one captured WebSocket."""
@@ -164,6 +211,8 @@ class ElevenLabsSTT(STTServiceBase):
                 self._transcript_queue = asyncio.Queue()
                 self._metadata_events.clear()
                 self._session_active = True
+            if self._websocket is not None or self._current_receiver is not None:
+                await self._stop_transport_locked()
             return await self._open_transport_locked(revision)
 
     async def reconnect_with_language(self, language_code: str) -> bool:
@@ -200,6 +249,8 @@ class ElevenLabsSTT(STTServiceBase):
             self._transcript_queue = None
             self._metadata_events.clear()
             self._status = STTStatus.DISCONNECTED
+            self._transport_outcome = STTTransportOutcome.LOCAL_DISCONNECT
+            self._provider_error_category = None
             await self._wait_for_cleanup_tasks()
             logger.info("ElevenLabs STT: Disconnected")
 
@@ -229,6 +280,8 @@ class ElevenLabsSTT(STTServiceBase):
         }
         if self.language:
             params["language_code"] = self.language
+        if self.filter_background_audio:
+            params["filter_background_audio"] = "true"
         query_string = "&".join(f"{key}={value}" for key, value in params.items())
         return f"{self.WEBSOCKET_URL}?{query_string}"
 
@@ -325,6 +378,8 @@ class ElevenLabsSTT(STTServiceBase):
             name="elevenlabs_stt_receive",
         )
         self._status = STTStatus.CONNECTED
+        self._transport_outcome = STTTransportOutcome.TRANSPORT_OPEN
+        self._provider_error_category = None
         logger.info("ElevenLabs STT: Connected")
         return True
 
@@ -515,17 +570,80 @@ class ElevenLabsSTT(STTServiceBase):
                 type(error).__name__,
             )
 
+    def _receiver_is_current(self, receiver: _ReceiverState) -> bool:
+        return (
+            self._current_receiver is receiver
+            and self._websocket is receiver.websocket
+        )
+
+    def _finish_receiver_outcome(
+        self,
+        receiver: _ReceiverState,
+        outcome: Optional[STTTransportOutcome],
+        provider_error_category: Optional[str],
+    ) -> None:
+        """Apply one terminal outcome only to the exactly owned receiver."""
+        if outcome is None or not self._receiver_is_current(receiver):
+            return
+
+        self._is_listening = False
+        self._transport_outcome = outcome
+        self._provider_error_category = provider_error_category
+        if outcome in (
+            STTTransportOutcome.PROVIDER_ERROR,
+            STTTransportOutcome.RECEIVER_ERROR,
+        ):
+            self._status = STTStatus.ERROR
+        else:
+            self._status = STTStatus.DISCONNECTED
+
+        receive_task = asyncio.current_task()
+        if self._receive_task is receive_task:
+            cleanup_task = asyncio.create_task(
+                self._retire_completed_receiver(receiver, receive_task),
+                name="elevenlabs_stt_receiver_cleanup",
+            )
+            self._retain_cleanup_task(cleanup_task)
+
+    async def _retire_completed_receiver(
+        self,
+        receiver: _ReceiverState,
+        receive_task: asyncio.Task,
+    ) -> None:
+        """Revoke a completed current receiver, then reuse bounded socket cleanup."""
+        async with self._connection_lock:
+            if (
+                not self._receiver_is_current(receiver)
+                or self._receive_task is not receive_task
+            ):
+                return
+            websocket = self._websocket
+            self._current_receiver = None
+            self._receive_task = None
+            self._websocket = None
+        await self._finish_transport_cleanup(receiver, None, websocket)
+
     async def _receive_loop(self, receiver: Optional[_ReceiverState] = None) -> None:
         """Normalize messages from one captured WebSocket/identity epoch."""
         receiver = receiver or self._receiver_for_loop()
+        terminal_outcome: Optional[STTTransportOutcome] = None
+        provider_error_category: Optional[str] = None
 
         try:
             while self._is_listening and receiver.websocket:
                 try:
-                    message = await asyncio.wait_for(
-                        receiver.websocket.recv(),
-                        timeout=60.0  # 1 minute timeout
-                    )
+                    receive_operation = asyncio.ensure_future(receiver.websocket.recv())
+                    try:
+                        message = await asyncio.wait_for(
+                            receive_operation,
+                            timeout=60.0  # 1 minute timeout
+                        )
+                    finally:
+                        # wait_for cancellation can leave a cancellation-resistant
+                        # recv finishing with an exception. Retain/consume that
+                        # child too, so its raw exception never reaches asyncio's
+                        # unhandled-task logger after transport replacement.
+                        self._retain_cleanup_task(receive_operation)
 
                     data = json.loads(message)
                     if not isinstance(data, dict):
@@ -577,15 +695,25 @@ class ElevenLabsSTT(STTServiceBase):
                         )
 
                     elif msg_type == "session_started":
-                        logger.info(
-                            "ElevenLabs STT: Session started (epoch={})",
-                            receiver.connection_epoch,
-                        )
+                        if self._receiver_is_current(receiver):
+                            self._transport_outcome = STTTransportOutcome.SESSION_STARTED
+                            self._provider_error_category = None
+                            logger.info(
+                                "ElevenLabs STT: Session started (epoch={})",
+                                receiver.connection_epoch,
+                            )
 
-                    elif msg_type == "error":
-                        logger.error("ElevenLabs STT: Provider error event")
+                    elif msg_type in self.PROVIDER_ERROR_TYPES:
+                        terminal_outcome = STTTransportOutcome.PROVIDER_ERROR
+                        provider_error_category = msg_type
+                        logger.error(
+                            "ElevenLabs STT: Provider rejected transport category={}",
+                            msg_type,
+                        )
+                        break
 
                     elif msg_type == "session_ended":
+                        terminal_outcome = STTTransportOutcome.REMOTE_ENDED
                         logger.info("ElevenLabs STT: Session ended")
                         break
 
@@ -602,19 +730,29 @@ class ElevenLabsSTT(STTServiceBase):
                         try:
                             await receiver.websocket.ping()
                         except Exception:
+                            terminal_outcome = STTTransportOutcome.REMOTE_CLOSED
                             break
 
         except WebSocketConnectionClosed:
+            terminal_outcome = STTTransportOutcome.REMOTE_CLOSED
             logger.info("ElevenLabs STT: WebSocket closed")
         except asyncio.CancelledError:
+            if self._receiver_is_current(receiver):
+                terminal_outcome = STTTransportOutcome.RECEIVER_ERROR
             logger.debug("ElevenLabs STT: Receive loop cancelled")
-            return  # Don't touch _is_listening — reset_for_listening manages it
+            return  # Revoked lifecycle receivers cannot change replacement state.
         except Exception as e:
+            terminal_outcome = STTTransportOutcome.RECEIVER_ERROR
             logger.error(
                 "ElevenLabs STT: Receive loop error category={}",
                 type(e).__name__,
             )
         finally:
+            self._finish_receiver_outcome(
+                receiver,
+                terminal_outcome,
+                provider_error_category,
+            )
             receiver.pending_commits.clear()
             receiver.seen_metadata_digests.clear()
             receiver.correlation_text_history.clear()
@@ -973,17 +1111,22 @@ def create_elevenlabs_stt(config: dict) -> ElevenLabsSTT:
     Returns:
         Configured ElevenLabsSTT instance
     """
-    if not WEBSOCKETS_AVAILABLE:
-        raise ImportError("websockets is not installed. Install with: pip install websockets")
-
     # Get language setting
     language = config.get('elevenlabs_stt_language', '')
     if language == 'auto':
         language = ''  # Empty = auto-detect
+    filter_background_audio = config.get(
+        'elevenlabs_stt_filter_background_audio', False
+    )
+    if not isinstance(filter_background_audio, bool):
+        raise TypeError("filter_background_audio must be a bool")
+    if not WEBSOCKETS_AVAILABLE:
+        raise ImportError("websockets is not installed. Install with: pip install websockets")
 
     return ElevenLabsSTT(
         api_key=config.get('elevenlabs_api_key'),
         language=language,
         model=config.get('elevenlabs_stt_model', 'scribe_v2_realtime'),
         sample_rate=8000,  # Native Twilio μ-law rate
+        filter_background_audio=filter_background_audio,
     )
