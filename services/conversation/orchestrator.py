@@ -148,6 +148,10 @@ class ConversationContext:
     start_time: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
     barge_in_diagnostics: Optional[Any] = field(default=None, repr=False, compare=False)
+    speech_activity_gate: Optional[Any] = field(default=None, repr=False, compare=False)
+    speech_activity_owner: Optional[Any] = field(default=None, repr=False, compare=False)
+    speech_activity_flow: Optional[Any] = field(default=None, repr=False, compare=False)
+    speech_activity_started_at: float = field(default=0.0, repr=False, compare=False)
 
     # Caller recognition
     caller_name: Optional[str] = None
@@ -244,6 +248,28 @@ class _SpeechOwner:
     active: bool = True
 
 
+@dataclass(eq=False)
+class _SpeechBargeInFlow:
+    """Bounded audio awaiting the accepted window's STT reset."""
+
+    context: ConversationContext
+    owner: _SpeechOwner
+    gate: Any
+    call_stt: Any
+    trailing: bytearray = field(default_factory=bytearray)
+    overflowed: bool = False
+    warning_emitted: bool = False
+
+    def append(self, audio: bytes) -> None:
+        if self.overflowed:
+            return
+        if len(self.trailing) + len(audio) > 2560:
+            self.trailing.clear()
+            self.overflowed = True
+            return
+        self.trailing.extend(audio)
+
+
 class ConversationOrchestrator:
     """
     Main orchestrator for AI voice conversations
@@ -293,6 +319,28 @@ class ConversationOrchestrator:
         self._call_state_locks: Dict[str, asyncio.Lock] = {}  # Per-call state locks
         self._speech_setup_locks: Dict[str, asyncio.Lock] = {}
         self._active_speech: Dict[str, _SpeechOwner] = {}
+
+        # The local ONNX runtime and model are imported only when this flag is on.
+        # A load/integrity failure disables interruption for enabled windows; it
+        # never falls back to the legacy volume threshold.
+        self._speech_aware_barge_in_enabled = settings.speech_aware_barge_in_enabled
+        self._local_vad_model = None
+        self._speech_gate_config = {
+            "probability_threshold": settings.local_vad_probability_threshold,
+            "speech_duration_ms": settings.local_vad_speech_duration_ms,
+            "max_input_gap_ms": settings.local_vad_max_input_gap_ms,
+            "max_inference_ms": settings.local_vad_max_inference_ms,
+        }
+        if self._speech_aware_barge_in_enabled:
+            try:
+                from services.conversation.local_vad import LocalVadModel
+
+                self._local_vad_model = LocalVadModel(
+                    settings.local_vad_model_path,
+                    max_inference_ms=settings.local_vad_max_inference_ms,
+                )
+            except Exception:
+                self._warn_speech_activity_gate("model_unavailable")
 
         self._barge_in_observer = None
         if settings.barge_in_diagnostics_enabled:
@@ -899,7 +947,14 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 logger.info(f"Orchestrator: process_audio called - chunk #{process_audio._chunk_count}, {len(audio_data)} bytes")
 
             context = self._conversations.get(call_sid)
-            if not context or context.state == ConversationState.ENDED:
+            if (
+                not context
+                or (
+                    getattr(self, "_speech_aware_barge_in_enabled", False)
+                    and context is not diagnostic_context
+                )
+                or context.state == ConversationState.ENDED
+            ):
                 logger.debug(f"Orchestrator: process_audio skipping - no context or call ended")
                 return
 
@@ -923,6 +978,17 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 diagnostic_window = self._observe_barge_in(
                     diagnostic_state, "observe_dispatch", len(audio_data)
                 )
+                if getattr(self, "_speech_aware_barge_in_enabled", False):
+                    await self._handle_speech_aware_audio(
+                        call_sid,
+                        context,
+                        call_stt,
+                        state_lock,
+                        audio_data,
+                        diagnostic_state,
+                        diagnostic_window,
+                    )
+                    return
                 # Check for barge-in (user speech during AI speech)
                 observer = getattr(self, "_barge_in_observer", None)
                 if observer is None:
@@ -1017,6 +1083,231 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                 logger.info(f"Orchestrator: First audio chunk sent to STT")
 
         return process_audio
+
+    @staticmethod
+    def _warn_speech_activity_gate(category: str) -> None:
+        logger.warning(f"Speech activity gate retired category={category}")
+
+    def _create_speech_activity_gate(self):
+        model = getattr(self, "_local_vad_model", None)
+        if model is None:
+            return None
+        try:
+            from services.conversation.speech_activity_gate import SpeechActivityGate
+
+            return SpeechActivityGate(
+                model,
+                warning=self._warn_speech_activity_gate,
+                **self._speech_gate_config,
+            )
+        except Exception:
+            self._warn_speech_activity_gate("window_initialization_failed")
+            return None
+
+    def _speech_gate_owner_is_current(
+        self,
+        call_sid: str,
+        context: ConversationContext,
+        owner: _SpeechOwner,
+        gate,
+        call_stt,
+    ) -> bool:
+        if not (
+            self._conversations.get(call_sid) is context
+            and self._call_stt_instances.get(call_sid) is call_stt
+            and self._active_speech.get(call_sid) is owner
+            and owner.active
+            and owner.context is context
+            and context.speech_activity_gate is gate
+            and context.speech_activity_owner is owner
+            and context.state == ConversationState.SPEAKING
+        ):
+            return False
+        current_playback = getattr(owner.handler, "is_current_playback", None)
+        return current_playback is None or bool(current_playback(owner.playback))
+
+    def _speech_flow_is_current(self, call_sid: str, flow: _SpeechBargeInFlow) -> bool:
+        return (
+            self._conversations.get(call_sid) is flow.context
+            and self._call_stt_instances.get(call_sid) is flow.call_stt
+            and flow.context.speech_activity_flow is flow
+            and flow.context.state != ConversationState.ENDED
+            and call_sid not in self._active_speech
+        )
+
+    async def _handle_speech_aware_audio(
+        self,
+        call_sid: str,
+        context: ConversationContext,
+        call_stt,
+        state_lock: asyncio.Lock,
+        audio_data: bytes,
+        diagnostic_state,
+        diagnostic_window,
+    ) -> None:
+        flow = context.speech_activity_flow
+        if flow is not None:
+            if (
+                self._conversations.get(call_sid) is context
+                and self._call_stt_instances.get(call_sid) is call_stt
+                and flow.call_stt is call_stt
+            ):
+                flow.append(audio_data)
+                if flow.overflowed and not flow.warning_emitted:
+                    flow.warning_emitted = True
+                    self._warn_speech_activity_gate("reset_buffer_overflow")
+            return
+
+        owner = self._active_speech.get(call_sid)
+        gate = context.speech_activity_gate
+        if owner is None or gate is None or context.speech_activity_owner is not owner:
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_route",
+                "dropped",
+                len(audio_data),
+                window=diagnostic_window,
+            )
+            return
+
+        started_at = context.speech_activity_started_at
+        if started_at > 0 and time.monotonic() - started_at < 0.8:
+            try:
+                gate.reset_evidence()
+            except Exception:
+                gate.retire()
+                self._warn_speech_activity_gate("state_reset_failed")
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_route",
+                "dropped",
+                len(audio_data),
+                window=diagnostic_window,
+            )
+            return
+
+        decision = await gate.analyze(audio_data)
+        if not self._speech_gate_owner_is_current(
+            call_sid, context, owner, gate, call_stt
+        ):
+            replacement_flow = context.speech_activity_flow
+            if (
+                replacement_flow is not None
+                and self._conversations.get(call_sid) is context
+                and replacement_flow.call_stt is call_stt
+            ):
+                replacement_flow.append(audio_data)
+            return
+        if not decision.triggered:
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_route",
+                "dropped",
+                len(audio_data),
+                window=diagnostic_window,
+            )
+            return
+
+        flow = _SpeechBargeInFlow(context, owner, gate, call_stt)
+        context.speech_activity_flow = flow
+        completed = False
+        try:
+            try:
+                interrupted = await self._interrupt_call_speech(
+                    call_sid, expected_owner=owner
+                )
+            except BaseException:
+                self._observe_barge_in(
+                    diagnostic_state,
+                    "observe_action",
+                    "interrupt",
+                    "failed",
+                    window=diagnostic_window,
+                )
+                raise
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_action",
+                "interrupt",
+                "succeeded" if interrupted else "not_owned",
+                window=diagnostic_window,
+            )
+            if not interrupted or not self._speech_flow_is_current(call_sid, flow):
+                return
+
+            self._echo_guard_until[call_sid] = 0
+            self._barge_in_reset_done[call_sid] = True
+            try:
+                await call_stt.reset_for_listening()
+            except BaseException:
+                self._observe_barge_in(
+                    diagnostic_state,
+                    "observe_action",
+                    "reset",
+                    "failed",
+                    window=diagnostic_window,
+                )
+                raise
+            if not self._speech_flow_is_current(call_sid, flow):
+                return
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_action",
+                "reset",
+                "succeeded",
+                window=diagnostic_window,
+            )
+
+            from services.stt.stt_base import AudioChunk
+
+            await call_stt.stream_audio(AudioChunk(data=decision.audio))
+            if not self._speech_flow_is_current(call_sid, flow):
+                return
+            self._observe_barge_in(
+                diagnostic_state,
+                "observe_route",
+                "forwarded",
+                len(decision.audio),
+                window=diagnostic_window,
+            )
+            while flow.trailing:
+                trailing = bytes(flow.trailing)
+                flow.trailing.clear()
+                await call_stt.stream_audio(AudioChunk(data=trailing))
+                if not self._speech_flow_is_current(call_sid, flow):
+                    return
+                self._observe_barge_in(
+                    diagnostic_state,
+                    "observe_route",
+                    "forwarded",
+                    len(trailing),
+                    window=diagnostic_window,
+                )
+
+            async with state_lock:
+                if not self._speech_flow_is_current(call_sid, flow):
+                    return
+                context.speech_activity_flow = None
+                context.state = ConversationState.LISTENING
+                completed = True
+        finally:
+            if not completed and context.speech_activity_flow is flow:
+                context.speech_activity_flow = None
+                flow.trailing.clear()
+                # This synchronous transition has no cancellation point. Once
+                # owned playback has been removed, an aborted reset/send must
+                # not strand a live call in SPEAKING and discard all later audio.
+                # Do not change a replacement call, transport, lock or playback.
+                if (
+                    self._conversations.get(call_sid) is context
+                    and self._call_stt_instances.get(call_sid) is call_stt
+                    and self._call_state_locks.get(call_sid) is state_lock
+                    and self._twilio_handlers.get(call_sid) is owner.handler
+                    and call_sid not in self._active_speech
+                    and context.state == ConversationState.SPEAKING
+                ):
+                    context.state = ConversationState.LISTENING
+            gate.retire()
 
     def _diagnostic_state_for(self, call_sid: str):
         bound, state = bound_diagnostic_state()
@@ -2891,6 +3182,10 @@ CRITICAL INSTRUCTIONS:
                     self._conversations.get(call_sid) is not context
                     or self._twilio_handlers.get(call_sid) is not twilio_handler
                     or context.state == ConversationState.ENDED
+                    or (
+                        getattr(self, "_speech_aware_barge_in_enabled", False)
+                        and context.speech_activity_flow is not None
+                    )
                 ):
                     return False
 
@@ -2911,6 +3206,13 @@ CRITICAL INSTRUCTIONS:
                 audio_stream = self.tts.create_stream(request)
                 owner = _SpeechOwner(context, twilio_handler, audio_stream, playback)
                 self._active_speech[call_sid] = owner
+                if getattr(self, "_speech_aware_barge_in_enabled", False):
+                    previous_gate = context.speech_activity_gate
+                    if previous_gate is not None:
+                        previous_gate.retire()
+                    context.speech_activity_gate = self._create_speech_activity_gate()
+                    context.speech_activity_owner = owner
+                    context.speech_activity_started_at = time.monotonic()
 
             stream_result = await twilio_handler.stream_audio_chunks(
                 owner.playback, owner.tts_stream
@@ -2999,6 +3301,16 @@ CRITICAL INSTRUCTIONS:
                     owner.handler.release_playback(owner.playback)
                     is_current = self._active_speech.get(call_sid) is owner
                     owner.active = False
+                    if (
+                        self._conversations.get(call_sid) is context
+                        and context.speech_activity_owner is owner
+                    ):
+                        gate = context.speech_activity_gate
+                        if gate is not None:
+                            gate.retire()
+                        context.speech_activity_gate = None
+                        context.speech_activity_owner = None
+                        context.speech_activity_started_at = 0.0
                     if is_current:
                         self._active_speech.pop(call_sid, None)
                         if (
@@ -3052,8 +3364,27 @@ CRITICAL INSTRUCTIONS:
             and owner.handler.is_current_playback(owner.playback)
         )
 
-    async def _interrupt_call_speech(self, call_sid: str) -> bool:
+    async def _interrupt_call_speech(
+        self, call_sid: str, expected_owner: Optional[_SpeechOwner] = None
+    ) -> bool:
         setup_lock = self._speech_setup_locks.setdefault(call_sid, asyncio.Lock())
+        if expected_owner is not None:
+            async with setup_lock:
+                if self._active_speech.get(call_sid) is not expected_owner:
+                    return False
+                owner = self._active_speech.pop(call_sid)
+                owner.active = False
+                owner.tts_stream.cancel()
+            await owner.handler.clear_audio(owner.playback)
+            try:
+                await owner.tts_stream.aclose()
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "Orchestrator: Speech cleanup failed "
+                    f"stage=interrupt_close ({type(cleanup_exc).__name__})"
+                )
+            return True
+
         async with setup_lock:
             owner = self._active_speech.pop(call_sid, None)
             if owner is None:
@@ -3345,6 +3676,17 @@ CRITICAL INSTRUCTIONS:
         # Update context and invalidate owned speech before any awaited cleanup.
         if call_sid in self._conversations:
             self._conversations[call_sid].state = ConversationState.ENDED
+        if context is not None:
+            gate = context.speech_activity_gate
+            if gate is not None:
+                gate.retire()
+            context.speech_activity_gate = None
+            context.speech_activity_owner = None
+            flow = context.speech_activity_flow
+            context.speech_activity_flow = None
+            context.speech_activity_started_at = 0.0
+            if flow is not None:
+                flow.trailing.clear()
         if handler is not None:
             handler.invalidate_playback_session()
         speech_owner = self._active_speech.get(call_sid)

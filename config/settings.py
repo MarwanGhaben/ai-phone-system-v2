@@ -131,6 +131,40 @@ class Settings(BaseSettings):
     barge_in_diagnostics_enabled: bool = Field(
         default=False, alias="BARGE_IN_DIAGNOSTICS_ENABLED"
     )
+    speech_aware_barge_in_enabled: bool = Field(
+        default=False, alias="SPEECH_AWARE_BARGE_IN_ENABLED"
+    )
+    local_vad_model_path: str = Field(
+        default="models/vad/silero_vad.onnx", alias="LOCAL_VAD_MODEL_PATH"
+    )
+    local_vad_probability_threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        alias="LOCAL_VAD_PROBABILITY_THRESHOLD",
+    )
+    local_vad_speech_duration_ms: int = Field(
+        default=160, ge=32, le=320, alias="LOCAL_VAD_SPEECH_DURATION_MS"
+    )
+    local_vad_max_input_gap_ms: int = Field(
+        default=96, ge=32, le=1000, alias="LOCAL_VAD_MAX_INPUT_GAP_MS"
+    )
+    local_vad_max_inference_ms: float = Field(
+        default=20.0,
+        gt=0.0,
+        le=100.0,
+        allow_inf_nan=False,
+        alias="LOCAL_VAD_MAX_INFERENCE_MS",
+    )
+
+    @field_validator("local_vad_model_path")
+    @classmethod
+    def validate_local_vad_model_path(cls, value: str) -> str:
+        value = value.strip()
+        if not value or len(value) > 512 or "\x00" in value or not value.endswith(".onnx"):
+            raise ValueError("local VAD model path must be a bounded ONNX path")
+        return value
 
     # =====================================================
     # OPENAI

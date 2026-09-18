@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "branch": "codex/phase-4-arabic-voice-quality",
+  "reviewed_worktree_head": "4c135d883554496a250e135368e7e6eade90cc7a",
+  "baseline_commit": "4c135d883554496a250e135368e7e6eade90cc7a",
+  "baseline_image": "sha256:089447b0a1acb36c1ffd9d5a14251dd3357f19e75bacd8ebed919df3ffae8913",
+  "hash_convention": "Text groups: SHA-256 of CRLF-to-LF bytes only. model_assets: SHA-256 of exact RAW bytes; never normalize binary or license assets.",
+  "runtime": {
+    "config/settings.py": "932152f1ec9ceefb8f9284106daa8a2cedc67be629cd007f16b77601c8cdb803",
+    "services/conversation/orchestrator.py": "3c91e5f042c440ed974c14efc8356db8b891dbdfd5f81be5342eaf06ef4a1fcb",
+    "services/conversation/local_vad.py": "11ab51a409c026a5c144b52fcbeab50bbda6fabf85413e315a204ce3e69a46f9",
+    "services/conversation/speech_activity_gate.py": "dbeb9ffa54a678b8c788d7c0f45144840f25973d5b784805411ed35d2db93660"
+  },
+  "protected_runtime": {
+    "services/conversation/events.py": "f551ee7fc7d207e65f81b3a03a714f8f3c4815a7a914331d8d9acc1b94d04651",
+    "services/conversation/language_policy.py": "9ec8c2c349061ca39f3279fbfb9b89574e1a20d48e041eb800de1c1348ef39fa",
+    "services/conversation/turn_controller.py": "6bb1da8971a09a3e3f81e8061f96ae9db8095a1ba00f13d7f4b458a9d6798b4e",
+    "services/stt/stt_base.py": "46e5b23daba1a6b0f6d4d3e19b092ba0ed592ec22a6de2083e72a29b622b2033",
+    "services/telephony/twilio_service.py": "28e6a75851620271d1e0244f74fb5dc3b3ce125cae54a3f3c482ddfde1399b3e",
+    "services/tts/elevenlabs_service.py": "9f673af85044995ed3bec238351f78cd690ba27086aa0397a7b7123ce7965fa0",
+    "services/conversation/barge_in_diagnostics.py": "654f888d3b8ac8519fd3fef094ec5f9774ba18806cbfeedc2eca51e1d5da0e24",
+    "services/stt/elevenlabs_stt_service.py": "64a9a8be07fef96a840a98f50f6fed410a7a26de792ac088c0e0b41f19be38f7"
+  },
+  "tests": {
+    "tests/conftest.py": "5612921e2796a81fe8e7fe527a812c035195a959a3611cf6a41ef6e3f9c4a131",
+    "tests/conversation/test_availability_acknowledgement.py": "f01699f83232f34a9dd74c3436329d42efa45454919c7826c72eb975a55e417d",
+    "tests/conversation/test_barge_in_diagnostics.py": "502016b238a13d0f71b870b9ab249ba1d652f68204bbfd9973151dbcdae3e912",
+    "tests/conversation/test_booking_cancellation.py": "93a6e984a5c4d579f8b4dea9923422ad37656776dac9264fda602d382c0df9ea",
+    "tests/conversation/test_booking_safety_guards.py": "b15b1e565e30790c68f3bf149bbae42ddedeeca2727ed16089834cfe1eeb4771",
+    "tests/conversation/test_booking_time_validation.py": "1c28639993a7c161bc36de963bc908e1316bd9de8244ad3405fad579fed28124",
+    "tests/conversation/test_caller_language.py": "52ef808e05e8d702bafcdef7421b034ed3a697df17fddd3f093f64e6ef54a83a",
+    "tests/conversation/test_language_policy.py": "2f5100e9d33d9d7e77cef8a3e3bb6f9d54cd29d26a82eb4e726581f66dde410a",
+    "tests/conversation/test_playback_ownership.py": "2db54874a9ddf9bbbab0fda9bcdd2f5adc52232a4f16212b8cdf1daa64a97bb0",
+    "tests/conversation/test_transcript_identity.py": "9121a20f56fcba91fe6f3b4f790eba17886a5451345d4013b489adfdfed45bd2",
+    "tests/conversation/test_transfer_playback.py": "5a1c30445a6d092fb11a8310e50d683a85c5ac5b7b79310db749b6a2b4cfb123",
+    "tests/conversation/test_turn_controller.py": "405decc854a5d61de0db5a6e6bab965dc397215a3e2305d0f4784590b83dcb39",
+    "tests/stt/test_background_audio_pilot.py": "a440d9d41ff5bb015fbd43b621dfe711ac3bdd375d3565c635fb829a379b1cac",
+    "tests/stt/test_background_filter_contract.py": "8876d0e9a37dd1e602eb33477cc6fda657d74de43c62912698c00c33f9330787",
+    "tests/stt/test_elevenlabs_reset.py": "c3b5080f16e6f0c89cba96d177015a263059c65f9f64115be95afe2241b45cb4",
+    "tests/stt/test_provider_compatibility_probe.py": "ec3054dcafbdd6932676c75a015668da7f57f6cd47640f7232f5625cea059879",
+    "tests/stt/test_provider_failure_state.py": "35e85679582a0f10ae101f833fbbdcb186e866b7ab77dba3d09cf8b976f97fc0",
+    "tests/stt/test_reset_preservation.py": "85d955c04d281cec0988bce570d9e092532a1c52ebe7c33cfd9352991f351cd1",
+    "tests/stt/test_utterance_events.py": "20dc164a9e5feb51f3ab838ea330d9e8f0df11f9a555f69a4dc305f77390b338",
+    "tests/stt/test_whisper_audio.py": "dd81931f3bd9be8a2d2f9d16271cba45a3b189a0f329dc757a31c8fbcba46228",
+    "tests/telephony/test_playback_generations.py": "afe7c0f336db40bb33c4b709fab64c2b703857ebfe89172329bbf1b9f5bc5bba",
+    "tests/telephony/test_twilio_stream.py": "39f90a01707f4e7702beefb390d3811a09f8b94fb1c61c65eb2508dc38a75650",
+    "tests/tts/test_call_isolation.py": "f6d74377dc9954c211599b184655bb473de1546dca8a47904e8c85938ed9db73",
+    "tests/conversation/test_speech_activity_gate.py": "933cb3e64c0d3365f4f32e00da2d2500e6523a2f0e9e582860cb507fa0020a8f",
+    "tests/conversation/test_speech_aware_barge_in.py": "ab9ab5296014ed8444129cea4f47d0147d511710648977fabb59b6d1a85d945b",
+    "tests/evaluation/test_local_vad_audio.py": "f35ab67313ebd881afa904a3d3c9c59b813f0c16a31cc1e009806680185f5823"
+  },
+  "test_support": {
+    "docker-compose.yml": "d0826e685368a4cbb797e0368fc5dcde01d9fbcedca79e3e3f66e43e78a4bc77",
+    "scripts/check-stt-provider-compatibility.py": "7e7c46e9cc27c3032de95f5de041591baed991dfbab0ee51aed0c3600ad5f214",
+    "scripts/evaluate-stt-background-audio.py": "720befeb40924934b21412c9adce3534237ad8da5974392627ce9be66cf93761"
+  },
+  "build_support": {
+    "requirements.txt": "f6bd45008dd5b4082a6fe9a6d5ef60c36af43db3a3bfdf3d1c819ce4da48fa7b",
+    ".gitattributes": "015036a5fb4fe45b608e027de7b9fc2b9c8326e1eac5a58f1e43e26c9b845ae5",
+    "Dockerfile": "3fc9a6b888142ad4fa26c7c113c30ece004f071c35e7fd95083ee022121baaec",
+    "scripts/deploy-barge-in-diagnostics.py": "f1b12b37a7ee699f614c6e5f6cc621467002c9db07e7f2595d134cdc37db5ffc"
+  },
+  "documentation": {
+    "docs/operations/speech-aware-barge-in.md": "fe46a6c746f4ce0d8895575dde95842c3b5508bf515804cbc2be94bff0ba2b7a",
+    "docs/delegation/T033-G-result.md": "df01238bc6282a481fcd97fa5ab5bf6fd1aefdfe64be72d21ddabe88f831e435",
+    "docs/delegation/T033-G-review.md": "363bda2f033a3921cc2f55b9963dde3e9c8de140907a56bbd2ceb668efefe8ae"
+  },
+  "model_assets": {
+    "models/vad/silero_vad.onnx": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+    "models/vad/LICENSE.silero-vad.txt": "2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b",
+    "models/vad/provenance.json": "26201f35647281e5d9f0ea36708453d8039ad1b14f16e19f2da97582e6c50974"
+  },
+  "source_scope": [
+    ".gitattributes",
+    "config/settings.py",
+    "docker-compose.yml",
+    "requirements.txt",
+    "services/conversation/orchestrator.py",
+    "services/conversation/local_vad.py",
+    "services/conversation/speech_activity_gate.py",
+    "models/vad/silero_vad.onnx",
+    "models/vad/LICENSE.silero-vad.txt",
+    "models/vad/provenance.json"
+  ],
+  "booking_method_hashes": {
+    "_check_booking": "cd282a11e4ef008de13e2fbf3209995f4e3b26c0e643bab3fe18666c6b59396c",
+    "_confirm_booking": "52a4d90a286ce4f0f99bbccd3e711aefe7f02284a6b6bb7baa575d7bf973d9b3",
+    "_lookup_my_bookings": "b984ae595f4ea02e66821d3cabea6fb4ead62610ca4f625e11974fb1b30b3fa3",
+    "_cancel_booking": "0bf96ba733cbeacab614fdaa7f5ceb024bcceeeaa43e831c72cf57f68c572659"
+  },
+  "candidate_setting_overrides": {
+    "speech_aware_barge_in_enabled": true,
+    "local_vad_model_path": "/app/models/vad/silero_vad.onnx",
+    "local_vad_probability_threshold": 0.5,
+    "local_vad_speech_duration_ms": 160,
+    "local_vad_max_input_gap_ms": 96,
+    "local_vad_max_inference_ms": 20.0
+  }
+}

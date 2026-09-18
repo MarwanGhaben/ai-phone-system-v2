@@ -1,0 +1,29 @@
+{
+  "name": "Silero VAD",
+  "upstream_repository": "https://github.com/snakers4/silero-vad",
+  "upstream_release": "v6.2.1",
+  "upstream_revision": "7e30209a3e901f9842f81b225f3e93d8199902b1",
+  "model_source": "src/silero_vad/data/silero_vad.onnx",
+  "model_git_blob_sha1": "80c5592ef1f4c9ede3e357bbd02eb863358a6a9d",
+  "model_size_bytes": 2327524,
+  "model_sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+  "license": "MIT",
+  "license_file": "LICENSE.silero-vad.txt",
+  "license_sha256": "2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b",
+  "runtime": "onnxruntime==1.30.0 CPUExecutionProvider",
+  "contract": {
+    "sample_rate": 8000,
+    "frame_samples": 256,
+    "context_samples": 32,
+    "recurrent_state_shape": [2, 1, 128],
+    "inputs": {"input": [1, 288], "state": [2, 1, 128], "sr": []},
+    "outputs": {"output": [1, 1], "stateN": [2, 1, 128]}
+  },
+  "public_test_fixture": {
+    "source": "examples/c++/aepyx_8k.wav",
+    "source_sha256": "3b36a5347bdad20ff72fb9e2613e4214d25f981c56b51ca17704f087b84fddc6",
+    "embedded_segment_frames": [24000, 32000],
+    "embedded_pcm16_sha256": "329cea9f14b2db6d0fcf85d7c63168b10defe794c303e3935d0c3d3296748870",
+    "license": "upstream repository MIT license"
+  }
+}
