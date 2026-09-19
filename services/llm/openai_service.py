@@ -228,7 +228,9 @@ class OpenAILLM(LLMServiceBase):
                 kwargs["tools"] = openai_tools
                 kwargs["tool_choice"] = "auto"
                 if request.metadata.get("single_tool_call") is True:
-                    kwargs["parallel_tool_calls"] = False
+                    # The pinned 1.10 SDK predates this named parameter, but
+                    # extra_body forwards it unchanged to the API request.
+                    kwargs["extra_body"] = {"parallel_tool_calls": False}
 
             response = await client.chat.completions.create(**kwargs)
 
