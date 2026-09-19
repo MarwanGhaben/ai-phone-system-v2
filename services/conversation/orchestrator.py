@@ -2064,11 +2064,11 @@ VERIFIED PHONE BOOKING CONTEXT:
                 return (("لم أتمكن من التحقق من الوقت المطلوب. الأوقات البديلة "
                          f"المتحقق منها: {alternatives}. اختر وقتاً لأتحقق منه من جديد.")
                         if alternatives else
-                        "لم يتم التحقق من وقت مؤهل. اختر وقتاً آخر لأتحقق منه.")
+                        "لا توجد مواعيد متاحة للحجز مع هذا المحاسب خلال الفترة التي تحققت منها. هل تريد أن أبحث لك عند محاسب آخر؟")
             return (("The requested time was not verified as eligible. Verified "
                      f"alternatives: {alternatives}. Please choose one to check again.")
                     if alternatives else
-                    "No eligible time was verified. Please choose another time to check.")
+                    "There are no available appointments to book with this accountant in the period I checked. Would you like me to check another accountant?")
         if outcome.startswith("BOOKING_") or outcome.startswith("AVAILABILITY_") or outcome.startswith("POLICY_"):
             return ("لم أتمكن من التحقق من الموعد. اختر وقتاً لأتحقق منه أو اطلب مساعدة موظف."
                     if context.language == "ar" else

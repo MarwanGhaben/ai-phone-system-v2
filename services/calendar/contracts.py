@@ -97,7 +97,7 @@ def _require_contract(query: object, observed_at: object) -> None:
 def _zone(value: object) -> timezone | ZoneInfo:
     if not isinstance(value, str) or not value:
         _invalid()
-    if value == "UTC":
+    if value in ("UTC", "(UTC) Coordinated Universal Time"):
         return timezone.utc
     iana_name = _WINDOWS_ZONES.get(value, value)
     try:

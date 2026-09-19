@@ -98,6 +98,21 @@ def _no_continuation(value: object) -> bool:
     return True
 
 
+def _validate_noncustom_hours(availability: dict) -> None:
+    """Accept observed empty hours; closed periods never derive openings from hours."""
+    hours = availability.get("businessHours")
+    if hours is None:
+        return
+    if type(hours) is not list:
+        raise ValueError
+    # Bookings can retain seven weekday entries on a notBookable period.
+    # They have no authority to reopen any part of that closed date range.
+    if availability["availabilityType"] == "notBookable":
+        return
+    if hours:
+        raise ValueError
+
+
 def decode_service_facts(wire: object, scope: CalendarScope,
                          observed_at: datetime) -> ServiceFactsRead:
     """Return no usable facts on malformed, incomplete or unsupported evidence."""
@@ -131,12 +146,12 @@ def decode_service_facts(wire: object, scope: CalendarScope,
             raise ValueError
         general = policy["generalAvailability"]
         if (not isinstance(general, dict)
-                or not isinstance(general.get("availabilityType"), str)
-                or general.get("businessHours") is not None):
+                or not isinstance(general.get("availabilityType"), str)):
             raise ValueError
         if general["availabilityType"] not in ("bookWhenStaffAreFree", "notBookable"):
             return ServiceFactsRead("unverified", scope, observed_at,
                                     failure="unsupported_policy")
+        _validate_noncustom_hours(general)
         windows = policy["customAvailabilities"]
         if type(windows) is not list:
             raise ValueError
@@ -148,8 +163,8 @@ def decode_service_facts(wire: object, scope: CalendarScope,
             if start > end:
                 raise ValueError
             mode = item["availabilityType"]
-            if mode == "notBookable" and item.get("businessHours") is not None:
-                raise ValueError
+            if mode == "notBookable":
+                _validate_noncustom_hours(item)
             parsed.append(ServiceWindow(start, end, mode))
         facts = ServiceFacts(
             scope, _duration(wire["defaultDuration"]),
