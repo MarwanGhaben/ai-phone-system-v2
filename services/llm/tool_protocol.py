@@ -10,6 +10,7 @@ from services.llm.llm_base import LLMRole, Message
 
 _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _SCHEMA = {
+    "search_appointments": ({"accountant_name": str, "date": str}, {"accountant_name", "date"}),
     "check_appointment": ({"accountant_name": str, "date_time": str,
                            "customer_name": str, "customer_email": str,
                            "client_type": str}, {"accountant_name", "date_time"}),
@@ -120,3 +121,12 @@ def literal_approval(text: object, language: str) -> bool | None:
         if value in ("no", "no thanks", "i do not confirm", "i don't confirm"):
             return False
     return None
+
+
+def caller_approval(text: object, language: str) -> bool | None:
+    """An unqualified yes/no need not switch the conversation language."""
+    if language not in ("ar", "en"):
+        return None
+    decision = literal_approval(text, language)
+    return (literal_approval(text, "en" if language == "ar" else "ar")
+            if decision is None else decision)

@@ -85,14 +85,20 @@ class STT:
 
 
 class LLM:
-    def __init__(self):
+    def __init__(self, search_first=False):
         self.calls = 0
         self.requests = []
+        self.search_first = search_first
 
     async def chat_with_tools(self, request):
         self.calls += 1
         self.requests.append(request)
-        if self.calls == 1:
+        if self.search_first and self.calls == 1:
+            return LLMResponse("", tool_calls=[{
+                "id": "call_search", "name": "search_appointments",
+                "arguments": '{"accountant_name":"Synthetic Consultant","date":"2026-09-21"}'
+            }])
+        if self.calls == (2 if self.search_first else 1):
             return LLMResponse("The appointment is booked", tool_calls=[{
                 "id": "call_check", "name": "check_appointment",
                 "arguments": ('{"accountant_name":"Synthetic Consultant",'
@@ -118,7 +124,7 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
     connection = journey.VerifiedCreateDatabaseTests.connection
 
     async def _journey(self, language, *, correction=False, unknown=False,
-                       rollback=False):
+                       rollback=False, search_first=False, approval_text=None):
         import services.conversation.orchestrator as module
         pool = await self.driver.create_pool(self.dsn, min_size=1, max_size=10)
         self.addAsyncCleanup(pool.close)
@@ -150,7 +156,7 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
         orchestrator._barge_in_observer = None
         orchestrator._call_stt_instances = {"synthetic-call": STT()}
         orchestrator.tts = Speech()
-        orchestrator.llm = LLM()
+        orchestrator.llm = LLM(search_first)
         session = BookingSession(context, handler, pool, calendar, mutations,
             clock=clock, selection_loader=journey.SyntheticSelections,
             owner_check=lambda: orchestrator._conversations.get("synthetic-call") is context,
@@ -171,12 +177,25 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
                   (mock.patch("services.sms.notification_outbox.create_new_booking_jobs",
                               side_effect=RuntimeError("synthetic rollback"))
                    if rollback else nullcontext())):
-                first_text = ("أريد موعدا يوم الاثنين s@example.invalid"
+                first_text = ("أريد موعدا يوم الاثنين الساعة العاشرة s@example.invalid"
                               if language == "ar" else
                               "I want Monday at ten, s@example.invalid")
+                if search_first:
+                    first_text = "شو المواعيد المتاحة يوم الاثنين"
                 await stt.queue.put(STTResult(first_text, language, None, is_final=True,
                     utterance_id=UtteranceIdentity("stt", "epoch", 1),
                     received_at=clock.now))
+                if search_first:
+                    await until(lambda: any("أي وقت يناسبك" in text for text in orchestrator.tts.texts)
+                                and context.state.value == "listening")
+                    self.assertIsNone(session.proposals.current)
+                    self.assertEqual(await self.conn.fetchval("SELECT count(*) FROM public.booking_operations"), 0)
+                    self.assertEqual(sum(method == "POST" and "graph.microsoft.com" in url
+                        for method, url, _ in http.calls), 0)
+                    clock.now += timedelta(seconds=1)
+                    await stt.queue.put(STTResult("الاثنين الساعة العاشرة s@example.invalid", language,
+                        None, is_final=True, utterance_id=UtteranceIdentity("stt", "epoch", 4),
+                        received_at=clock.now))
                 await until(lambda: session.proposals._presentation_completed is not None)
                 self.assertEqual(await self.conn.fetchval(
                     "SELECT count(*) FROM public.booking_operations"), 0)
@@ -199,7 +218,7 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
                     gate = DispatchGate()
                     mutations._slots = gate
                 clock.now += timedelta(seconds=1)
-                await stt.queue.put(STTResult("نعم" if language == "ar" else "yes",
+                await stt.queue.put(STTResult(approval_text or ("نعم" if language == "ar" else "yes"),
                     language, None, is_final=True,
                     utterance_id=UtteranceIdentity("stt", "epoch", 2),
                     received_at=clock.now))
@@ -233,8 +252,9 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(context.booking_just_completed)
                     return
                 await until(lambda: context.booking_just_completed)
+                expected_marks = 5 if search_first else 3  # search acknowledgement, proposal, success
                 await until(lambda: len([m for m in socket.messages
-                                          if m["event"] == "mark"]) == 2)
+                                          if m["event"] == "mark"]) == expected_marks)
                 self.assertEqual(await self.conn.fetchval(
                     "SELECT count(*) FROM public.booking_operations WHERE state='applied'"), 1)
                 self.assertEqual(await self.conn.fetchval(
@@ -243,13 +263,14 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
                     "SELECT count(*) FROM public.booking_notification_outbox WHERE state='held'"), 2)
                 self.assertEqual(sum(method == "POST" and "graph.microsoft.com" in url
                     for method, url, _ in http.calls), 1)
-                self.assertEqual(len([m for m in socket.messages if m["event"] == "mark"]), 2)
+                self.assertEqual(len([m for m in socket.messages if m["event"] == "mark"]), expected_marks)
                 self.assertTrue(any("Synthetic Customer" in text
                     for text in orchestrator.tts.texts))
-                self.assertEqual(orchestrator.llm.requests[1].messages[-1].role.value,
+                confirmation_index = 2 if search_first else 1
+                self.assertEqual(orchestrator.llm.requests[confirmation_index].messages[-1].role.value,
                                  "user")
                 self.assertTrue(any(message.role.value == "tool" for message in
-                    orchestrator.llm.requests[1].messages))
+                    orchestrator.llm.requests[confirmation_index].messages))
                 self.assertIsNone(context.pending_booking)
         finally:
             if gate is not None:
@@ -266,6 +287,12 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_enabled_arabic_full_verified_phone_journey(self):
         await self._journey("ar")
+
+    async def test_arabic_day_search_requires_time_choice_before_proposal_and_create(self):
+        await self._journey("ar", search_first=True)
+
+    async def test_english_yes_during_arabic_call_keeps_approval_and_language(self):
+        await self._journey("ar", approval_text="yes")
 
     async def test_correction_during_actual_transport_admission_prevents_post(self):
         await self._journey("en", correction=True)

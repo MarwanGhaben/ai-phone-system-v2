@@ -42,6 +42,9 @@ from services.conversation.language_policy import explicit_language_request
 from services.calendar.calendar_base import TimeSlot
 from services.calendar.business_time import as_business_time, business_now
 from services.scheduling import spoken_arabic
+from services.conversation.booking_dialogue import (
+    requested_day, has_clock, turn_language, plain_reply_ok,
+)
 from services.scheduling.booking_records import (
     BookingPersistenceError,
     persist_booking_record,
@@ -1814,12 +1817,7 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         if not session.owns(self._conversations.get(call_sid),
                             self._twilio_handlers.get(call_sid)):
             return
-        if re.search(r"[\u0600-\u06ff]", utterance.text):
-            context.language = "ar"
-        elif utterance.language in ("en", "ar"):
-            context.language = utterance.language
-        elif context.language not in ("en", "ar"):
-            context.language = "en"
+        context.language = turn_language(utterance.text, utterance.language, context.language)
         context.state = ConversationState.THINKING
         response = await self._get_verified_response(call_sid, session, utterance.text, token)
         if response is _ABORTED_RESPONSE or not session.turn.check_output(token).allowed:
@@ -1850,7 +1848,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         from services.scheduling.models import CalendarScope
         from zoneinfo import ZoneInfo
         accountants = get_accountants_service()
-        local = datetime.now(ZoneInfo("America/Toronto"))
+        local = business_now().astimezone(ZoneInfo("America/Toronto"))
+        date_map = "; ".join(
+            f"{(local + timedelta(days=i)):%A} / {spoken_arabic.date(local + timedelta(days=i))} = "
+            f"{(local + timedelta(days=i)):%Y-%m-%d}" for i in range(7))
         caller = context.caller_name or "not yet known"
         names_en = names_ar = "available from the configured consultant resolver"
         try:
@@ -1874,6 +1875,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
 VERIFIED PHONE BOOKING CONTEXT:
 - Toronto local date and time: {local:%Y-%m-%d %H:%M %Z}.
+- Current response language: {context.language}. Use this language for the whole reply,
+  including acknowledgements. Consultant names, times and emails do not switch it.
+- Calendar reference (dates only, NOT evidence of availability): {date_map}.
+- Caller-selected day retained for this conversation: {getattr(session, 'requested_day', None)}.
 - Caller name currently on file: {caller}.
 - Configured consultants in English: {names_en}.
 - Configured consultants in Arabic: {names_ar}.
@@ -1884,6 +1889,11 @@ VERIFIED PHONE BOOKING CONTEXT:
 - Only a later caller confirmation after the complete deterministic readback may
   use confirm_appointment. Never announce success without BOOKING_SUCCESS.
 - Reply in Arabic when the caller language is Arabic and English otherwise.
+- To list availability for a DAY, use search_appointments. Never invent a time
+  just to call check_appointment. Use check_appointment only for a selected time.
+- Keep the caller's selected day when they change consultant or pick a time.
+  Do not substitute another day. Ask before searching a different day.
+- Never say you will check/search/transfer without calling the corresponding tool.
 """
 
     async def _get_verified_response(self, call_sid, session, user_input, token):
@@ -1893,6 +1903,7 @@ VERIFIED PHONE BOOKING CONTEXT:
             parse_linked_calls, tool_result_message)
 
         context = session.context
+        caller_day = requested_day(user_input, business_now())
         def localized(english: str, arabic: str) -> str:
             return arabic if context.language == "ar" else english
 
@@ -1922,14 +1933,33 @@ VERIFIED PHONE BOOKING CONTEXT:
                 return localized("Please repeat that request.",
                                  "يرجى إعادة الطلب.")
         tools = self._get_booking_tools()
+        tools.append({"name": "search_appointments",
+            "description": "Read available times for the caller's requested day and consultant. Creates no proposal or booking. Do not invent a clock time.",
+            "parameters": {"type": "object", "properties": {
+                "accountant_name": {"type": "string", "description": "The caller's selected consultant name."},
+                "date": {"type": "string", "description": "Requested Toronto calendar date, YYYY-MM-DD, using the supplied weekday reference."}},
+                "required": ["accountant_name", "date"]}})
         for tool in tools:
             tool["parameters"]["additionalProperties"] = False
             if tool["name"] == "check_appointment":
                 tool["parameters"]["required"] = ["accountant_name", "date_time"]
         try:
-            response = await self.llm.chat_with_tools(LLMRequest(
-                messages, temperature=0.2, max_tokens=120, stream=False,
-                tools=tools, metadata={"single_tool_call": True}))
+            for attempt in range(2):
+                response = await self.llm.chat_with_tools(LLMRequest(
+                    list(messages), temperature=0.2, max_tokens=320, stream=False,
+                    tools=tools, metadata={"single_tool_call": True}))
+                if not session.turn.check_output(token).allowed:
+                    return _ABORTED_RESPONSE
+                if (attempt == 0 and not response.tool_calls and response.finish_reason == "stop"
+                        and type(response.content) is str
+                        and not plain_reply_ok(response.content, context.language)):
+                    messages.append(Message(LLMRole.SYSTEM,
+                        f"Answer this same caller request in {context.language}. "
+                        "If checking availability, call search_appointments for a day or "
+                        "check_appointment for a selected time. Do not announce a search without a tool call. "
+                        "Use the named consultant, not 'staff member'. For other questions, answer the question."))
+                    continue
+                break
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1945,6 +1975,9 @@ VERIFIED PHONE BOOKING CONTEXT:
                              "يرجى إعادة الطلب أو توضيحه.")
         if not response.tool_calls:
             content = response.content.strip() if type(response.content) is str else ""
+            if content and not plain_reply_ok(content, context.language):
+                return localized("Which day and accountant would you like me to check?",
+                                 "أي يوم وعند أي محاسب تحب أن أبحث لك؟")
             if session.proposals.current is not None:
                 return ("Please confirm the exact appointment I read back, or tell me what to change."
                         if context.language != "ar" else
@@ -1965,14 +1998,41 @@ VERIFIED PHONE BOOKING CONTEXT:
         call = calls[0]
         context.conversation_history.append(
             assistant_call_message("", calls).to_dict())
-        if session.unresolved and call.name in ("check_appointment", "confirm_appointment",
+        if session.unresolved and call.name in ("check_appointment", "search_appointments", "confirm_appointment",
                                                 "cancel_booking"):
             outcome = "BOOKING_PENDING"
-        elif call.name == "check_appointment":
+        elif call.name in ("check_appointment", "search_appointments"):
+            from services.scheduling.booking_check import parse_requested_time
+            arguments = dict(call.arguments)
+            if caller_day.ambiguous:
+                session.requested_day = None
+                session.requested_day_unclear = True
+                outcome = "DATE_NEEDS_CLARIFICATION"
+            elif session.requested_day_unclear and caller_day.day is None:
+                outcome = "DATE_NEEDS_CLARIFICATION"
+            else:
+                if caller_day.day is not None:
+                    session.requested_day = caller_day.day
+                    session.requested_day_unclear = False
+                search = call.name == "search_appointments" or (caller_day.day is not None and not has_clock(user_input))
+                if search:
+                    day = session.requested_day
+                    if day is None:
+                        parsed = parse_requested_time(arguments.get("date", "") + " 10:00")
+                        day = parsed.date() if parsed is not None else None
+                    arguments = {"accountant_name": arguments["accountant_name"],
+                                 "search_date": day.isoformat() if day is not None else ""}
+                    outcome = None if day is not None else "DATE_NEEDS_CLARIFICATION"
+                else:
+                    parsed = parse_requested_time(arguments.get("date_time"))
+                    outcome = ("DATE_NEEDS_CLARIFICATION" if parsed is not None
+                               and session.requested_day is not None
+                               and parsed.astimezone(__import__("zoneinfo").ZoneInfo("America/Toronto")).date() != session.requested_day
+                               else None)
             handler = self._twilio_handlers.get(call_sid)
             state_lock = getattr(self, "_call_state_locks", {}).get(call_sid)
-            if (handler is not None and state_lock is not None
-                    and self._valid_availability_arguments(call.arguments)):
+            if (outcome is None and handler is not None and state_lock is not None
+                    and (arguments.get("search_date") or self._valid_availability_arguments(arguments))):
                 acknowledged = await self._acknowledge_availability_search(
                     call_sid, context, handler, state_lock)
                 if (not acknowledged
@@ -1980,7 +2040,8 @@ VERIFIED PHONE BOOKING CONTEXT:
                         or not session.owns(self._conversations.get(call_sid),
                                             self._twilio_handlers.get(call_sid))):
                     return _ABORTED_RESPONSE
-            outcome = await self._check_booking(call_sid, call.arguments)
+            if outcome is None:
+                outcome = await self._check_booking(call_sid, arguments)
         elif call.name == "confirm_appointment":
             outcome = await self._confirm_booking(call_sid, call.arguments)
         elif call.name == "lookup_my_bookings":
@@ -2033,6 +2094,24 @@ VERIFIED PHONE BOOKING CONTEXT:
             return _ABORTED_RESPONSE if presented else localized(
                 "I couldn't finish reading that proposal. Please ask me to check it again.",
                 "لم أتمكن من إكمال قراءة تفاصيل الموعد. يرجى أن تطلب مني التحقق منه مرة أخرى.")
+        if outcome == "DATE_NEEDS_CLARIFICATION":
+            return localized("Which exact day and date do you mean? I'll keep the search on that day.",
+                             "تقصد أي يوم وأي تاريخ بالضبط؟ سأبحث لك في نفس اليوم.")
+        if outcome.startswith("DAY_AVAILABILITY:"):
+            if "search_date" in arguments:
+                session.requested_day = __import__("datetime").date.fromisoformat(arguments["search_date"])
+            return outcome.split(":", 1)[1].strip()
+        if outcome.startswith("REQUESTED_DAY_OUTSIDE_WINDOW:"):
+            return localized("That day is outside the period I can book. Would you like to check a nearer day?",
+                             "هذا اليوم خارج الفترة المسموح لي بالحجز فيها. تحب أن نبحث في يوم أقرب؟")
+        if outcome.startswith("INVALID_DATE_TIME:"):
+            return localized("Which day and time would you like?", "أي يوم وأي ساعة يناسبانك؟")
+        if outcome.startswith("DUPLICATE_WARNING:"):
+            return localized("You already have an appointment that day. Would you like to keep it and check another time?",
+                             "عندك موعد مسجل في نفس اليوم. تحب أن تحتفظ به ونبحث عن موعد آخر؟")
+        if outcome.startswith("AVAILABILITY_UNVERIFIED:"):
+            return localized("I couldn't read the calendar just now. Would you like me to try again?",
+                             "لم أتمكن من قراءة التقويم الآن. تحب أن أحاول مرة ثانية؟")
         if outcome == "BOOKING_SUCCESS":
             proposal = session.approval.proposal
             local = proposal.candidate.interval.start.astimezone(
@@ -2061,6 +2140,14 @@ VERIFIED PHONE BOOKING CONTEXT:
             marker = "Verified alternatives:"
             if marker in outcome:
                 alternatives = outcome.split(marker, 1)[1].split(". Ask", 1)[0].strip()
+            if not alternatives and "Requested date:" in outcome:
+                from services.scheduling.booking_check import parse_requested_time
+                exact_day = outcome.split("Requested date:", 1)[1].strip()
+                parsed = parse_requested_time(exact_day + " 10:00")
+                if parsed is not None:
+                    return localized(
+                        f"I couldn't find a bookable time with this accountant on {parsed:%A, %B %d}. Would you like another accountant or a different day?",
+                        f"لم أجد وقتاً متاحاً للحجز مع هذا المحاسب يوم {spoken_arabic.date(parsed)}. تحب أن أبحث عند محاسب آخر أم في يوم آخر؟")
             if context.language == "ar":
                 return (("الوقت الذي طلبته غير متاح للحجز. عندي لك هذه الخيارات: "
                          f"{alternatives}. أي وقت يناسبك لأتحقق منه؟")
@@ -2292,7 +2379,10 @@ VERIFIED PHONE BOOKING CONTEXT:
             return superseded
         if not isinstance(arguments, dict):
             return "INVALID_DATE_TIME: Ask the caller for a complete date and time."
-        requested = parse_requested_time(arguments.get("date_time"))
+        search_only = "search_date" in arguments
+        requested = parse_requested_time(
+            arguments.get("search_date", "") + " 10:00" if search_only
+            and type(arguments.get("search_date")) is str else arguments.get("date_time"))
         if requested is None:
             return "INVALID_DATE_TIME: Ask the caller for a complete date and time."
 
@@ -2321,6 +2411,9 @@ VERIFIED PHONE BOOKING CONTEXT:
             snapshot = load_booking_policy(scope, choice.staff_id, now)
             if snapshot is None:
                 return "POLICY_UNVERIFIED: Booking policy coverage is unavailable. Offer human help."
+            requested_date = requested.astimezone(TORONTO).date()
+            if not now.astimezone(TORONTO).date() <= requested_date <= snapshot.horizon_end:
+                return "REQUESTED_DAY_OUTSIDE_WINDOW: Ask before choosing another day."
             query = make_booking_query(snapshot, choice.staff_id, now)
             facts = await calendar.get_service_facts(scope)
             if not current():
@@ -2331,7 +2424,7 @@ VERIFIED PHONE BOOKING CONTEXT:
                 return unverified
 
             # Advisory duplicate warning remains per call; never updates an old check.
-            if context.phone_number and not context.duplicate_warned:
+            if not search_only and context.phone_number and not context.duplicate_warned:
                 try:
                     existing = await calendar.get_customer_appointments(context.phone_number)
                     if not current():
@@ -2365,19 +2458,33 @@ VERIFIED PHONE BOOKING CONTEXT:
                 return unverified
             if assessment.status == "policy_unverified":
                 return "POLICY_UNVERIFIED: Service or booking policy could not be verified. Offer human help."
+            day_candidates = tuple(candidate for candidate in assessment.candidates
+                if candidate.interval.start.astimezone(TORONTO).date() == requested_date)
+            if search_only and day_candidates:
+                if context.booking_session is not None:
+                    context.booking_session.revoke_proposal()
+                if context.language == "ar":
+                    options = "، أو ".join(spoken_arabic.clock(item.interval.start.astimezone(TORONTO))
+                                          for item in day_candidates[:3])
+                    return (f"DAY_AVAILABILITY: عند {spoken_arabic.consultant(choice.name)} يوم "
+                            f"{spoken_arabic.date(requested)}، من الأوقات المتاحة الساعة {options}. أي وقت يناسبك؟")
+                options = ", or ".join(item.interval.start.astimezone(TORONTO).strftime("%I:%M %p")
+                                      for item in day_candidates[:3])
+                return (f"DAY_AVAILABILITY: With {choice.name} on {requested:%A, %B %d}, "
+                        f"available options include {options}. Which time works for you?")
             match = next((
-                candidate for candidate in assessment.candidates
+                candidate for candidate in day_candidates
                 if candidate.interval.start == requested.astimezone(timezone.utc)
                 and candidate.interval.end == requested.astimezone(timezone.utc)
                 + timedelta(minutes=30)
             ), None)
             if match is None:
-                if assessment.candidates:
+                if day_candidates:
                     alternatives = ", ".join(
                         (spoken_arabic.slot(item.interval.start.astimezone(TORONTO))
                          if context.language == "ar" else
                          item.interval.start.astimezone(TORONTO).strftime("%A, %B %d at %I:%M %p"))
-                        for item in assessment.candidates[:2]
+                        for item in day_candidates[:2]
                     )
                     return (
                         "NO_ELIGIBLE_SLOT: The requested time is not verified as eligible. "
@@ -2387,7 +2494,8 @@ VERIFIED PHONE BOOKING CONTEXT:
                     )
                 return (
                     "NO_ELIGIBLE_SLOT: No eligible appointment was verified for this "
-                    "consultant within the approved booking window. Ask for another choice."
+                    "consultant on the requested day. Ask before changing days. "
+                    f"Requested date: {requested_date.isoformat()}"
                 )
 
             if getattr(self, "_verified_phone_booking_enabled", False):

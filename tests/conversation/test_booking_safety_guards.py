@@ -158,8 +158,8 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
                                  "staff": [], "services": []},
              self._arguments(), "BOOKING_ERROR:"),
             ("invalid-date", {}, self._arguments("not-a-date"), "INVALID_DATE_TIME:"),
-            ("weekend", {}, self._arguments("2030-01-12 10:00"), "NO_ELIGIBLE_SLOT:"),
-            ("horizon", {}, self._arguments("2030-01-15 10:00"), "NO_ELIGIBLE_SLOT:"),
+            ("weekend", {}, self._arguments("2030-01-12 10:00"), "REQUESTED_DAY_OUTSIDE_WINDOW:"),
+            ("horizon", {}, self._arguments("2030-01-15 10:00"), "REQUESTED_DAY_OUTSIDE_WINDOW:"),
             ("duplicate", {"existing": [{
                 "start_time": RealDateTime(2030, 1, 8, 9, 0, tzinfo=TORONTO),
                 "staff_name": "Other Staff",
@@ -231,9 +231,13 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
                 self.calendar.synthetic_slots = slots
                 result = await self.orchestrator._check_booking(
                     "call-a", self._arguments(requested.isoformat()))
-                self.assertIn(text, result)
-                self.assertIn("call check_appointment again", result.lower())
-                self.assertIn("fresh confirmation", result.lower())
+                if name == "same-day":
+                    self.assertIn(text, result)
+                    self.assertIn("call check_appointment again", result.lower())
+                    self.assertIn("fresh confirmation", result.lower())
+                else:
+                    self.assertNotIn(text, result)
+                    self.assertIn("Requested date: 2030-01-08", result)
                 self.assertNotIn("confirm=true directly", result.lower())
                 self.assertIsNone(self.context.pending_booking)
                 await self._confirm_after_rejection()

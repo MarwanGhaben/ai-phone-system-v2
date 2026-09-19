@@ -346,7 +346,7 @@ async def test_exact_grid_close_boundary_offset_and_past_do_not_round_or_roll():
         ("2026-09-18 17:00", datetime(2026, 9, 18, 17, 0, tzinfo=TORONTO),
          "NO_ELIGIBLE_SLOT:"),
         ("2026-09-18T14:00:00Z", START, "SLOT_AVAILABLE:"),
-        ("2026-09-17 10:00", START, "NO_ELIGIBLE_SLOT:"),
+        ("2026-09-17 10:00", START, "REQUESTED_DAY_OUTSIDE_WINDOW:"),
     ):
         orchestrator, calendar = fake_check(slot=slot)
         context = orchestrator._conversations["call"]

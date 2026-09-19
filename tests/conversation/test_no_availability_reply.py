@@ -30,7 +30,7 @@ def test_no_slots_and_unverified_read_have_distinct_caller_replies(language, kno
             assert ("another accountant" if language == "en" else "محاسب آخر") in reply
             assert ("period I checked" if language == "en" else "الفترة التي تحققت منها") in reply
         else:
-            assert ("couldn't verify" if language == "en" else "لم أتمكن من التحقق") in reply
+            assert ("couldn't read the calendar" if language == "en" else "لم أتمكن من قراءة التقويم") in reply
         assert "October" not in reply and "أكتوبر" not in reply and "13" not in reply
         assert context.pending_booking is None
     asyncio.run(run())

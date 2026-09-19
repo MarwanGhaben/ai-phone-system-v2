@@ -51,6 +51,8 @@ class BookingSession:
         self.approval = None
         self.unresolved = False
         self.help_spoken = False
+        self.requested_day = None
+        self.requested_day_unclear = False
 
     def owns(self, context, handler) -> bool:
         return (not self.closed and self.context is context and self.handler is handler
@@ -87,11 +89,10 @@ class BookingSession:
         else:
             self.receipts[identity] = receipt.receipt
             if self.proposals.current is not None:
-                from services.llm.tool_protocol import literal_approval
-                language = getattr(result, "language", None)
-                if language not in ("en", "ar"):
-                    language = self.context.language
-                if literal_approval(result.text, language) is not True:
+                from services.llm.tool_protocol import caller_approval
+                from services.conversation.booking_dialogue import turn_language
+                language = turn_language(result.text, getattr(result, "language", None), self.context.language)
+                if caller_approval(result.text, language) is not True:
                     # A change, refusal or qualified answer revokes the old
                     # tuple before model classification or delayed lookup.
                     self.revoke_proposal()
@@ -201,11 +202,11 @@ class BookingSession:
         return success
 
     async def confirm(self, caller_text: str, language: str, token) -> BookingOutcome | None:
-        from services.llm.tool_protocol import literal_approval
+        from services.llm.tool_protocol import caller_approval
         if (self.closed or self.unresolved or self.current_receipt is None
                 or self.offer_token is None or not self.turn.check_output(token).allowed):
             return None
-        literal = literal_approval(caller_text, language)
+        literal = caller_approval(caller_text, language)
         if literal is None:
             return None
         decision = self.proposals.confirm(self.offer_token, self.current_receipt,
