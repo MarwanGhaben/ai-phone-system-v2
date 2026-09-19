@@ -156,6 +156,91 @@ def make_orchestrator(tts):
 
 
 @pytest.mark.asyncio
+async def test_speech_guard_rechecks_after_delayed_playback_setup():
+    speech = FakeTTS({"old": FakeStream(b"A" * 1600)})
+    orchestrator = make_orchestrator(speech)
+    _context, handler, _stt = add_call(orchestrator, "guarded")
+    entered, release = asyncio.Event(), asyncio.Event()
+    allowed = True
+    original = handler.begin_playback
+
+    async def delayed_begin():
+        entered.set()
+        await release.wait()
+        return await original()
+
+    handler.begin_playback = delayed_begin
+    task = asyncio.create_task(orchestrator._speak_to_caller(
+        "guarded", "old", "en", speech_guard=lambda: allowed))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        allowed = False
+        release.set()
+        assert not await asyncio.wait_for(task, 2)
+        assert speech.created_requests == []
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await handler.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_delayed_verified_clear_cannot_clear_replacement_or_other_call():
+    old = FakeStream(b"A" * 1600, blocked=True)
+    replacement = FakeStream(b"N" * 1600)
+    other = FakeStream(b"B" * 1600)
+    orchestrator = make_orchestrator(FakeTTS({
+        "old": old, "new": replacement, "other": other}))
+    context_a, handler_a, _ = add_call(orchestrator, "A")
+    _context_b, handler_b, _ = add_call(orchestrator, "B")
+    media_sent = asyncio.Event()
+    clear_entered, release_clear = asyncio.Event(), asyncio.Event()
+    original_send = handler_a.websocket.send_json
+    original_clear = handler_a.clear_audio
+
+    async def observe(message):
+        await original_send(message)
+        if message["event"] == "media":
+            media_sent.set()
+
+    async def delayed_clear(owner=None):
+        clear_entered.set()
+        await release_clear.wait()
+        return await original_clear(owner)
+
+    handler_a.websocket.send_json = observe
+    handler_a.clear_audio = delayed_clear
+    old_task = asyncio.create_task(orchestrator._speak_to_caller("A", "old", "en"))
+    other_task = asyncio.create_task(orchestrator._speak_to_caller("B", "other", "en"))
+    replacement_task = None
+    try:
+        await asyncio.wait_for(media_sent.wait(), 2)
+        before = sum(item["event"] == "clear" for item in handler_a.websocket.messages)
+        orchestrator._revoke_verified_speech("A", context_a, handler_a)
+        await asyncio.wait_for(clear_entered.wait(), 2)
+        replacement_task = asyncio.create_task(
+            orchestrator._speak_to_caller("A", "new", "en"))
+        await asyncio.sleep(0)
+        release_clear.set()
+        assert await asyncio.wait_for(replacement_task, 3)
+        assert await asyncio.wait_for(other_task, 3)
+        assert sum(item["event"] == "clear" for item in handler_a.websocket.messages) == before + 1
+    finally:
+        release_clear.set()
+        old.release.set()
+        for task in (old_task, other_task, replacement_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (old_task, other_task, replacement_task) if task is not None),
+            return_exceptions=True)
+        await handler_a.cleanup()
+        await handler_b.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_barge_in_interrupts_only_call_a_and_outer_coroutine_resumes():
     stream_a = FakeStream(b"A" * 1600, blocked=True)
     stream_b = FakeStream(b"B" * 1600)

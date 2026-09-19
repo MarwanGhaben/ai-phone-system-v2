@@ -196,6 +196,9 @@ class Settings(BaseSettings):
     automatic_notifications_enabled: bool = Field(
         default=False, alias="AUTOMATIC_NOTIFICATIONS_ENABLED"
     )
+    verified_phone_booking_enabled: bool = Field(
+        default=False, alias="VERIFIED_PHONE_BOOKING_ENABLED"
+    )
     automatic_notification_workers_paused: bool = Field(
         default=False, alias="AUTOMATIC_NOTIFICATION_WORKERS_PAUSED"
     )

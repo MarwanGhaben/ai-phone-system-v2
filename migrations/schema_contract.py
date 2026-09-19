@@ -20,6 +20,11 @@ NOTIFICATION_OUTBOX_TABLE = "booking_notification_outbox"
 NOTIFICATION_CONTRACT_TABLE = "booking_notification_contract"
 NOTIFICATION_TABLES = frozenset((NOTIFICATION_STATE_TABLE, NOTIFICATION_OUTBOX_TABLE,
                                  NOTIFICATION_CONTRACT_TABLE))
+OPERATION_REVISION_VERSION = "0005"
+OPERATION_REVISION_CHECKSUM = "cf9c9e2cdc53569a59833235efa98633b5f7b233f98549a8b2f1b16614866100"
+OPERATION_TABLE = "booking_operations"
+OPERATION_CONTRACT_TABLE = "booking_operation_contract"
+OPERATION_TABLES = frozenset((OPERATION_TABLE, OPERATION_CONTRACT_TABLE))
 
 
 class SchemaCompatibilityError(Exception):
@@ -30,8 +35,8 @@ _VARCHAR_LITERAL_ARRAY_CAST = re.compile(
     r"\(ARRAY\[((?:'[a-z_]+'::character varying)(?:, '[a-z_]+'::character varying)*)\]\)::text\[\]")
 
 
-def check_definitions_match(baseline, actual):
-    """Allow the two proven PostgreSQL dump/restore serialization differences.
+def check_definitions_match(baseline, actual, *, allow_operation_fk_visibility=False):
+    """Allow narrowly proven PostgreSQL dump/restore serialization differences.
 
     Casting an unbounded varchar literal array to text[] is equivalent to casting
     each of its literal elements to text. pg_restore reparses the saved expression
@@ -55,9 +60,30 @@ def check_definitions_match(baseline, actual):
         # parentheses around OR/NOT or change a bound/column/operator.
         if value.startswith(nested):
             value = flat + value[len(nested):]
+        # pg_restore also flattens the first BETWEEN expansion in 0005's
+        # identity-length conjunction, without changing its bound or operator.
+        nested_identity = ("CHECK ((((length(tenant_id) >= 1) AND "
+                           "(length(tenant_id) <= 255)) AND ")
+        flat_identity = ("CHECK (((length(tenant_id) >= 1) AND "
+                         "(length(tenant_id) <= 255) AND ")
+        if value.startswith(nested_identity):
+            value = flat_identity + value[len(nested_identity):]
         return value
 
-    return all(canonical(baseline[key]) == canonical(actual[key]) for key in baseline)
+    operation_fk = "booking_operations_booking_id_fkey"
+    qualified = "FOREIGN KEY (booking_id) REFERENCES public.bookings(id)"
+    visible = "FOREIGN KEY (booking_id) REFERENCES bookings(id)"
+    for key in baseline:
+        left, right = canonical(baseline[key]), canonical(actual[key])
+        if left == right:
+            continue
+        # pg_get_constraintdef renders this one FK according to search_path.
+        # Only these exact strings are equivalent; catalog checks below verify
+        # referenced OID, column, actions and deferrability independently.
+        if (not allow_operation_fk_visibility or key != operation_fk
+                or {left, right} != {qualified, visible}):
+            return False
+    return True
 
 
 # name:type[:varchar length][!] where ! means NOT NULL. This is an explicit,
@@ -164,6 +190,153 @@ NOTIFICATION_OUTBOX_COLUMNS = _parse_spec(
     "updated_at:timestamptz!"
 )
 NOTIFICATION_CONTRACT_COLUMNS = _parse_spec("singleton:int4! check_definitions:jsonb!")
+OPERATION_COLUMNS = _parse_spec(
+    "operation_id:uuid! tenant_id:text! business_id:text! staff_id:text! "
+    "service_id:text! action:text! proposal_id:text! proposal_revision:int8! "
+    "payload_hash:text! payload_snapshot:jsonb! confirmation_identity:jsonb! "
+    "confirmed_at:timestamptz! issued_at:timestamptz! expires_at:timestamptz! "
+    "admitted_at:timestamptz! "
+    "starts_at:timestamptz! ends_at:timestamptz! pre_buffer:interval! "
+    "post_buffer:interval! claim_span:tstzrange! state:text! fence:int8! "
+    "dispatch_count:int2! owner_token:uuid lease_until:timestamptz "
+    "ownership_started_at:timestamptz "
+    "provider_id:text receipt_provider_id:text booking_id:int4 verified_snapshot:jsonb "
+    "settlement_source:text settlement_observed_at:timestamptz "
+    "created_at:timestamptz! updated_at:timestamptz!"
+)
+OPERATION_CONTRACT_COLUMNS = _parse_spec("singleton:int4! constraint_definitions:jsonb!")
+
+
+async def check_operation_schema(conn):
+    """Reject 0005 structural, protective-constraint, index and extension drift."""
+    extension = await conn.fetchrow("""
+        SELECT n.nspname,e.extname FROM pg_catalog.pg_extension e
+        JOIN pg_catalog.pg_namespace n ON n.oid=e.extnamespace
+        WHERE e.extname='btree_gist'
+    """)
+    if extension is None or extension["nspname"] != "public":
+        raise SchemaCompatibilityError("incompatible schema")
+    expected_constraints = {
+        "booking_operations_pkey": ("p", ("operation_id",)),
+        "booking_operations_intent_key": ("u", ("tenant_id", "business_id", "action",
+                                                 "proposal_id", "proposal_revision")),
+        "booking_operations_receipt_identity_key": ("u", ("tenant_id", "business_id",
+                                                            "receipt_provider_id")),
+        "booking_operations_booking_link_key": ("u", ("booking_id",)),
+        "booking_operations_booking_id_fkey": ("f", ("booking_id",)),
+        "booking_operations_staff_exclusion": ("x", ("tenant_id", "business_id",
+                                                      "staff_id", "claim_span")),
+        **{name: ("c", ()) for name in (
+            "booking_operations_action_check", "booking_operations_identity_check",
+            "booking_operations_payload_check", "booking_operations_clock_check",
+            "booking_operations_interval_check", "booking_operations_state_check")},
+    }
+    oid = await relation(conn, OPERATION_TABLE)
+    actual = await columns(conn, oid)
+    check_columns(actual, OPERATION_COLUMNS)
+    defaults = {"state": "'pending'::text", "fence": "0", "dispatch_count": "0",
+                "created_at": "CURRENT_TIMESTAMP", "updated_at": "CURRENT_TIMESTAMP"}
+    if any(row["default_expr"] != defaults.get(name) for name, row in actual.items()):
+        raise SchemaCompatibilityError("incompatible schema")
+    rows = await conn.fetch("""
+        SELECT k.conname,k.contype::text,k.condeferrable,k.condeferred,k.convalidated,
+               k.connoinherit,pg_catalog.pg_get_constraintdef(k.oid,false) AS definition,
+               k.confrelid,k.confupdtype::text,k.confdeltype::text,k.confmatchtype::text,
+               ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(k.conkey)
+                     WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid=k.conrelid AND a.attnum=u.num ORDER BY u.ord) AS columns,
+               ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(k.confkey)
+                     WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid=k.confrelid AND a.attnum=u.num ORDER BY u.ord) AS reference_columns
+        FROM pg_catalog.pg_constraint k WHERE k.conrelid=$1
+    """, oid)
+    if len(rows) != len(expected_constraints) or {r["conname"] for r in rows} != set(expected_constraints):
+        raise SchemaCompatibilityError("incompatible schema")
+    definitions = {}
+    bookings_oid = await relation(conn, "bookings")
+    for row in rows:
+        kind, key = expected_constraints[row["conname"]]
+        if (row["contype"] != kind or row["condeferrable"] or row["condeferred"]
+                or not row["convalidated"] or (kind == "c" and row["connoinherit"])
+                or (kind != "c" and tuple(row["columns"]) != key)):
+            raise SchemaCompatibilityError("incompatible schema")
+        if row["conname"] == "booking_operations_booking_id_fkey" and (
+                row["confrelid"] != bookings_oid
+                or tuple(row["reference_columns"]) != ("id",)
+                or row["confupdtype"] != "a" or row["confdeltype"] != "a"
+                or row["confmatchtype"] != "s"):
+            raise SchemaCompatibilityError("incompatible schema")
+        definitions[row["conname"]] = row["definition"]
+    indexes = await conn.fetch("""
+        SELECT c.relname,i.indisvalid,i.indisready,i.indisunique,i.indimmediate,
+               i.indpred IS NOT NULL AS partial,i.indexprs IS NOT NULL AS expression,
+               am.amname,
+               ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(i.indkey)
+                     WITH ORDINALITY u(num,ord) JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid=i.indrelid AND a.attnum=u.num ORDER BY u.ord) AS columns
+        FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid
+        JOIN pg_catalog.pg_class t ON t.oid=i.indrelid
+        JOIN pg_catalog.pg_am am ON am.oid=c.relam
+        WHERE i.indrelid=$1
+    """, oid)
+    expected_indexes = {"booking_operations_pkey", "booking_operations_intent_key",
+                        "booking_operations_receipt_identity_key", "booking_operations_booking_link_key",
+                        "booking_operations_staff_exclusion", "booking_operations_unresolved_idx"}
+    if len(indexes) != len(expected_indexes) or {r["relname"] for r in indexes} != expected_indexes:
+        raise SchemaCompatibilityError("incompatible schema")
+    for row in indexes:
+        name = row["relname"]
+        expected_columns = {
+            "booking_operations_pkey": ("operation_id",),
+            "booking_operations_intent_key": ("tenant_id", "business_id", "action",
+                                              "proposal_id", "proposal_revision"),
+            "booking_operations_receipt_identity_key": ("tenant_id", "business_id",
+                                                        "receipt_provider_id"),
+            "booking_operations_booking_link_key": ("booking_id",),
+            "booking_operations_staff_exclusion": ("tenant_id", "business_id", "staff_id",
+                                                   "claim_span"),
+            "booking_operations_unresolved_idx": ("state", "lease_until", "operation_id"),
+        }
+        if (not row["indisvalid"] or not row["indisready"] or not row["indimmediate"]
+                or row["expression"] or row["partial"] != (name == "booking_operations_staff_exclusion")
+                or tuple(row["columns"]) != expected_columns[name]
+                or row["indisunique"] != (name in ("booking_operations_pkey",
+                                                  "booking_operations_intent_key",
+                                                  "booking_operations_receipt_identity_key",
+                                                  "booking_operations_booking_link_key"))
+                or row["amname"] != ("gist" if name == "booking_operations_staff_exclusion" else "btree")):
+            raise SchemaCompatibilityError("incompatible schema")
+    contract_oid = await relation(conn, OPERATION_CONTRACT_TABLE)
+    contract_columns = await columns(conn, contract_oid)
+    check_columns(contract_columns, OPERATION_CONTRACT_COLUMNS)
+    if any(row["default_expr"] is not None for row in contract_columns.values()):
+        raise SchemaCompatibilityError("incompatible schema")
+    contract_rules = await conn.fetch("""
+        SELECT conname,contype::text,convalidated,condeferrable,condeferred,
+               pg_catalog.pg_get_constraintdef(oid,false) AS definition
+        FROM pg_catalog.pg_constraint WHERE conrelid=$1
+    """, contract_oid)
+    if (len(contract_rules) != 2 or
+            {row["conname"]: row["contype"] for row in contract_rules} != {
+                "booking_operation_contract_pkey": "p",
+                "booking_operation_contract_singleton_check": "c"}
+            or any(not row["convalidated"] or row["condeferrable"] or row["condeferred"]
+                   for row in contract_rules)):
+        raise SchemaCompatibilityError("incompatible schema")
+    singleton_check = next(row for row in contract_rules if row["contype"] == "c")
+    if singleton_check["definition"] != "CHECK ((singleton = 1))":
+        raise SchemaCompatibilityError("incompatible schema")
+    baseline = await conn.fetch("SELECT singleton,constraint_definitions FROM public.booking_operation_contract")
+    if len(baseline) != 1 or baseline[0]["singleton"] != 1:
+        raise SchemaCompatibilityError("incompatible schema")
+    recorded = baseline[0]["constraint_definitions"]
+    if isinstance(recorded, str):
+        try:
+            recorded = json.loads(recorded)
+        except ValueError:
+            raise SchemaCompatibilityError("incompatible schema") from None
+    if not check_definitions_match(recorded, definitions, allow_operation_fk_visibility=True):
+        raise SchemaCompatibilityError("incompatible schema")
 
 
 async def check_notification_schema(conn):
@@ -553,6 +726,7 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
         BOOKINGS_REVISION_VERSION: BOOKINGS_REVISION_CHECKSUM,
         OBSERVATION_REVISION_VERSION: OBSERVATION_REVISION_CHECKSUM,
         NOTIFICATION_REVISION_VERSION: NOTIFICATION_REVISION_CHECKSUM,
+        OPERATION_REVISION_VERSION: OPERATION_REVISION_CHECKSUM,
     }
     if allow_bootstrap:
         expected[BOOTSTRAP_VERSION] = BOOTSTRAP_CHECKSUM
@@ -577,6 +751,9 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
     if (NOTIFICATION_REVISION_VERSION in versions
             and OBSERVATION_REVISION_VERSION not in versions):
         raise SchemaCompatibilityError("incompatible schema")
+    if (OPERATION_REVISION_VERSION in versions
+            and NOTIFICATION_REVISION_VERSION not in versions):
+        raise SchemaCompatibilityError("incompatible schema")
     if (BOOTSTRAP_VERSION in versions
             and applied[BOOTSTRAP_VERSION] > applied[REVISION_VERSION]):
         raise SchemaCompatibilityError("incompatible schema")
@@ -594,6 +771,9 @@ async def ledger(conn, *, allow_bootstrap=False, require_revision=False,
         raise SchemaCompatibilityError("incompatible schema")
     if (NOTIFICATION_REVISION_VERSION in versions and OBSERVATION_REVISION_VERSION in versions
             and applied[OBSERVATION_REVISION_VERSION] > applied[NOTIFICATION_REVISION_VERSION]):
+        raise SchemaCompatibilityError("incompatible schema")
+    if (OPERATION_REVISION_VERSION in versions and NOTIFICATION_REVISION_VERSION in versions
+            and applied[NOTIFICATION_REVISION_VERSION] > applied[OPERATION_REVISION_VERSION]):
         raise SchemaCompatibilityError("incompatible schema")
     if require_notification and NOTIFICATION_REVISION_VERSION not in versions:
         raise SchemaCompatibilityError("incompatible schema")
@@ -628,6 +808,8 @@ async def check_application_schema(conn, *, allow_missing_admin_updated=False,
         expected_names.update(NOTIFICATION_TABLES)
     elif not allow_missing_notifications:
         raise SchemaCompatibilityError("incompatible schema")
+    if OPERATION_TABLES.issubset(names):
+        expected_names.update(OPERATION_TABLES)
     if names != expected_names:
         raise SchemaCompatibilityError("incompatible schema")
     lock_names = sorted(TABLE_COLUMNS)
@@ -637,6 +819,8 @@ async def check_application_schema(conn, *, allow_missing_admin_updated=False,
         lock_names.extend((OBSERVATION_TABLE, OBSERVATION_CONTROL_TABLE))
     if NOTIFICATION_TABLES.issubset(names):
         lock_names.extend(sorted(NOTIFICATION_TABLES))
+    if OPERATION_TABLES.issubset(names):
+        lock_names.extend(sorted(OPERATION_TABLES))
     lock_targets = [
         'public."' + name.replace('"', '""') + '"' for name in lock_names
     ]
@@ -714,6 +898,8 @@ async def check_application_schema(conn, *, allow_missing_admin_updated=False,
         await check_observation_schema(conn)
     if NOTIFICATION_TABLES.issubset(names):
         await check_notification_schema(conn)
+    if OPERATION_TABLES.issubset(names):
+        await check_operation_schema(conn)
     if "schema_migrations" in names:
         _, versions = await ledger(conn, allow_bootstrap=True)
         if OBSERVATION_REVISION_VERSION in versions and OBSERVATION_TABLE not in names:
@@ -721,6 +907,10 @@ async def check_application_schema(conn, *, allow_missing_admin_updated=False,
         if NOTIFICATION_REVISION_VERSION in versions and not NOTIFICATION_TABLES.issubset(names):
             raise SchemaCompatibilityError("incompatible schema")
         if NOTIFICATION_TABLES.issubset(names) and NOTIFICATION_REVISION_VERSION not in versions:
+            raise SchemaCompatibilityError("incompatible schema")
+        if OPERATION_REVISION_VERSION in versions and not OPERATION_TABLES.issubset(names):
+            raise SchemaCompatibilityError("incompatible schema")
+        if OPERATION_TABLES.issubset(names) and OPERATION_REVISION_VERSION not in versions:
             raise SchemaCompatibilityError("incompatible schema")
 
 

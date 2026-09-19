@@ -2,13 +2,21 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime as RealDateTime, timedelta, timezone
+from datetime import date, datetime as RealDateTime, time, timedelta, timezone
 import unittest
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from services.conversation import orchestrator as orchestrator_module
 from services.calendar.calendar_base import TimeSlot, BookingResult
+from services.config.accountants_service import BookingSelection, BookingSelectionResult
+from services.calendar.service_facts import decode_service_facts
+from services.scheduling.booking_check import BookingPolicySnapshot
+from services.scheduling.models import (
+    AvailabilityFailure, AvailabilityFailureCategory, AvailabilityResult,
+    AvailabilityStatus, FreeInterval, TimeInterval,
+)
+from services.scheduling.policy import AppointmentFormat, ClosureCalendar, SchedulingPolicy
 
 TORONTO = ZoneInfo("America/Toronto")
 UTC = timezone.utc
@@ -27,27 +35,83 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(mock.patch.object(self.module, "datetime", FrozenDateTime))
         self.enterContext(mock.patch.object(self.module, "business_now", return_value=NOW))
         self.calendar = mock.Mock()
+        self.calendar.tenant_id = "tenant"
+        self.calendar.business_id = "business"
         self.calendar.is_available = mock.AsyncMock(return_value=True)
         self.calendar.get_staff_members = mock.AsyncMock(return_value=[])
         self.calendar.get_services = mock.AsyncMock(return_value=[])
         self.calendar.get_customer_appointments = mock.AsyncMock(return_value=[])
         self.calendar.get_available_slots = mock.AsyncMock(return_value=[])
+        self.calendar.synthetic_slots = []
+        self.calendar.get_service_facts = mock.AsyncMock(side_effect=self._facts)
+        self.calendar.get_availability = mock.AsyncMock(side_effect=self._availability)
         self.calendar.create_booking = mock.AsyncMock(
             return_value=BookingResult(success=False, error_message="synthetic rejection"))
         self.accountants = mock.Mock()
-        self.accountants.get_accountant_by_name.return_value = {
-            "name": "Hussam", "staff_id": "staff-1", "service_id": "service-1"}
+        self.accountants.resolve_booking_accountant.return_value = BookingSelectionResult(
+            "resolved", BookingSelection("Hussam", "staff-1", "service-1"))
         self.enterContext(mock.patch(
             "services.calendar.ms_bookings_service.get_calendar_service",
             return_value=self.calendar))
         self.enterContext(mock.patch(
             "services.config.accountants_service.get_accountants_service",
             return_value=self.accountants))
+        self.enterContext(mock.patch(
+            "services.scheduling.booking_check.load_booking_policy",
+            side_effect=self._policy))
         self.orchestrator = self.module.ConversationOrchestrator.__new__(
             self.module.ConversationOrchestrator)
         self.orchestrator._speak_to_caller = mock.AsyncMock()
         self.orchestrator._conversations = {}
         self.context = self._context("call-a")
+
+    def _policy(self, scope, staff, now):
+        today = now.astimezone(TORONTO).date()
+        horizon = today
+        for _ in range(2):
+            horizon += timedelta(days=1)
+            while horizon.weekday() >= 5:
+                horizon += timedelta(days=1)
+        policy = SchedulingPolicy(
+            "synthetic-v1", scope, (staff,), timedelta(minutes=30),
+            timedelta(minutes=30), timedelta(0), timedelta(0),
+            "America/Toronto", (0, 1, 2, 3, 4), time(10), time(17),
+            timedelta(minutes=30), 2,
+            ClosureCalendar(date(2030, 1, 1), date(2031, 12, 31), frozenset()),
+            AppointmentFormat.IN_PERSON, 1)
+        return BookingPolicySnapshot(policy, horizon, "Synthetic office")
+
+    def _facts(self, scope):
+        return decode_service_facts({
+            "id": scope.service_id, "defaultDuration": "PT30M",
+            "preBuffer": "PT0S", "postBuffer": "PT0S",
+            "staffMemberIds": ["staff-1"], "isLocationOnline": False,
+            "maximumAttendeesCount": 1, "isHiddenFromCustomers": False,
+            "schedulingPolicy": {
+                "allowStaffSelection": True, "timeSlotInterval": "PT30M",
+                "minimumLeadTime": "PT0S", "maximumAdvance": "P365D",
+                "generalAvailability": {"availabilityType": "bookWhenStaffAreFree"},
+                "customAvailabilities": [],
+            },
+        }, scope, self.module.business_now())
+
+    async def _availability(self, query):
+        slots = self.calendar.synthetic_slots
+        if isinstance(slots, Exception):
+            raise slots
+        if not isinstance(slots, list) or any(
+                not isinstance(slot, TimeSlot) or slot.staff_id != query.staff_ids[0]
+                or slot.start_time.tzinfo is None or slot.end_time.tzinfo is None
+                or slot.end_time <= slot.start_time for slot in slots):
+            return AvailabilityResult(query, AvailabilityStatus.INVALID_RESPONSE,
+                self.module.business_now(), failure=AvailabilityFailure(
+                    AvailabilityFailureCategory.INVALID_RESPONSE))
+        intervals = tuple(FreeInterval(query.scope, slot.staff_id,
+                                       TimeInterval(slot.start_time, slot.end_time))
+                          for slot in slots)
+        return AvailabilityResult(query, AvailabilityStatus.AVAILABLE if intervals else
+                                  AvailabilityStatus.NO_AVAILABILITY,
+                                  self.module.business_now(), intervals)
 
     def _context(self, call_sid):
         context = self.module.ConversationContext(
@@ -83,19 +147,19 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_rejections_invalidate_seeded_pending_and_cannot_confirm(self):
         cases = (
-            ("empty", {}, self._arguments(), "AVAILABILITY_UNVERIFIED:"),
+            ("empty", {}, self._arguments(), "NO_ELIGIBLE_SLOT:"),
             ("adapter-error", {"slots": RuntimeError("private provider body")},
              self._arguments(), "AVAILABILITY_UNVERIFIED:"),
             ("invalid-result", {"slots": [object()]},
              self._arguments(), "AVAILABILITY_UNVERIFIED:"),
             ("not-configured", {"available": False},
-             self._arguments(), "BOOKING_ERROR:"),
+             self._arguments(), "AVAILABILITY_UNVERIFIED:"),
             ("missing-service", {"accountant": {"name": "Hussam"},
                                  "staff": [], "services": []},
              self._arguments(), "BOOKING_ERROR:"),
             ("invalid-date", {}, self._arguments("not-a-date"), "INVALID_DATE_TIME:"),
-            ("weekend", {}, self._arguments("2030-01-12 10:00"), "WEEKEND_CLOSED:"),
-            ("horizon", {}, self._arguments("2030-01-15 10:00"), "BOOKING_TOO_FAR:"),
+            ("weekend", {}, self._arguments("2030-01-12 10:00"), "NO_ELIGIBLE_SLOT:"),
+            ("horizon", {}, self._arguments("2030-01-15 10:00"), "NO_ELIGIBLE_SLOT:"),
             ("duplicate", {"existing": [{
                 "start_time": RealDateTime(2030, 1, 8, 9, 0, tzinfo=TORONTO),
                 "staff_name": "Other Staff",
@@ -109,21 +173,18 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
                 self.orchestrator._speak_to_caller.reset_mock()
                 self.calendar.is_available = mock.AsyncMock(
                     return_value=setup.get("available", True))
-                self.calendar.get_available_slots = mock.AsyncMock(
-                    side_effect=setup.get("slots") if isinstance(setup.get("slots"), Exception)
-                    else None,
-                    return_value=[] if "slots" not in setup else setup.get("slots"),
-                )
+                self.calendar.synthetic_slots = setup.get("slots", [])
                 self.calendar.get_customer_appointments = mock.AsyncMock(
                     return_value=setup.get("existing", []))
                 self.calendar.get_staff_members = mock.AsyncMock(
                     return_value=setup.get("staff", []))
                 self.calendar.get_services = mock.AsyncMock(
                     return_value=setup.get("services", []))
-                self.accountants.get_accountant_by_name.return_value = setup.get(
-                    "accountant",
-                    {"name": "Hussam", "staff_id": "staff-1", "service_id": "service-1"},
-                )
+                self.accountants.resolve_booking_accountant.return_value = (
+                    BookingSelectionResult("invalid_configuration")
+                    if "accountant" in setup else
+                    BookingSelectionResult("resolved", BookingSelection(
+                        "Hussam", "staff-1", "service-1")))
 
                 result = await self.orchestrator._check_booking("call-a", arguments)
 
@@ -167,7 +228,7 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
             ("later-day", [later_day], "Wednesday, January 09 at 01:30 PM"),
         ):
             with self.subTest(name=name):
-                self.calendar.get_available_slots = mock.AsyncMock(return_value=slots)
+                self.calendar.synthetic_slots = slots
                 result = await self.orchestrator._check_booking(
                     "call-a", self._arguments(requested.isoformat()))
                 self.assertIn(text, result)
@@ -177,7 +238,7 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(self.context.pending_booking)
                 await self._confirm_after_rejection()
 
-        self.calendar.get_available_slots = mock.AsyncMock(return_value=[later_day])
+        self.calendar.synthetic_slots = [later_day]
         result = await self.orchestrator._check_booking(
             "call-a", self._arguments(later_day.start_time.isoformat()))
         self.assertTrue(result.startswith("SLOT_AVAILABLE:"), result)
@@ -200,7 +261,7 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
         for name, slots in cases:
             with self.subTest(name=name):
                 self.context.pending_booking = {"appointment_time": "stale"}
-                self.calendar.get_available_slots = mock.AsyncMock(return_value=slots)
+                self.calendar.synthetic_slots = slots
                 result = await self.orchestrator._check_booking(
                     "call-a", self._arguments(requested.isoformat()))
                 self.assertFalse(result.startswith("SLOT_AVAILABLE:"), result)
@@ -215,7 +276,7 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(name=name):
                 slot = self._slot(start)
-                self.calendar.get_available_slots = mock.AsyncMock(return_value=[slot])
+                self.calendar.synthetic_slots = [slot]
                 result = await self.orchestrator._check_booking(
                     "call-a", self._arguments(requested.isoformat()))
                 self.assertTrue(result.startswith("SLOT_AVAILABLE:"), result)
@@ -266,8 +327,7 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(self.module, "datetime", SummerClock), mock.patch.object(
             self.module, "business_now", return_value=summer_now
         ):
-            self.calendar.get_available_slots.return_value = [
-                self._slot(requested.astimezone(UTC))]
+            self.calendar.synthetic_slots = [self._slot(requested.astimezone(UTC))]
             checked = await self.orchestrator._check_booking(
                 "call-a", self._arguments(requested.isoformat()))
             self.assertTrue(checked.startswith("SLOT_AVAILABLE:"), checked)
@@ -281,10 +341,10 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_late_check_exception_clears_new_pending_authorization(self):
         requested = RealDateTime(2030, 1, 8, 10, 0, tzinfo=TORONTO)
-        self.calendar.get_available_slots.return_value = [self._slot(requested)]
+        self.calendar.synthetic_slots = [self._slot(requested)]
 
         def fail_final_log(message):
-            if message == "Orchestrator: exact selected-staff slot pending confirmation":
+            if message == "Orchestrator: exact policy-approved slot pending confirmation":
                 raise OSError("synthetic log sink failure")
 
         with mock.patch.object(self.module.logger, "info", side_effect=fail_final_log):
@@ -295,8 +355,7 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_literal_true_after_exact_check_reaches_one_expected_create(self):
         requested = RealDateTime(2030, 1, 8, 10, 0, tzinfo=TORONTO)
-        self.calendar.get_available_slots = mock.AsyncMock(
-            return_value=[self._slot(requested)])
+        self.calendar.synthetic_slots = [self._slot(requested)]
         checked = await self.orchestrator._check_booking(
             "call-a", self._arguments(requested.isoformat()))
         self.assertTrue(checked.startswith("SLOT_AVAILABLE:"), checked)
@@ -318,7 +377,7 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
         for failure in (BookingResult(success=False, error_message="private body"),
                         TimeoutError("private body")):
             with self.subTest(failure=type(failure).__name__):
-                self.calendar.get_available_slots.return_value = [self._slot(requested)]
+                self.calendar.synthetic_slots = [self._slot(requested)]
                 self.calendar.create_booking.reset_mock()
                 self.calendar.create_booking.side_effect = (
                     failure if isinstance(failure, Exception) else None)
@@ -339,7 +398,7 @@ class BookingSafetyGuardsTests(unittest.IsolatedAsyncioTestCase):
         pending_b = {"appointment_time": "independent"}
         context_b.pending_booking = pending_b
         self.context.pending_booking = {"appointment_time": "stale-a"}
-        self.calendar.get_available_slots = mock.AsyncMock(return_value=[])
+        self.calendar.synthetic_slots = []
 
         await self.orchestrator._check_booking("call-a", self._arguments())
 

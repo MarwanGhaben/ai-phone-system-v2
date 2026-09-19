@@ -18,6 +18,7 @@ class LLMRole(Enum):
     USER = "user"
     ASSISTANT = "assistant"
     FUNCTION = "function"
+    TOOL = "tool"
 
 
 @dataclass
@@ -29,10 +30,15 @@ class Message:
 
     def to_dict(self) -> dict:
         """Convert to dictionary for API calls"""
-        return {
+        item = {
             "role": self.role.value,
             "content": self.content
         }
+        if self.role is LLMRole.ASSISTANT and "tool_calls" in self.metadata:
+            item["tool_calls"] = self.metadata["tool_calls"]
+        if self.role is LLMRole.TOOL:
+            item["tool_call_id"] = self.metadata["tool_call_id"]
+        return item
 
 
 @dataclass

@@ -51,6 +51,7 @@ async def lifespan(app: FastAPI):
     scheduler_started = False
     observation_poller = None
     notification_worker = None
+    booking_orchestrator = None
     try:
         workers_paused = getattr(
             settings, 'automatic_notification_workers_paused', False)
@@ -63,9 +64,13 @@ async def lifespan(app: FastAPI):
         pool = await get_db_pool()
         await check_database_compatibility(pool)
         logger.info("Database connection pool and schema initialized")
+        if getattr(settings, 'verified_phone_booking_enabled', False):
+            booking_orchestrator = get_orchestrator()
+            booking_orchestrator.initialize_verified_booking(pool)
 
         # Start only after the database has passed the read-only compatibility gate.
-        if not getattr(settings, 'automatic_notifications_enabled', False):
+        if (not getattr(settings, 'automatic_notifications_enabled', False)
+                and not getattr(settings, 'verified_phone_booking_enabled', False)):
             from services.sms.reminder_scheduler import get_reminder_scheduler
             reminder_scheduler = get_reminder_scheduler()
             reminder_scheduler.start()
@@ -111,8 +116,12 @@ async def lifespan(app: FastAPI):
                     if scheduler_started and reminder_scheduler is not None:
                         reminder_scheduler.stop()
                 finally:
-                    await close_db_pool()
-                    logger.info("AI Voice Platform v2 shutting down...")
+                    try:
+                        if booking_orchestrator is not None:
+                            await booking_orchestrator.close_verified_booking()
+                    finally:
+                        await close_db_pool()
+                        logger.info("AI Voice Platform v2 shutting down...")
 
 
 # Create FastAPI app

@@ -10,6 +10,7 @@ from typing import AsyncIterator, Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 import asyncio
+from datetime import datetime
 
 from services.conversation.events import UtteranceIdentity
 
@@ -32,6 +33,7 @@ class STTResult:
     alternatives: list = None
     metadata: Dict[str, Any] = None
     utterance_id: Optional[UtteranceIdentity] = None
+    received_at: Optional[datetime] = None
 
     def __post_init__(self):
         if self.alternatives is None:

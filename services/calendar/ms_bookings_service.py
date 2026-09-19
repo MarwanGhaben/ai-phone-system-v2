@@ -4,13 +4,20 @@ AI Voice Platform v2 - Microsoft Bookings Service
 =====================================================
 """
 
-import httpx
+import asyncio
 from datetime import datetime, timedelta, timezone
+import json
+import math
 from typing import Optional, List, Dict, Any
+from urllib.parse import quote
+
+import httpx
 from loguru import logger
 
 from config.settings import get_settings
 from services.calendar.business_time import business_now, parse_graph_datetime
+from services.calendar.contracts import decode_availability
+from services.calendar.service_facts import ServiceFactsRead, decode_service_facts
 from services.calendar.calendar_base import (
     CalendarServiceBase,
     StaffMember,
@@ -18,6 +25,65 @@ from services.calendar.calendar_base import (
     TimeSlot,
     BookingResult
 )
+from services.scheduling.models import (
+    AvailabilityContractError,
+    AvailabilityFailure,
+    AvailabilityFailureCategory,
+    AvailabilityQuery,
+    AvailabilityResult,
+    AvailabilityStatus,
+    CalendarScope,
+)
+
+
+_TOKEN_RESPONSE_LIMIT = 64 * 1024
+_AVAILABILITY_RESPONSE_LIMIT = 1024 * 1024
+_CONTRACT_ERROR = "invalid availability contract"
+
+
+class _AvailabilityReadFailure(Exception):
+    """A safe fixed failure crossing the typed availability transport."""
+
+    def __init__(self, category: AvailabilityFailureCategory,
+                 http_status: int | None = None):
+        super().__init__(category.value)
+        self.category = category
+        self.http_status = http_status
+
+
+class _AvailabilityPermit:
+    """Tracks whether a retained cleanup owns an availability admission slot."""
+
+    def __init__(self) -> None:
+        self.acquired = False
+        self.handed_off = False
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError
+
+
+def _availability_http_failure(status: int) -> _AvailabilityReadFailure:
+    if status == 401:
+        category = AvailabilityFailureCategory.AUTHENTICATION
+    elif status == 403:
+        category = AvailabilityFailureCategory.PERMISSION_DENIED
+    elif status == 429:
+        category = AvailabilityFailureCategory.THROTTLED
+    elif 200 <= status < 300:
+        category = AvailabilityFailureCategory.INVALID_RESPONSE
+    else:
+        category = AvailabilityFailureCategory.PROVIDER_ERROR
+    return _AvailabilityReadFailure(category, status)
+
+
+def _availability_token_http_failure(status: int) -> _AvailabilityReadFailure:
+    if status == 400:
+        return _AvailabilityReadFailure(
+            AvailabilityFailureCategory.AUTHENTICATION,
+            status,
+        )
+    return _availability_http_failure(status)
 
 
 def normalize_customer_phone(phone_number: str) -> Optional[str]:
@@ -45,6 +111,10 @@ class MSBookingsService(CalendarServiceBase):
     - Availability checking
     - Appointment creation
     """
+
+    AVAILABILITY_TIMEOUT_SECONDS = 20.0
+    AVAILABILITY_CLEANUP_GRACE_SECONDS = 1.0
+    AVAILABILITY_CLEANUP_CAPACITY = 8
 
     def __init__(self, config: Dict[str, Any] = None):
         """
@@ -77,6 +147,10 @@ class MSBookingsService(CalendarServiceBase):
         self._staff_cache: Dict[str, StaffMember] = {}
         self._services_cache: Dict[str, Service] = {}
         self._http_client: Optional[httpx.AsyncClient] = None
+        self._availability_slots = asyncio.Semaphore(
+            self.AVAILABILITY_CLEANUP_CAPACITY
+        )
+        self._availability_cleanup_tasks: set[asyncio.Task[bytes]] = set()
 
     async def is_available(self) -> bool:
         """Check if the service is configured and available"""
@@ -86,8 +160,348 @@ class MSBookingsService(CalendarServiceBase):
     async def _get_client(self) -> httpx.AsyncClient:
         """Get HTTP client"""
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=30.0)
+            self._http_client = httpx.AsyncClient(
+                timeout=30.0,
+                follow_redirects=False,
+            )
         return self._http_client
+
+    @staticmethod
+    async def _read_availability_body(
+        response: httpx.Response,
+        limit: int,
+    ) -> bytes:
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            if len(body) + len(chunk) > limit:
+                raise _AvailabilityReadFailure(
+                    AvailabilityFailureCategory.INCOMPLETE,
+                    response.status_code,
+                )
+            body.extend(chunk)
+        return bytes(body)
+
+    async def _read_streamed_availability_response(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        limit: int,
+        *,
+        token_boundary: bool = False,
+        **request_kwargs: Any,
+    ) -> bytes:
+        async with client.stream(
+            method,
+            url,
+            follow_redirects=False,
+            **request_kwargs,
+        ) as response:
+            if response.status_code != 200:
+                classifier = (
+                    _availability_token_http_failure
+                    if token_boundary
+                    else _availability_http_failure
+                )
+                raise classifier(response.status_code)
+            return await self._read_availability_body(response, limit)
+
+    def _availability_cleanup_finished(
+        self,
+        task: asyncio.Task[bytes],
+    ) -> None:
+        self._availability_cleanup_tasks.discard(task)
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        self._availability_slots.release()
+
+    def _retain_availability_cleanup(
+        self,
+        task: asyncio.Task[bytes],
+        permit: _AvailabilityPermit,
+    ) -> None:
+        permit.handed_off = True
+        self._availability_cleanup_tasks.add(task)
+        task.add_done_callback(self._availability_cleanup_finished)
+
+    async def _run_availability_io(
+        self,
+        operation: Any,
+        permit: _AvailabilityPermit,
+    ) -> bytes:
+        task = asyncio.create_task(
+            operation,
+            name="ms_bookings_availability_io",
+        )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.cancel()
+            self._retain_availability_cleanup(task, permit)
+            try:
+                await asyncio.wait(
+                    {task},
+                    timeout=self.AVAILABILITY_CLEANUP_GRACE_SECONDS,
+                )
+            except asyncio.CancelledError:
+                raise
+            raise
+
+    async def _get_availability_access_token(
+        self,
+        client: httpx.AsyncClient,
+        permit: _AvailabilityPermit,
+    ) -> str:
+        """Get a bounded token while preserving the existing shared cache."""
+        if self._access_token and self._token_expires_at:
+            if datetime.now(timezone.utc) < self._token_expires_at:
+                return self._access_token
+
+        token_url = (
+            "https://login.microsoftonline.com/"
+            + quote(self.tenant_id, safe="")
+            + "/oauth2/v2.0/token"
+        )
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+        }
+        body = await self._run_availability_io(
+            self._read_streamed_availability_response(
+                client,
+                "POST",
+                token_url,
+                _TOKEN_RESPONSE_LIMIT,
+                token_boundary=True,
+                data=data,
+            ),
+            permit,
+        )
+        try:
+            token_data = json.loads(body, parse_constant=_reject_json_constant)
+            token = token_data["access_token"]
+            expires_in = token_data.get("expires_in", 3600)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise _AvailabilityReadFailure(
+                AvailabilityFailureCategory.INVALID_RESPONSE,
+                200,
+            ) from None
+        if (
+            not isinstance(token, str)
+            or not token
+            or not isinstance(expires_in, (int, float))
+            or isinstance(expires_in, bool)
+            or expires_in <= 0
+        ):
+            raise _AvailabilityReadFailure(
+                AvailabilityFailureCategory.INVALID_RESPONSE,
+                200,
+            )
+        try:
+            lifetime = float(expires_in)
+        except (OverflowError, TypeError, ValueError):
+            raise _AvailabilityReadFailure(
+                AvailabilityFailureCategory.INVALID_RESPONSE,
+                200,
+            ) from None
+        if not math.isfinite(lifetime):
+            raise _AvailabilityReadFailure(
+                AvailabilityFailureCategory.INVALID_RESPONSE,
+                200,
+            )
+        cache_seconds = min(lifetime, 3600.0) - 60.0
+        if cache_seconds > 0:
+            self._access_token = token
+            self._token_expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=cache_seconds
+            )
+        return token
+
+    @staticmethod
+    def _availability_failure_result(
+        query: AvailabilityQuery,
+        category: AvailabilityFailureCategory,
+        http_status: int | None = None,
+    ) -> AvailabilityResult:
+        if category is AvailabilityFailureCategory.INVALID_RESPONSE:
+            status = AvailabilityStatus.INVALID_RESPONSE
+        elif category is AvailabilityFailureCategory.INCOMPLETE:
+            status = AvailabilityStatus.INCOMPLETE
+        else:
+            status = AvailabilityStatus.UNAVAILABLE
+        return AvailabilityResult(
+            query,
+            status,
+            datetime.now(timezone.utc),
+            failure=AvailabilityFailure(category, http_status),
+        )
+
+    async def get_availability(
+        self,
+        query: AvailabilityQuery,
+    ) -> AvailabilityResult:
+        """Read one scoped Microsoft availability result without policy inference."""
+        if type(query) is not AvailabilityQuery:
+            raise AvailabilityContractError(_CONTRACT_ERROR)
+        if (
+            (self.tenant_id and query.scope.tenant_id != self.tenant_id)
+            or (self.business_id and query.scope.business_id != self.business_id)
+        ):
+            raise AvailabilityContractError(_CONTRACT_ERROR)
+        if not (
+            self.tenant_id
+            and self.client_id
+            and self.client_secret
+            and self.business_id
+        ):
+            return self._availability_failure_result(
+                query,
+                AvailabilityFailureCategory.NOT_CONFIGURED,
+            )
+
+        payload = {
+            "staffIds": list(query.staff_ids),
+            "startDateTime": {
+                "dateTime": self._availability_wire_datetime(query.window.start),
+                "timeZone": "UTC",
+            },
+            "endDateTime": {
+                "dateTime": self._availability_wire_datetime(query.window.end),
+                "timeZone": "UTC",
+            },
+        }
+        url = (
+            "https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/"
+            + quote(self.business_id, safe="")
+            + "/getStaffAvailability"
+        )
+        permit = _AvailabilityPermit()
+        try:
+            async with asyncio.timeout(self.AVAILABILITY_TIMEOUT_SECONDS):
+                await self._availability_slots.acquire()
+                permit.acquired = True
+                client = await self._get_client()
+                token = await self._get_availability_access_token(client, permit)
+                body = await self._run_availability_io(
+                    self._read_streamed_availability_response(
+                        client,
+                        "POST",
+                        url,
+                        _AVAILABILITY_RESPONSE_LIMIT,
+                        headers={
+                            "Authorization": "Bearer " + token,
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                    ),
+                    permit,
+                )
+                try:
+                    wire_payload = json.loads(body)
+                except (TypeError, ValueError):
+                    raise _AvailabilityReadFailure(
+                        AvailabilityFailureCategory.INVALID_RESPONSE,
+                        200,
+                    ) from None
+                observed_at = datetime.now(timezone.utc)
+                return decode_availability(wire_payload, query, observed_at)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            return self._availability_failure_result(
+                query,
+                AvailabilityFailureCategory.TIMEOUT,
+            )
+        except httpx.TimeoutException:
+            return self._availability_failure_result(
+                query,
+                AvailabilityFailureCategory.TIMEOUT,
+            )
+        except httpx.TransportError:
+            return self._availability_failure_result(
+                query,
+                AvailabilityFailureCategory.TRANSPORT,
+            )
+        except _AvailabilityReadFailure as error:
+            return self._availability_failure_result(
+                query,
+                error.category,
+                error.http_status,
+            )
+        except Exception:
+            return self._availability_failure_result(
+                query,
+                AvailabilityFailureCategory.PROVIDER_ERROR,
+            )
+        finally:
+            if permit.acquired and not permit.handed_off:
+                self._availability_slots.release()
+
+    async def get_service_facts(self, scope: CalendarScope) -> ServiceFactsRead:
+        """Read exact service facts under the shared bounded availability budget."""
+        if type(scope) is not CalendarScope:
+            raise AvailabilityContractError(_CONTRACT_ERROR)
+        if (scope.tenant_id != self.tenant_id
+                or scope.business_id != self.business_id):
+            raise AvailabilityContractError(_CONTRACT_ERROR)
+
+        def failed(category: str) -> ServiceFactsRead:
+            return ServiceFactsRead("unverified", scope, datetime.now(timezone.utc),
+                                    failure=category)
+
+        if not (self.tenant_id and self.client_id and self.client_secret
+                and self.business_id):
+            return failed("not_configured")
+        url = (
+            "https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/"
+            + quote(scope.business_id, safe="") + "/services/"
+            + quote(scope.service_id, safe="")
+        )
+        permit = _AvailabilityPermit()
+        try:
+            async with asyncio.timeout(self.AVAILABILITY_TIMEOUT_SECONDS):
+                await self._availability_slots.acquire()
+                permit.acquired = True
+                client = await self._get_client()
+                token = await self._get_availability_access_token(client, permit)
+                body = await self._run_availability_io(
+                    self._read_streamed_availability_response(
+                        client, "GET", url, _AVAILABILITY_RESPONSE_LIMIT,
+                        headers={"Authorization": "Bearer " + token},
+                    ), permit,
+                )
+                try:
+                    wire = json.loads(body, parse_constant=_reject_json_constant)
+                except (TypeError, ValueError):
+                    return failed("invalid_response")
+                return decode_service_facts(wire, scope, datetime.now(timezone.utc))
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            return failed("timeout")
+        except httpx.TimeoutException:
+            return failed("timeout")
+        except httpx.TransportError:
+            return failed("transport")
+        except _AvailabilityReadFailure as error:
+            return failed(error.category.value)
+        except Exception:
+            return failed("provider_error")
+        finally:
+            if permit.acquired and not permit.handed_off:
+                self._availability_slots.release()
+
+    @staticmethod
+    def _availability_wire_datetime(value: datetime) -> str:
+        value = value.astimezone(timezone.utc)
+        timespec = "microseconds" if value.microsecond else "seconds"
+        return value.isoformat(timespec=timespec).replace("+00:00", "Z")
 
     async def _get_access_token(self) -> str:
         """
@@ -605,6 +1019,12 @@ class MSBookingsService(CalendarServiceBase):
 
     async def close(self):
         """Close HTTP client"""
+        pending_cleanup = tuple(self._availability_cleanup_tasks)
+        if pending_cleanup:
+            await asyncio.wait(
+                pending_cleanup,
+                timeout=self.AVAILABILITY_CLEANUP_GRACE_SECONDS,
+            )
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None

@@ -104,3 +104,32 @@ async def persist_booking_record(
                 conn, booking, tenant_id=provider_tenant_id,
                 business_id=provider_business_id)
             return record_id
+
+
+async def insert_verified_booking(conn: Any, *, call_sid: str, phone_number: str,
+                                  client_name: str, client_email: str,
+                                  accountant_name: str, appointment_time: datetime,
+                                  language: str, provider_appointment_id: str,
+                                  tenant_id: str, business_id: str) -> int:
+    """Connection-owned insert and held-job creation for the operation transaction."""
+    if (not isinstance(provider_appointment_id, str) or not provider_appointment_id
+            or not tenant_id or not business_id):
+        raise BookingPersistenceError("invalid verified booking")
+    legacy, canonical = _booking_times(appointment_time)
+    booking_id = await conn.fetchval("""
+        INSERT INTO public.bookings (
+            call_sid,phone_number,client_name,client_email,accountant_name,
+            appointment_time,appointment_time_utc,client_type,language,status,
+            ms_booking_id,notes)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,'new',$8,'confirmed',$9,'') RETURNING id
+    """, call_sid, phone_number, client_name, client_email, accountant_name,
+        legacy, canonical, language, provider_appointment_id)
+    if type(booking_id) is not int:
+        raise BookingPersistenceError("booking record not inserted")
+    from services.sms.notification_outbox import create_new_booking_jobs
+    await create_new_booking_jobs(conn, {
+        "id": booking_id, "ms_booking_id": provider_appointment_id,
+        "appointment_time_utc": canonical, "phone_number": phone_number,
+        "accountant_name": accountant_name, "language": language,
+    }, tenant_id=tenant_id, business_id=business_id)
+    return booking_id

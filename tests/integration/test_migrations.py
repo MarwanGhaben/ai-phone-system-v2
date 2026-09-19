@@ -324,6 +324,25 @@ def auth_password_statements():
 
 
 class OfflineTests(unittest.TestCase):
+    def test_operation_fk_visibility_is_narrow_and_drift_is_rejected(self):
+        from migrations.schema_contract import check_definitions_match
+        key = 'booking_operations_booking_id_fkey'
+        qualified = 'FOREIGN KEY (booking_id) REFERENCES public.bookings(id)'
+        visible = 'FOREIGN KEY (booking_id) REFERENCES bookings(id)'
+        self.assertFalse(check_definitions_match({key: qualified}, {key: visible}))
+        self.assertTrue(check_definitions_match(
+            {key: qualified}, {key: visible}, allow_operation_fk_visibility=True))
+        self.assertTrue(check_definitions_match(
+            {key: visible}, {key: qualified}, allow_operation_fk_visibility=True))
+        for changed in ('FOREIGN KEY (booking_id) REFERENCES private.bookings(id)',
+                        'FOREIGN KEY (booking_id) REFERENCES bookings(other_id)',
+                        'FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE CASCADE',
+                        'FOREIGN KEY (booking_id) REFERENCES bookings(id) DEFERRABLE',
+                        'FOREIGN KEY (other_id) REFERENCES bookings(id)'):
+            self.assertFalse(check_definitions_match(
+                {key: qualified}, {key: changed}, allow_operation_fk_visibility=True))
+        self.assertFalse(check_definitions_match({'other': qualified}, {'other': visible}))
+
     def test_check_cast_equivalence_preserves_values_types_and_boolean_rules(self):
         from migrations.schema_contract import check_definitions_match
         original = "CHECK ((state)::text = ANY ((ARRAY['held'::character varying, 'pending'::character varying])::text[]))"
@@ -460,6 +479,7 @@ class OfflineTests(unittest.TestCase):
             ("0002", "0002_bookings_aware_time.sql"),
             ("0003", "0003_booking_provider_observations.sql"),
             ("0004", "0004_appointment_notifications.sql"),
+            ("0005", "0005_booking_operations.sql"),
         ))
         revision = self.runner.MANIFEST[0]
         sql, checksum = self.runner._load_revision()
@@ -481,7 +501,8 @@ class OfflineTests(unittest.TestCase):
             [("0001", contract.REVISION_CHECKSUM),
              ("0002", contract.BOOKINGS_REVISION_CHECKSUM),
              ("0003", contract.OBSERVATION_REVISION_CHECKSUM),
-             ("0004", contract.NOTIFICATION_REVISION_CHECKSUM)],
+             ("0004", contract.NOTIFICATION_REVISION_CHECKSUM),
+             ("0005", contract.OPERATION_REVISION_CHECKSUM)],
         )
         self.assertEqual(
             revisions[1][1],
@@ -494,6 +515,10 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(
             revisions[3][1],
             (ROOT / "migrations/0004_appointment_notifications.sql").read_bytes().decode("utf-8"),
+        )
+        self.assertEqual(
+            revisions[4][1],
+            (ROOT / "migrations/0005_booking_operations.sql").read_bytes().decode("utf-8"),
         )
         self.assertEqual(bootstrap_checksum, contract.BOOTSTRAP_CHECKSUM)
         self.assertEqual(

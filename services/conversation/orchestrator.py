@@ -160,6 +160,8 @@ class ConversationContext:
 
     # Pending booking (set by check_appointment, used by confirm_appointment)
     pending_booking: Optional[Dict[str, Any]] = None
+    booking_check_owner: Optional[object] = field(default=None, repr=False, compare=False)
+    booking_session: Optional[Any] = field(default=None, repr=False, compare=False)
 
     # Found appointments (set by lookup_my_bookings, used by cancel_booking)
     found_appointments: Optional[list] = None
@@ -319,6 +321,11 @@ class ConversationOrchestrator:
         self._call_state_locks: Dict[str, asyncio.Lock] = {}  # Per-call state locks
         self._speech_setup_locks: Dict[str, asyncio.Lock] = {}
         self._active_speech: Dict[str, _SpeechOwner] = {}
+        self._verified_clear_tasks: set[asyncio.Task] = set()
+        self._verified_phone_booking_enabled = getattr(
+            settings, "verified_phone_booking_enabled", False)
+        self._booking_pool = None
+        self._booking_mutations = None
 
         # The local ONNX runtime and model are imported only when this flag is on.
         # A load/integrity failure disables interruption for enabled windows; it
@@ -379,6 +386,84 @@ class ConversationOrchestrator:
 
         # Track which calls have greeted
         self._greeted_calls: set = set()
+
+    def initialize_verified_booking(self, pool) -> None:
+        """Called only after enabled 0005 readiness succeeds at startup."""
+        if not self._verified_phone_booking_enabled:
+            return
+        from services.calendar.booking_mutations import GraphBookingMutations
+        settings = get_settings()
+        self._booking_mutations = GraphBookingMutations(
+            tenant_id=settings.ms_bookings_tenant_id,
+            business_id=settings.ms_bookings_business_id,
+            client_id=settings.ms_bookings_client_id,
+            client_secret=settings.ms_bookings_client_secret)
+        self._booking_pool = pool
+
+    async def close_verified_booking(self) -> None:
+        workers = []
+        for context in tuple(self._conversations.values()):
+            session = getattr(context, "booking_session", None)
+            if session is not None:
+                session.close()
+                if session.worker is not None:
+                    session.worker.cancel()
+                    workers.append(session.worker)
+        if workers:
+            try:
+                async with asyncio.timeout(5):
+                    await asyncio.gather(*workers, return_exceptions=True)
+            except TimeoutError:
+                pass
+        clear_tasks = tuple(getattr(self, "_verified_clear_tasks", ()))
+        if clear_tasks:
+            try:
+                async with asyncio.timeout(3):
+                    await asyncio.gather(*clear_tasks, return_exceptions=True)
+            except TimeoutError:
+                for task in clear_tasks:
+                    task.cancel()
+        mutations, self._booking_mutations = self._booking_mutations, None
+        self._booking_pool = None
+        if mutations is not None:
+            await mutations.close()
+
+    def _revoke_verified_speech(self, call_sid, context, handler) -> None:
+        owner = self._active_speech.get(call_sid)
+        if owner is not None and owner.context is context and owner.handler is handler:
+            owner.active = False
+            owner.tts_stream.cancel()
+            try:
+                task = asyncio.create_task(self._clear_verified_speech(call_sid, owner))
+            except RuntimeError:
+                handler.invalidate_playback(owner.playback)
+                return
+            tasks = getattr(self, "_verified_clear_tasks", None)
+            if tasks is None:
+                tasks = self._verified_clear_tasks = set()
+            tasks.add(task)
+            task.add_done_callback(self._verified_clear_done)
+
+    def _verified_clear_done(self, task: asyncio.Task) -> None:
+        tasks = getattr(self, "_verified_clear_tasks", None)
+        if tasks is not None:
+            tasks.discard(task)
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception as exc:
+                logger.warning(
+                    "Orchestrator: verified speech clear failed "
+                    f"({type(exc).__name__})")
+
+    async def _clear_verified_speech(self, call_sid: str, owner: _SpeechOwner) -> None:
+        try:
+            async with asyncio.timeout(2):
+                await self._interrupt_call_speech(call_sid, owner)
+        except TimeoutError:
+            owner.active = False
+            owner.tts_stream.cancel()
+            owner.handler.invalidate_playback(owner.playback)
 
     def _format_date_arabic(self, date) -> str:
         """Format a date in Arabic for voice output"""
@@ -745,6 +830,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         logger.info(f"Orchestrator: ===== START CALL {call_sid} from {phone_number}, stream_sid={stream_sid}")
 
         context = None
+        booking_task = None
+        previous = self._conversations.get(call_sid)
+        if previous is not None and getattr(previous, "booking_session", None) is not None:
+            previous.booking_session.close()
         try:
             # =====================================================
             # STEP 1: Create per-call STT instance
@@ -835,6 +924,24 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             twilio_handler = TwilioMediaStreamHandler(call_sid, stream_sid, websocket)
             self._twilio_handlers[call_sid] = twilio_handler
 
+            if getattr(self, "_verified_phone_booking_enabled", False):
+                if self._booking_pool is None or self._booking_mutations is None:
+                    raise RuntimeError("verified booking unavailable")
+                from services.conversation.booking_session import BookingSession
+                from services.calendar.ms_bookings_service import get_calendar_service
+                session = BookingSession(
+                    context, twilio_handler, self._booking_pool,
+                    get_calendar_service(), self._booking_mutations,
+                    owner_check=lambda: (
+                        self._conversations.get(call_sid) is context
+                        and self._twilio_handlers.get(call_sid) is twilio_handler),
+                    on_new_input=lambda: self._revoke_verified_speech(
+                        call_sid, context, twilio_handler))
+                context.booking_session = session
+                booking_task = asyncio.create_task(
+                    session.run(self, call_sid), name=f"booking_dialogue_{call_sid}")
+                session.worker = booking_task
+
             # IMPORTANT: Manually set streaming flag since we already consumed the start event in main.py
             # The handler's handle_connection() won't see the start event, so we set this manually
             twilio_handler._is_streaming = True
@@ -923,6 +1030,26 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
             logger.error(f"Orchestrator: Traceback:\n{traceback.format_exc()}")
         finally:
             logger.info(f"Orchestrator: ===== END CALL {call_sid}")
+            if context is not None and getattr(context, "booking_session", None) is not None:
+                context.booking_session.close()
+            if booking_task is not None:
+                booking_task.cancel()
+                await asyncio.gather(booking_task, return_exceptions=True)
+            if context is not None and self._conversations.get(call_sid) is not context:
+                # The old invocation retains its own local resources after a
+                # replacement has taken the call SID in the shared dictionaries.
+                old_stt = locals().get("call_stt")
+                old_handler = locals().get("twilio_handler")
+                if old_stt is not None:
+                    try:
+                        await old_stt.disconnect()
+                    except Exception:
+                        pass
+                if old_handler is not None:
+                    try:
+                        await old_handler.cleanup()
+                    except Exception:
+                        pass
             await self.end_call(call_sid, diagnostic_context=context)
 
     def _handle_incoming_audio(self, call_sid: str):
@@ -1386,6 +1513,13 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
                         if not result or not result.text or not result.is_final:
                             continue
 
+                        booking_session = getattr(context, "booking_session", None)
+                        if getattr(self, "_verified_phone_booking_enabled", False):
+                            if (booking_session is not None
+                                    and self._conversations.get(call_sid) is context):
+                                booking_session.admit(result)
+                            continue
+
                         utterance_id = getattr(result, "utterance_id", None)
                         if utterance_id is not None:
                             try:
@@ -1461,6 +1595,10 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         """
         context = self._conversations.get(call_sid)
         if not context:
+            return
+        if getattr(self, "_verified_phone_booking_enabled", False):
+            # This compatibility entry point carries neither canonical identity
+            # nor commit-time receipt; it cannot authorize enabled mutations.
             return
 
         # Update context
@@ -1659,6 +1797,321 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         # State is set back to LISTENING inside _speak_to_caller finally block
         # Do NOT set it here to avoid race condition
 
+    async def _verified_help(self, call_sid: str, session) -> None:
+        if session.help_spoken or not session.owns(
+                self._conversations.get(call_sid), self._twilio_handlers.get(call_sid)):
+            return
+        session.help_spoken = True
+        language = session.context.language
+        text = ("تعذر تأكيد الموعد الآن. يمكن لموظف مساعدتك في التحقق منه."
+                if language == "ar" else
+                "I can't verify this appointment right now. A person can help check it.")
+        await self._speak_to_caller(call_sid, text, language if language in ("en", "ar") else "en")
+
+    async def _process_verified_turn(self, call_sid, session, utterance, token) -> None:
+        context = session.context
+        if not session.owns(self._conversations.get(call_sid),
+                            self._twilio_handlers.get(call_sid)):
+            return
+        if re.search(r"[\u0600-\u06ff]", utterance.text):
+            context.language = "ar"
+        elif utterance.language in ("en", "ar"):
+            context.language = utterance.language
+        elif context.language not in ("en", "ar"):
+            context.language = "en"
+        context.state = ConversationState.THINKING
+        response = await self._get_verified_response(call_sid, session, utterance.text, token)
+        if response is _ABORTED_RESPONSE or not session.turn.check_output(token).allowed:
+            return
+        if not session.owns(self._conversations.get(call_sid),
+                            self._twilio_handlers.get(call_sid)):
+            return
+        if type(response) is not str or not response.strip():
+            return
+        context.add_assistant_message(response)
+        context.state = ConversationState.SPEAKING
+        await self._speak_to_caller(
+            call_sid, response, context.language,
+            speech_guard=lambda: (
+                session.turn.check_output(token).allowed
+                and session.owns(self._conversations.get(call_sid),
+                                 self._twilio_handlers.get(call_sid))))
+
+    def _verified_system_prompt(self, context, session) -> str:
+        """Keep approved facts while excluding legacy booking-policy instructions."""
+        base = self._system_prompt
+        booking_start = base.find("BOOKING CONFIRMATIONS:")
+        safe_tail = base.find("WHEN TO TRANSFER:")
+        if 0 <= booking_start < safe_tail:
+            base = base[:booking_start] + base[safe_tail:]
+        from services.config.accountants_service import get_accountants_service
+        from services.scheduling.booking_check import load_booking_policy
+        from services.scheduling.models import CalendarScope
+        from zoneinfo import ZoneInfo
+        accountants = get_accountants_service()
+        local = datetime.now(ZoneInfo("America/Toronto"))
+        caller = context.caller_name or "not yet known"
+        names_en = names_ar = "available from the configured consultant resolver"
+        try:
+            names_en = accountants.get_names_formatted("en")
+            names_ar = accountants.get_names_formatted("ar")
+        except (AttributeError, TypeError, ValueError):
+            pass
+        location = "available only from a verified booking tool result"
+        try:
+            configured = accountants.get_all_accountants()
+            first = configured[0]
+            scope = CalendarScope(session.mutations.tenant_id,
+                                  session.mutations.business_id,
+                                  first["service_id"])
+            policy = load_booking_policy(scope, first["staff_id"], local)
+            if policy is not None:
+                location = policy.location
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            pass
+        return f"""{base}
+
+VERIFIED PHONE BOOKING CONTEXT:
+- Toronto local date and time: {local:%Y-%m-%d %H:%M %Z}.
+- Caller name currently on file: {caller}.
+- Configured consultants in English: {names_en}.
+- Configured consultants in Arabic: {names_ar}.
+- Approved in-person office location: {location}.
+- Booking eligibility, notice, horizon, closures, location and availability come
+  only from the accepted booking configuration and linked tool result. Never
+  calculate, weaken or invent those rules.
+- Only a later caller confirmation after the complete deterministic readback may
+  use confirm_appointment. Never announce success without BOOKING_SUCCESS.
+- Reply in Arabic when the caller language is Arabic and English otherwise.
+"""
+
+    async def _get_verified_response(self, call_sid, session, user_input, token):
+        """One bounded, linked tool round. Booking outcomes are spoken by code."""
+        from services.llm.llm_base import LLMRequest, LLMRole, Message
+        from services.llm.tool_protocol import (assistant_call_message,
+            parse_linked_calls, tool_result_message)
+
+        context = session.context
+        def localized(english: str, arabic: str) -> str:
+            return arabic if context.language == "ar" else english
+
+        prompt = self._verified_system_prompt(context, session)
+        messages = [Message(LLMRole.SYSTEM, prompt)]
+        history = context.get_history_for_llm()
+        for index, item in enumerate(history):
+            if item.get("role") == "tool":
+                prior = history[index - 1] if index else None
+                links = prior.get("tool_calls", ()) if isinstance(prior, dict) else ()
+                if not (isinstance(links, list) and len(links) == 1
+                        and links[0].get("id") == item.get("tool_call_id")):
+                    continue
+            if item.get("role") == "assistant" and "tool_calls" in item:
+                following = history[index + 1] if index + 1 < len(history) else None
+                links = item["tool_calls"]
+                if not (isinstance(links, list) and len(links) == 1
+                        and isinstance(following, dict)
+                        and following.get("tool_call_id") == links[0].get("id")):
+                    continue
+            try:
+                role = LLMRole(item["role"])
+                metadata = {key: value for key, value in item.items()
+                            if key not in ("role", "content")}
+                messages.append(Message(role, item.get("content", ""), metadata))
+            except (KeyError, TypeError, ValueError):
+                return localized("Please repeat that request.",
+                                 "يرجى إعادة الطلب.")
+        tools = self._get_booking_tools()
+        for tool in tools:
+            tool["parameters"]["additionalProperties"] = False
+            if tool["name"] == "check_appointment":
+                tool["parameters"]["required"] = ["accountant_name", "date_time"]
+        try:
+            response = await self.llm.chat_with_tools(LLMRequest(
+                messages, temperature=0.2, max_tokens=120, stream=False,
+                tools=tools, metadata={"single_tool_call": True}))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return localized("I couldn't complete that request. A person can help.",
+                             "لم أتمكن من إكمال الطلب. يمكن لموظف مساعدتك.")
+        if not session.turn.check_output(token).allowed:
+            return _ABORTED_RESPONSE
+        finish_reason = response.finish_reason
+        if (finish_reason is not None
+                and ((response.tool_calls and finish_reason not in ("tool_calls", "function_call"))
+                     or (not response.tool_calls and finish_reason != "stop"))):
+            return localized("Please repeat or clarify that request.",
+                             "يرجى إعادة الطلب أو توضيحه.")
+        if not response.tool_calls:
+            content = response.content.strip() if type(response.content) is str else ""
+            if session.proposals.current is not None:
+                return ("Please confirm the exact appointment I read back, or tell me what to change."
+                        if context.language != "ar" else
+                        "يرجى تأكيد تفاصيل الموعد التي قرأتها، أو أخبرني بما تريد تغييره.")
+            if (not content or re.search(
+                    r"\b(booked|confirmed|reserved|scheduled|secured)\b|"
+                    r"\b(set up|all set)\b|"
+                    r"\bتم\s+(?:حجز|تأكيد)\b|"
+                    r"\bالموعد\s+(?:محجوز|مؤكد)\b", content, re.IGNORECASE)):
+                return localized(
+                    "Please tell me the exact appointment you'd like me to check.",
+                    "يرجى تحديد الموعد الذي تريد مني التحقق منه.")
+            return content[:500]
+        calls = parse_linked_calls(response.tool_calls)
+        if calls is None or len(calls) != 1:
+            return localized("Please repeat or clarify that request.",
+                             "يرجى إعادة الطلب أو توضيحه.")
+        call = calls[0]
+        context.conversation_history.append(
+            assistant_call_message("", calls).to_dict())
+        if session.unresolved and call.name in ("check_appointment", "confirm_appointment",
+                                                "cancel_booking"):
+            outcome = "BOOKING_PENDING"
+        elif call.name == "check_appointment":
+            handler = self._twilio_handlers.get(call_sid)
+            state_lock = getattr(self, "_call_state_locks", {}).get(call_sid)
+            if (handler is not None and state_lock is not None
+                    and self._valid_availability_arguments(call.arguments)):
+                acknowledged = await self._acknowledge_availability_search(
+                    call_sid, context, handler, state_lock)
+                if (not acknowledged
+                        or not session.turn.check_output(token).allowed
+                        or not session.owns(self._conversations.get(call_sid),
+                                            self._twilio_handlers.get(call_sid))):
+                    return _ABORTED_RESPONSE
+            outcome = await self._check_booking(call_sid, call.arguments)
+        elif call.name == "confirm_appointment":
+            outcome = await self._confirm_booking(call_sid, call.arguments)
+        elif call.name == "lookup_my_bookings":
+            outcome = await self._lookup_my_bookings(call_sid, call.arguments)
+        elif call.name == "cancel_booking":
+            outcome = await self._cancel_booking(call_sid, call.arguments)
+        elif call.name == "register_caller_name":
+            name = call.arguments["caller_name"].strip()
+            if not session.turn.check_output(token).allowed:
+                return _ABORTED_RESPONSE
+            if name.casefold() not in user_input.casefold():
+                outcome = "NAME_NOT_GROUNDED"
+            else:
+                session.revoke_proposal()
+                context.caller_name = name
+                context.name_collected = True
+                try:
+                    await self.caller_service.register_caller(
+                        context.phone_number, name, context.language)
+                    outcome = "NAME_SAVED"
+                except Exception:
+                    outcome = "NAME_UNVERIFIED"
+        elif call.name == "save_language_preference":
+            language = call.arguments["language"]
+            if explicit_language_request(user_input) != language:
+                outcome = "LANGUAGE_NOT_CONFIRMED"
+            else:
+                context.language = language
+                try:
+                    await self.caller_service.update_caller_language(context.phone_number,
+                                                                    language)
+                    outcome = "LANGUAGE_SAVED"
+                except Exception:
+                    outcome = "LANGUAGE_UNVERIFIED"
+        elif call.name == "transfer_to_human":
+            await self._handle_transfer(call_sid)
+            outcome = "TRANSFER_HANDLED"
+        elif call.name == "end_call":
+            await self.end_call(call_sid)
+            outcome = "CALL_ENDED"
+        else:
+            outcome = "UNSUPPORTED_TOOL"
+        context.conversation_history.append(tool_result_message(call, outcome).to_dict())
+        context._trim_history()
+        if not session.turn.check_output(token).allowed:
+            return _ABORTED_RESPONSE
+        if outcome == "PROPOSAL_READY":
+            context.state = ConversationState.SPEAKING
+            presented = await session.present(self, call_sid, context.language, token)
+            return _ABORTED_RESPONSE if presented else localized(
+                "I couldn't finish reading that proposal. Please ask me to check it again.",
+                "لم أتمكن من إكمال قراءة تفاصيل الموعد. يرجى أن تطلب مني التحقق منه مرة أخرى.")
+        if outcome == "BOOKING_SUCCESS":
+            proposal = session.approval.proposal
+            local = proposal.candidate.interval.start.astimezone(
+                __import__("zoneinfo").ZoneInfo(proposal.display_zone))
+            if context.language == "ar":
+                return (f"تم تأكيد موعد {proposal.service_display} مع "
+                        f"{proposal.consultant_display} يوم {local.date().isoformat()} "
+                        f"الساعة {local:%H:%M}.")
+            return (f"Your {proposal.service_display} with {proposal.consultant_display} "
+                    f"is confirmed for {local:%Y-%m-%d at %H:%M} Toronto time.")
+        if outcome == "BOOKING_PENDING":
+            return (("قد يكون طلب الموعد قد أُرسل، لكن لا أستطيع التحقق منه الآن. "
+                     "يرجى أن يراجعه موظف قبل محاولة الحجز مرة أخرى.")
+                    if context.language == "ar" else
+                    ("The appointment may have been sent, but I cannot verify it yet. "
+                     "Please let a person check before booking again."))
+        if outcome.startswith("BOOKING_CANCELLED_NOTIFICATION_UNRESOLVED:"):
+            return localized(
+                "Microsoft reported the cancellation, but I couldn't verify its local follow-up. A person can check it.",
+                "أبلغت Microsoft عن الإلغاء، لكنني لم أتمكن من التحقق من المتابعة المحلية. يمكن لموظف التحقق منها.")
+        if outcome.startswith("BOOKING_CANCELLED:"):
+            return localized("The selected appointment was cancelled.",
+                             "تم إلغاء الموعد المحدد.")
+        if outcome.startswith("NO_ELIGIBLE_SLOT:"):
+            alternatives = ""
+            marker = "Verified alternatives:"
+            if marker in outcome:
+                alternatives = outcome.split(marker, 1)[1].split(". Ask", 1)[0].strip()
+            if context.language == "ar":
+                return (("لم أتمكن من التحقق من الوقت المطلوب. الأوقات البديلة "
+                         f"المتحقق منها: {alternatives}. اختر وقتاً لأتحقق منه من جديد.")
+                        if alternatives else
+                        "لم يتم التحقق من وقت مؤهل. اختر وقتاً آخر لأتحقق منه.")
+            return (("The requested time was not verified as eligible. Verified "
+                     f"alternatives: {alternatives}. Please choose one to check again.")
+                    if alternatives else
+                    "No eligible time was verified. Please choose another time to check.")
+        if outcome.startswith("BOOKING_") or outcome.startswith("AVAILABILITY_") or outcome.startswith("POLICY_"):
+            return ("لم أتمكن من التحقق من الموعد. اختر وقتاً لأتحقق منه أو اطلب مساعدة موظف."
+                    if context.language == "ar" else
+                    "I couldn't verify that appointment. Please choose a time to check again or ask for a person.")
+        if outcome in ("TRANSFER_HANDLED", "CALL_ENDED"):
+            return _ABORTED_RESPONSE
+        if outcome == "NAME_SAVED":
+            return (f"شكراً، {context.caller_name}. كيف يمكنني مساعدتك؟"
+                    if context.language == "ar" else
+                    f"Thank you, {context.caller_name}. How can I help?")
+        if outcome == "LANGUAGE_SAVED":
+            return ("تم حفظ تفضيل اللغة." if context.language == "ar"
+                    else "I've saved your language preference.")
+        if outcome == "LANGUAGE_NOT_CONFIRMED":
+            return localized("Would you like English or Arabic?",
+                             "هل تفضل اللغة الإنجليزية أم العربية؟")
+        if outcome.startswith("APPOINTMENTS_FOUND:"):
+            appointments = context.found_appointments or ()
+            details = "; ".join(
+                f"{number}: {item.get('staff_name', 'consultant')} on "
+                f"{item.get('formatted_time', 'an unverified time')}"
+                for number, item in enumerate(appointments, 1)
+                if isinstance(item, dict)
+            )
+            if context.language == "ar":
+                return (f"وجدت المواعيد التالية: {details}. أي موعد تقصد؟"
+                        if details else
+                        "لم أتمكن من التحقق من تفاصيل الموعد. يمكن لموظف مساعدتك.")
+            return (f"I found these appointments: {details}. Which one do you mean?"
+                    if details else "I couldn't verify the appointment details. A person can help.")
+        if outcome.startswith("NO_APPOINTMENTS_FOUND:"):
+            return localized(
+                "I couldn't find an upcoming appointment for this number. Would you like to check a new time?",
+                "لم أجد موعداً قادماً لهذا الرقم. هل تريد التحقق من وقت جديد؟")
+        if outcome.startswith("CANCEL_NEEDS_SELECTION:"):
+            return localized("Which appointment from the list would you like to cancel?",
+                             "أي موعد من القائمة تريد إلغاءه؟")
+        if outcome.startswith("CANCEL_ABORTED:"):
+            return localized("I haven't cancelled the appointment. Would you like to keep it?",
+                             "لم ألغِ الموعد. هل تريد الاحتفاظ به؟")
+        return localized("I couldn't verify that request. A person can help.",
+                         "لم أتمكن من التحقق من الطلب. يمكن لموظف مساعدتك.")
+
     def _get_booking_tools(self) -> list:
         """Get tool definitions for OpenAI function calling"""
         return [
@@ -1794,296 +2247,191 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         ]
 
     async def _check_booking(self, call_sid: str, arguments: dict) -> str:
-        """
-        Check availability for a requested appointment slot.
-        If available, stores pending booking data on the context for later confirmation.
-
-        Args:
-            call_sid: Call identifier
-            arguments: Function call arguments from LLM
-
-        Returns:
-            Result message to feed back to LLM
-        """
+        """Check one exact consultant/time against fresh scoped provider evidence."""
         from services.calendar.ms_bookings_service import get_calendar_service
         from services.config.accountants_service import get_accountants_service
+        from services.scheduling.models import CalendarScope
+        from services.scheduling.booking_check import (
+            TORONTO, assess_booking, load_booking_policy, make_booking_query,
+            parse_requested_time,
+        )
 
         context = self._conversations.get(call_sid)
         if context is None:
-            logger.warning("Orchestrator: booking check rejected without call context")
-            return (
-                "BOOKING_ERROR: Booking cannot be checked for this call. "
-                "Offer to retry or transfer the caller to a human."
-            )
-
-        # Invalidate stale authorization before parsing or any awaited provider work.
+            return "BOOKING_ERROR: Booking cannot be checked for this call. Offer human help."
         context.pending_booking = None
+        owner = object()
+        context.booking_check_owner = owner
+
+        def current() -> bool:
+            return (self._conversations.get(call_sid) is context
+                    and context.booking_check_owner is owner
+                    and (not getattr(self, "_verified_phone_booking_enabled", False)
+                         or (context.booking_session is not None
+                             and context.booking_session.active_token is not None
+                             and context.booking_session.turn.check_output(
+                                 context.booking_session.active_token).allowed))
+                    and context.state not in (ConversationState.CLOSING, ConversationState.ENDED))
+
+        superseded = "BOOKING_CHECK_SUPERSEDED: This check is no longer current. Check again."
+        unverified = (
+            "AVAILABILITY_UNVERIFIED: Unable to verify an available appointment. "
+            "Ask the caller to retry or offer help from a human."
+        )
+        if not current():
+            return superseded
         if not isinstance(arguments, dict):
-            logger.warning("Orchestrator: booking check rejected invalid arguments")
-            return "INVALID_DATE_TIME: Ask the caller to repeat the requested date and time."
-
-        client_type = arguments.get("client_type", "individual")
-        accountant_name = arguments.get("accountant_name", "")
-        date_time_str = arguments.get("date_time") or ""
-        customer_name = arguments.get("customer_name", context.caller_name or "")
-        customer_email = arguments.get("customer_email", "")
-        logger.info("Orchestrator: booking availability check started")
+            return "INVALID_DATE_TIME: Ask the caller for a complete date and time."
+        requested = parse_requested_time(arguments.get("date_time"))
+        if requested is None:
+            return "INVALID_DATE_TIME: Ask the caller for a complete date and time."
 
         try:
-            appointment_time = _parse_booking_datetime(date_time_str)
-        except Exception:
-            appointment_time = None
-        if appointment_time is None:
-            logger.warning("Orchestrator: booking check rejected invalid date")
-            return "INVALID_DATE_TIME: Ask the caller to repeat the requested date and time."
-
-        try:
+            selected = get_accountants_service().resolve_booking_accountant(
+                arguments.get("accountant_name"))
+            if selected.status == "invalid_configuration":
+                return "BOOKING_ERROR: Booking is temporarily unavailable. Offer human help."
+            if selected.status != "resolved" or selected.selection is None:
+                return (
+                    "BOOKING_NEEDS_CLARIFICATION: Ask the caller to choose "
+                    "Hussam Saadaldin, Rami Kahwaji, or Abdul ElFarra by name. "
+                    "Then check the requested appointment again."
+                )
+            choice = selected.selection
             calendar = get_calendar_service()
-            acc_service = get_accountants_service()
             if not await calendar.is_available():
-                logger.warning("Orchestrator: booking check unavailable")
-                return (
-                    "BOOKING_ERROR: Microsoft Bookings is not configured. "
-                    "Please inform the caller that booking is temporarily unavailable "
-                    "and offer to transfer them to a human."
-                )
+                if not current():
+                    return superseded
+                return unverified
+            if not current():
+                return superseded
+            scope = CalendarScope(calendar.tenant_id, calendar.business_id,
+                                  choice.service_id)
+            now = business_now()
+            snapshot = load_booking_policy(scope, choice.staff_id, now)
+            if snapshot is None:
+                return "POLICY_UNVERIFIED: Booking policy coverage is unavailable. Offer human help."
+            query = make_booking_query(snapshot, choice.staff_id, now)
+            facts = await calendar.get_service_facts(scope)
+            if not current():
+                return superseded
+            if facts.status != "verified":
+                if facts.failure == "unsupported_policy":
+                    return "POLICY_UNVERIFIED: Service policy could not be verified. Offer human help."
+                return unverified
 
-            # Look up accountant
-            staff_id = ""
-            service_id = ""
-            matched_staff_name = ""
-            if accountant_name:
-                acc = acc_service.get_accountant_by_name(accountant_name)
-                if acc:
-                    staff_id = acc.get("staff_id", "")
-                    service_id = acc.get("service_id", "")
-                    accountant_name = acc.get("name", accountant_name)
-                    logger.info("Orchestrator: configured booking mapping found")
-
-            # If no staff/service IDs configured, try to get from MSGraph
-            if not staff_id or not service_id:
-                staff_members = await calendar.get_staff_members()
-                if staff_members:
-                    if accountant_name:
-                        name_lower = accountant_name.lower()
-                        for staff in staff_members:
-                            staff_name_lower = staff.name.lower()
-                            if name_lower in staff_name_lower or staff_name_lower in name_lower:
-                                staff_id = staff.id
-                                matched_staff_name = staff.name
-                                logger.info("Orchestrator: matching calendar staff found")
-                                break
-                            if name_lower.split()[0] in staff_name_lower.split() if name_lower.split() else False:
-                                staff_id = staff.id
-                                matched_staff_name = staff.name
-                                logger.info("Orchestrator: calendar staff alias matched")
-                                break
-                    if not staff_id and staff_members:
-                        staff_id = staff_members[0].id
-                        matched_staff_name = staff_members[0].name
-                        logger.info("Orchestrator: default calendar staff selected")
-
-                if not service_id:
-                    services = await calendar.get_services()
-                    if services:
-                        for svc in services:
-                            if client_type in svc.name.lower() or client_type in svc.description.lower():
-                                service_id = svc.id
-                                break
-                        if not service_id and services:
-                            service_id = services[0].id
-                            logger.info("Orchestrator: default calendar service selected")
-
-            if (not isinstance(staff_id, str) or not staff_id.strip()
-                    or not isinstance(service_id, str) or not service_id.strip()):
-                logger.warning("Orchestrator: booking check missing staff or service mapping")
-                return (
-                    "BOOKING_ERROR: Could not find a matching staff member and service. "
-                    "Please ask the caller for more details or offer to transfer them."
-                )
-            staff_id = staff_id.strip()
-            service_id = service_id.strip()
-
-            logger.info("Orchestrator: booking mapping resolved")
-
-            # =====================================================
-            # VALIDATE: Weekend check - Office closed Sat/Sun
-            # =====================================================
-            requested_weekday = appointment_time.weekday()  # 0=Monday, 5=Saturday, 6=Sunday
-            if requested_weekday >= 5:  # Saturday or Sunday
-                day_name = "Saturday" if requested_weekday == 5 else "Sunday"
-                day_name_ar = "السبت" if requested_weekday == 5 else "الأحد"
-                # Suggest next Monday
-                days_until_monday = (7 - requested_weekday) % 7
-                if days_until_monday == 0:
-                    days_until_monday = 1  # If somehow on Monday, suggest tomorrow
-                next_monday = appointment_time.date() + timedelta(days=days_until_monday)
-                next_monday_str = next_monday.strftime('%A, %B %d')
-                next_monday_ar = self._format_date_arabic(next_monday)
-
-                logger.warning(f"Orchestrator: WEEKEND_CLOSED - Requested {day_name}, office closed")
-                return (
-                    f"WEEKEND_CLOSED: The office is CLOSED on {day_name}. "
-                    f"We are only open Monday through Friday. "
-                    f"Tell the caller: 'I'm sorry, but our office is closed on {day_name}. We're open Monday through Friday. Would you like to book for {next_monday_str} instead?' "
-                    f"In Arabic: 'عذراً، المكتب مغلق يوم {day_name_ar}. نحن مفتوحين من الاثنين إلى الجمعة. تحب أحجز لك يوم {next_monday_ar}؟'"
-                )
-
-            # =====================================================
-            # VALIDATE: Maximum 2 business days ahead
-            # =====================================================
-            staff_display = matched_staff_name or accountant_name or "the accountant"
-            full_fmt = '%A, %B %d at %I:%M %p'
-
-            # Calculate max booking date (2 business days from today) using Toronto timezone
-            from pytz import timezone as pytz_timezone
-            toronto_tz = pytz_timezone("America/Toronto")
-            today = datetime.now(toronto_tz).date()
-            max_date = today
-            business_days_added = 0
-            while business_days_added < 2:
-                max_date += timedelta(days=1)
-                # Skip weekends (Saturday=5, Sunday=6)
-                if max_date.weekday() < 5:
-                    business_days_added += 1
-
-            logger.info("Orchestrator: booking date policy evaluated")
-
-            if appointment_time.date() > max_date:
-                max_date_str = max_date.strftime('%A, %B %d')
-                max_date_ar = self._format_date_arabic(max_date)
-                logger.warning("Orchestrator: booking check rejected horizon")
-                return (
-                    f"BOOKING_TOO_FAR: The requested date is too far in advance. "
-                    f"We can ONLY book appointments up to 2 business days ahead. "
-                    f"Today is {today.strftime('%A, %B %d')}. The latest available date is {max_date_str}. "
-                    f"Tell the caller: 'We can only book up to 2 business days in advance. Would you like to book for {max_date_str} instead?' "
-                    f"In Arabic: 'نقدر نحجز لمدة يومين عمل فقط. تحب نحجز ليوم {max_date_ar} بدلاً من ذلك؟'"
-                )
-
-            # =====================================================
-            # DUPLICATE BOOKING CHECK: Warn ONCE if caller already has an
-            # appointment on the requested day. After warning once, we set a
-            # per-call flag so a caller who chooses to proceed with a second
-            # booking is NOT blocked in an infinite warning loop on re-check.
-            # =====================================================
-            if context and context.phone_number and not context.duplicate_warned:
+            # Advisory duplicate warning remains per call; never updates an old check.
+            if context.phone_number and not context.duplicate_warned:
                 try:
-                    existing_appointments = await calendar.get_customer_appointments(context.phone_number)
-                    if existing_appointments:
-                        for appt in existing_appointments:
-                            appt_start = appt.get("start_time")
-                            appt_staff = appt.get("staff_name", "")
-                            if isinstance(appt_start, _DATETIME_TYPE):
-                                if appt_start.date() == appointment_time.date():
-                                    # Mark as warned so subsequent checks proceed
-                                    context.duplicate_warned = True
-                                    appt_date = appt_start.date()
-                                    logger.warning("Orchestrator: duplicate booking warning")
-                                    return (
-                                        f"DUPLICATE_WARNING: The caller already has an appointment on {appt_date.strftime('%A, %B %d')} "
-                                        f"with {appt_staff}. Ask if they want to: 1) Keep existing and book another, "
-                                        f"2) Cancel existing and book new one, or 3) Choose a different day. "
-                                        f"In Arabic: 'عندك موعد موجود يوم {self._format_date_arabic(appt_date)} مع {appt_staff}. "
-                                        f"تحب تحجز موعد إضافي، أو تلغي الموجود وتحجز جديد، أو تختار يوم ثاني؟'"
-                                    )
+                    existing = await calendar.get_customer_appointments(context.phone_number)
+                    if not current():
+                        return superseded
+                    for appointment in existing:
+                        start_time = appointment.get("start_time")
+                        if (isinstance(start_time, _DATETIME_TYPE)
+                                and start_time.astimezone(TORONTO).date()
+                                == requested.astimezone(TORONTO).date()):
+                            context.duplicate_warned = True
+                            day = start_time.astimezone(TORONTO).strftime("%A, %B %d")
+                            staff_name = appointment.get("staff_name", "")
+                            return (
+                                f"DUPLICATE_WARNING: The caller already has an appointment "
+                                f"on {day} with {staff_name}. Ask whether to keep it and "
+                                "book another, cancel it, or choose a different day. "
+                                "Recheck any new choice."
+                            )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.warning("Orchestrator: duplicate booking check failed")
-                    return (
-                        "AVAILABILITY_UNVERIFIED: Unable to verify an available appointment. "
-                        "Ask the caller to retry or offer help from a human."
-                    )
+                    if not current():
+                        return superseded
+                    return unverified
 
-            logger.info("Orchestrator: checking selected-staff availability")
-            available_slots = await calendar.get_available_slots(
-                service_id=service_id,
-                staff_id=staff_id,
-                days_ahead=7
-            )
-
-            slots = _validated_booking_slots(available_slots, staff_id)
-            if slots is None or not slots:
-                logger.warning("Orchestrator: availability could not be verified")
-                return (
-                    "AVAILABILITY_UNVERIFIED: Unable to verify an available appointment. "
-                    "Ask the caller to retry or offer help from a human."
-                )
-
-            matched_slot = next(
-                (slot for slot in slots
-                 if slot.start_time.astimezone(timezone.utc)
-                 == appointment_time.astimezone(timezone.utc)),
-                None,
-            )
-            if matched_slot is None:
-                local_starts = [
-                    slot.start_time.astimezone(appointment_time.tzinfo)
-                    for slot in slots
-                ]
-                same_day = [
-                    start for start in local_starts
-                    if start.date() == appointment_time.date()
-                ]
-                if same_day:
+            available = await calendar.get_availability(query)
+            if not current():
+                return superseded
+            assessment = assess_booking(snapshot, query, facts, available, business_now())
+            if assessment.status == "availability_unverified":
+                return unverified
+            if assessment.status == "policy_unverified":
+                return "POLICY_UNVERIFIED: Service or booking policy could not be verified. Offer human help."
+            match = next((
+                candidate for candidate in assessment.candidates
+                if candidate.interval.start == requested.astimezone(timezone.utc)
+                and candidate.interval.end == requested.astimezone(timezone.utc)
+                + timedelta(minutes=30)
+            ), None)
+            if match is None:
+                if assessment.candidates:
                     alternatives = ", ".join(
-                        start.strftime(full_fmt) for start in same_day[:2]
+                        item.interval.start.astimezone(TORONTO).strftime("%A, %B %d at %I:%M %p")
+                        for item in assessment.candidates[:2]
                     )
-                    result_type = "SLOT_BUSY"
-                    description = "That exact time was not returned as available."
-                else:
-                    suggestions = []
-                    seen_days = set()
-                    for start in local_starts:
-                        if start.date() not in seen_days:
-                            suggestions.append(start.strftime(full_fmt))
-                            seen_days.add(start.date())
-                        if len(suggestions) == 2:
-                            break
-                    alternatives = ", ".join(suggestions)
-                    result_type = "SCHEDULE_FULL"
-                    description = "No verified slot was returned on the requested day."
-                logger.info("Orchestrator: booking alternatives returned for recheck")
+                    return (
+                        "NO_ELIGIBLE_SLOT: The requested time is not verified as eligible. "
+                        f"Verified alternatives: {alternatives}. Ask the caller to choose one, "
+                        "then call check_appointment again and obtain a fresh confirmation. "
+                        "Do not confirm a suggestion directly."
+                    )
                 return (
-                    f"{result_type}: {description} Suggested alternatives: "
-                    f"{alternatives}. Ask which date and time the caller chooses. "
-                    "Then call check_appointment again with that exact choice, read "
-                    "back the new SLOT_AVAILABLE result, and obtain a fresh "
-                    "confirmation before booking. Suggestions must pass the new "
-                    "check and must not be confirmed directly."
+                    "NO_ELIGIBLE_SLOT: No eligible appointment was verified for this "
+                    "consultant within the approved booking window. Ask for another choice."
                 )
 
-            # The legacy create adapter labels wall-clock fields as Eastern Time.
-            # Preserve the verified instant in Toronto before passing it downstream.
-            booking_time = as_business_time(matched_slot.start_time)
-            display_time = booking_time.strftime(full_fmt)
-            context.pending_booking = {
-                "service_id": service_id,
-                "staff_id": staff_id,
-                "staff_name": matched_slot.staff_name or staff_display,
-                "appointment_time": booking_time,
-                "customer_name": customer_name,
-                "customer_email": customer_email,
-                "client_type": client_type,
-            }
-            logger.info("Orchestrator: exact selected-staff slot pending confirmation")
-            return (
-                f"SLOT_AVAILABLE: The appointment with {staff_display} on "
-                f"{display_time} is available. Ask the caller to confirm whether "
-                "they want to book this exact appointment. Do not book until the "
-                "caller says yes."
-            )
+            if getattr(self, "_verified_phone_booking_enabled", False):
+                from services.scheduling.proposals import CustomerSnapshot, ProposalStatus
+                session = context.booking_session
+                handler = self._twilio_handlers.get(call_sid)
+                if (session is None or not session.owns(context, handler)
+                        or not current()):
+                    return superseded
+                if not context.caller_name or not context.phone_number:
+                    return "BOOKING_NEEDS_CLARIFICATION: Ask for the caller's name before checking again."
+                email = arguments.get("customer_email", "")
+                if type(email) is not str or len(email) > 255:
+                    return "BOOKING_NEEDS_CLARIFICATION: Clarify the customer's contact details."
+                if email and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) is None:
+                    return "BOOKING_NEEDS_CLARIFICATION: Clarify the email or leave it empty."
+                if email and email.casefold() not in session.current_text.casefold():
+                    return "BOOKING_NEEDS_CLARIFICATION: Ask the caller to repeat the email."
+                try:
+                    customer = CustomerSnapshot(context.caller_name,
+                                                context.phone_number, email)
+                    offered = session.offer(match, customer, choice.name,
+                                            "appointment", snapshot.location,
+                                            snapshot.policy.business_timezone,
+                                            snapshot.policy.pre_buffer,
+                                            snapshot.policy.post_buffer)
+                except (TypeError, ValueError):
+                    return unverified
+                return ("PROPOSAL_READY" if offered.status is ProposalStatus.OFFERED
+                        else unverified)
 
+            booking_time = match.interval.start.astimezone(TORONTO)
+            context.pending_booking = {
+                "service_id": choice.service_id,
+                "staff_id": choice.staff_id,
+                "staff_name": choice.name,
+                "appointment_time": booking_time,
+                "customer_name": arguments.get("customer_name", context.caller_name or ""),
+                "customer_email": arguments.get("customer_email", ""),
+                "client_type": arguments.get("client_type", "individual"),
+            }
+            logger.info("Orchestrator: exact policy-approved slot pending confirmation")
+            return (
+                f"SLOT_AVAILABLE: {choice.name}, "
+                f"{booking_time.strftime('%A, %B %d at %I:%M %p')} America/Toronto, "
+                f"30 minutes, in person at {snapshot.location}. "
+                "Read back these exact details and ask the caller to confirm. "
+                "Do not book until the caller says yes."
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
-            context.pending_booking = None
+            if current():
+                context.pending_booking = None
             logger.error("Orchestrator: booking availability check failed")
-            return (
-                "AVAILABILITY_UNVERIFIED: Unable to verify an available appointment. "
-                "Ask the caller to retry or offer help from a human."
-            )
+            return unverified
 
     async def _confirm_booking(self, call_sid: str, arguments: dict) -> str:
         """
@@ -2096,6 +2444,29 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         Returns:
             Result message to feed back to LLM
         """
+        if getattr(self, "_verified_phone_booking_enabled", False):
+            from services.scheduling.booking_service import BookingOutcome
+            context = self._conversations.get(call_sid)
+            session = getattr(context, "booking_session", None)
+            if (session is None or session.active_token is None
+                    or not isinstance(arguments, dict)
+                    or type(arguments.get("confirm")) is not bool):
+                return "BOOKING_NEEDS_RECHECK"
+            if arguments["confirm"] is False:
+                return "BOOKING_NEEDS_CLARIFICATION"
+            outcome = await session.confirm(
+                session.current_text, context.language if context.language in ("en", "ar") else "en",
+                session.active_token)
+            if outcome is BookingOutcome.VERIFIED:
+                if session.turn.check_output(session.active_token).allowed:
+                    context.booking_just_completed = True
+                    context.last_booking_summary = "verified appointment"
+                return "BOOKING_SUCCESS"
+            if outcome is None:
+                return "BOOKING_NEEDS_CLARIFICATION"
+            if outcome is BookingOutcome.PENDING or outcome is BookingOutcome.STORE_ERROR:
+                return "BOOKING_PENDING"
+            return "BOOKING_NOT_CREATED"
         from services.calendar.ms_bookings_service import get_calendar_service
 
         context = self._conversations.get(call_sid)
@@ -2286,6 +2657,8 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         Send booking confirmation SMS and schedule a 24hr reminder.
         Runs as a fire-and-forget background task so it doesn't block the call.
         """
+        if getattr(self, "_verified_phone_booking_enabled", False):
+            return
         from services.sms.telnyx_sms_service import get_sms_service
         from services.sms.reminder_scheduler import get_reminder_scheduler
 
@@ -2636,6 +3009,13 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
         Returns:
             AI response text
         """
+        if getattr(self, "_verified_phone_booking_enabled", False):
+            current_context = self._conversations.get(call_sid)
+            session = getattr(current_context, "booking_session", None)
+            if session is None or session.active_token is None:
+                return _ABORTED_RESPONSE
+            return await self._get_verified_response(
+                call_sid, session, user_input, session.active_token)
         context = self._conversations.get(call_sid)
         if not context:
             return "I apologize, I'm having technical difficulties."
@@ -3108,7 +3488,8 @@ CRITICAL INSTRUCTIONS:
 
         return response
 
-    async def _speak_to_caller(self, call_sid: str, text: str, language: str) -> bool:
+    async def _speak_to_caller(self, call_sid: str, text: str, language: str,
+                               *, on_booking_playback=None, speech_guard=None) -> bool:
         """
         Speak response to caller using streaming TTS.
 
@@ -3151,22 +3532,28 @@ CRITICAL INSTRUCTIONS:
         )
         owner = None
         speech_completed = False
+
+        def authorized() -> bool:
+            if speech_guard is None:
+                return True
+            try:
+                return speech_guard() is True
+            except Exception:
+                return False
+
         try:
             # Clear the barge-in reset flag at the start of each TTS turn
             # This ensures we track fresh barge-ins for this utterance
             self._barge_in_reset_done[call_sid] = False
 
-            # Pre-process Arabic text: convert numbers/times to Arabic words
-            if language == "ar":
-                from services.audio.arabic_text_processor import process_arabic_text
-                text = process_arabic_text(text)
-
-            from services.tts.tts_base import TTSRequest
-            request = TTSRequest(
-                text=text,
-                language=language,
-                voice_id=None
-            )
+            request = None
+            if on_booking_playback is None:
+                # Preserve the existing default-off request/validation order.
+                if language == "ar":
+                    from services.audio.arabic_text_processor import process_arabic_text
+                    text = process_arabic_text(text)
+                from services.tts.tts_base import TTSRequest
+                request = TTSRequest(text=text, language=language, voice_id=None)
 
             # =====================================================
             # STREAMING TTS → TWILIO PIPELINE
@@ -3182,6 +3569,7 @@ CRITICAL INSTRUCTIONS:
                     self._conversations.get(call_sid) is not context
                     or self._twilio_handlers.get(call_sid) is not twilio_handler
                     or context.state == ConversationState.ENDED
+                    or not authorized()
                     or (
                         getattr(self, "_speech_aware_barge_in_enabled", False)
                         and context.speech_activity_flow is not None
@@ -3199,10 +3587,28 @@ CRITICAL INSTRUCTIONS:
                     self._conversations.get(call_sid) is not context
                     or self._twilio_handlers.get(call_sid) is not twilio_handler
                     or context.state == ConversationState.ENDED
+                    or not authorized()
                     or not twilio_handler.is_current_playback(playback)
                 ):
                     twilio_handler.release_playback(playback)
                     return False
+                if on_booking_playback is not None:
+                    text = on_booking_playback(playback)
+                    if type(text) is not str or not text:
+                        twilio_handler.release_playback(playback)
+                        return False
+                if not authorized():
+                    twilio_handler.release_playback(playback)
+                    return False
+                # The deterministic proposal is selected only after the exact
+                # playback owner is established. The successful mark below is
+                # the only completion evidence passed back to ProposalState.
+                if on_booking_playback is not None:
+                    if language == "ar":
+                        from services.audio.arabic_text_processor import process_arabic_text
+                        text = process_arabic_text(text)
+                    from services.tts.tts_base import TTSRequest
+                    request = TTSRequest(text=text, language=language, voice_id=None)
                 audio_stream = self.tts.create_stream(request)
                 owner = _SpeechOwner(context, twilio_handler, audio_stream, playback)
                 self._active_speech[call_sid] = owner
@@ -3224,7 +3630,8 @@ CRITICAL INSTRUCTIONS:
                 f"bytes in {tts_elapsed:.2f}s, completed={stream_result.completed}"
             )
 
-            if not stream_result.completed or stream_result.bytes_sent == 0:
+            if (not authorized() or not stream_result.completed
+                    or stream_result.bytes_sent == 0):
                 logger.warning("Orchestrator: TTS streaming did not complete")
                 return False
 
@@ -3239,7 +3646,7 @@ CRITICAL INSTRUCTIONS:
                     f"Orchestrator: Playback was not confirmed for call {call_sid}"
                 )
 
-            if not self._speech_is_current(call_sid, owner):
+            if not authorized() or not self._speech_is_current(call_sid, owner):
                 return False
 
             # Reset STT for clean listening — reconnects to flush echo buffer
@@ -3268,13 +3675,13 @@ CRITICAL INSTRUCTIONS:
                     "succeeded",
                     window=diagnostic_window,
                 )
-                if not self._speech_is_current(call_sid, owner):
+                if not authorized() or not self._speech_is_current(call_sid, owner):
                     return False
             elif barge_in_already_reset:
                 logger.info(f"Orchestrator: Skipping post-TTS STT reset (barge-in already did it)")
 
             # Set echo guard for residual phone speaker echo (shortened since STT is clean)
-            if not self._speech_is_current(call_sid, owner):
+            if not authorized() or not self._speech_is_current(call_sid, owner):
                 return False
             self._echo_guard_until[call_sid] = time.time() + 0.15
             logger.info(f"Orchestrator: Playback complete, echo guard 0.15s")
@@ -3652,8 +4059,21 @@ CRITICAL INSTRUCTIONS:
         """
         logger.info(f"Orchestrator: Ending call {call_sid}")
 
+        if diagnostic_context is not _DIAGNOSTIC_CONTEXT_UNSET:
+            current_context = self._conversations.get(call_sid)
+            if current_context is not diagnostic_context:
+                # A replacement stream reusing the call SID owns the current
+                # handler/STT; the earlier invocation may only retire itself.
+                if diagnostic_context is not None:
+                    earlier = getattr(diagnostic_context, "booking_session", None)
+                    if earlier is not None:
+                        earlier.close()
+                return
+
         # Capture context data before cleanup for database logging
         context = self._conversations.get(call_sid)
+        if context is not None and getattr(context, "booking_session", None) is not None:
+            context.booking_session.close()
         call_stt = self._call_stt_instances.get(call_sid)
         handler = self._twilio_handlers.get(call_sid)
         caller_name = context.caller_name if context else None

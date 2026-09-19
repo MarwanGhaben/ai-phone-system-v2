@@ -227,6 +227,8 @@ class OpenAILLM(LLMServiceBase):
             if openai_tools:
                 kwargs["tools"] = openai_tools
                 kwargs["tool_choice"] = "auto"
+                if request.metadata.get("single_tool_call") is True:
+                    kwargs["parallel_tool_calls"] = False
 
             response = await client.chat.completions.create(**kwargs)
 

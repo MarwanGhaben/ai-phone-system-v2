@@ -758,6 +758,10 @@ class ElevenLabsSTT(STTServiceBase):
             receiver.correlation_text_history.clear()
 
     async def _handle_commit(self, receiver: _ReceiverState, data: dict) -> None:
+        # Local receipt time belongs to the canonical commit, before queueing.
+        # Provider event timestamps are separate metadata, never approval clocks.
+        from datetime import datetime, timezone
+        received_at = datetime.now(timezone.utc)
         text = data.get("text")
         if not isinstance(text, str) or not text.strip():
             self._record_metadata(
@@ -815,6 +819,7 @@ class ElevenLabsSTT(STTServiceBase):
                 is_final=True,
                 metadata=metadata,
                 utterance_id=utterance_id,
+                received_at=received_at,
             )
         )
         logger.info(

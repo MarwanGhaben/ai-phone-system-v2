@@ -10,7 +10,8 @@ import asyncpg
 from typing import Optional
 from loguru import logger
 from config.settings import settings
-from migrations.schema_contract import check_runtime_compatibility
+from migrations.schema_contract import (check_runtime_compatibility, ledger,
+                                        OPERATION_REVISION_VERSION, SchemaCompatibilityError)
 
 
 _pool: Optional[asyncpg.Pool] = None
@@ -67,6 +68,11 @@ async def check_database_compatibility(pool: Optional[asyncpg.Pool] = None) -> N
                             conn,
                             require_notification=getattr(
                                 settings, 'automatic_notifications_enabled', False))
+                        if getattr(settings, 'verified_phone_booking_enabled', False):
+                            _, versions = await ledger(conn, allow_bootstrap=True,
+                                                       require_notification=True)
+                            if OPERATION_REVISION_VERSION not in versions:
+                                raise SchemaCompatibilityError("incompatible schema")
     except Exception:
         raise DatabaseReadinessError("database unavailable") from None
 

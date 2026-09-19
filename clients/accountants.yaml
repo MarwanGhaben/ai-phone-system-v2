@@ -8,18 +8,21 @@ accountants:
   - name: "Hussam Saadaldin"
     name_ar: "حسام سعد الدين"
     aliases: ["Hossam", "Hussam", "Hossam Saadaldin", "Hussein", "Husain", "Husein", "Hosam", "Housam", "حسام"]  # Common variations
+    booking_aliases: ["Hussam", "Hossam", "حسام"]
     email: "hussam@iflextax.ca"
-    staff_id: ""  # MS Bookings staff ID (optional)
-    service_id: "" # MS Bookings service ID (optional)
+    staff_id: "93ee7133-8b0c-42c4-a886-a368b998de4b"
+    service_id: "357dc857-4360-4801-8bc4-12d3ed63afa3"
 
   - name: "Rami Kahwaji"
     name_ar: "رامي قهوجي"
+    booking_aliases: ["Rami", "رامي"]
     email: "rami@iflextax.ca"
-    staff_id: ""
-    service_id: ""
+    staff_id: "d3d0fa56-b0ef-4267-a15d-85e3af42db38"
+    service_id: "357dc857-4360-4801-8bc4-12d3ed63afa3"
 
   - name: "Abdul ElFarra"
     name_ar: "عبدول الفرا"
+    booking_aliases: ["Abdul", "عبدول", "عبد"]
     email: "abdul@iflextax.ca"
-    staff_id: ""
-    service_id: ""
+    staff_id: "91142a93-3c60-4127-bdbd-efde7fd61b75"
+    service_id: "357dc857-4360-4801-8bc4-12d3ed63afa3"

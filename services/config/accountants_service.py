@@ -6,9 +6,68 @@ AI Voice Platform v2 - Accountants Configuration Service
 
 import yaml
 import os
+import unicodedata
+from dataclasses import dataclass
 from typing import List, Dict, Any
 from pathlib import Path
 from loguru import logger
+
+
+@dataclass(frozen=True)
+class BookingSelection:
+    name: str
+    staff_id: str
+    service_id: str
+
+
+@dataclass(frozen=True)
+class BookingSelectionResult:
+    status: str
+    selection: BookingSelection | None = None
+
+
+def _booking_key(value: str) -> str:
+    return unicodedata.normalize("NFC", " ".join(value.split())).casefold()
+
+
+def _booking_id(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and value == value.strip()
+
+
+def _build_booking_index(data: object) -> dict[str, tuple[BookingSelection, ...]] | None:
+    if not isinstance(data, dict) or not isinstance(data.get("accountants"), list):
+        return None
+    rows = data["accountants"]
+    if not rows:
+        return None
+    index: dict[str, set[BookingSelection]] = {}
+    staff_ids: set[str] = set()
+    names: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        name, name_ar = row.get("name"), row.get("name_ar")
+        staff_id, service_id = row.get("staff_id"), row.get("service_id")
+        aliases, booking_aliases = row.get("aliases", []), row.get("booking_aliases")
+        if (not isinstance(name, str) or not _booking_key(name)
+                or not isinstance(name_ar, str) or not _booking_key(name_ar)
+                or not _booking_id(staff_id) or not _booking_id(service_id)
+                or not isinstance(aliases, list)
+                or not all(isinstance(alias, str) and _booking_key(alias)
+                           for alias in aliases)
+                or not isinstance(booking_aliases, list)
+                or not all(isinstance(alias, str) and _booking_key(alias)
+                           for alias in booking_aliases)):
+            return None
+        canonical = _booking_key(name)
+        if staff_id in staff_ids or canonical in names:
+            return None
+        staff_ids.add(staff_id)
+        names.add(canonical)
+        selection = BookingSelection(name, staff_id, service_id)
+        for value in (name, name_ar, *booking_aliases):
+            index.setdefault(_booking_key(value), set()).add(selection)
+    return {key: tuple(values) for key, values in index.items()}
 
 
 class AccountantsService:
@@ -33,19 +92,22 @@ class AccountantsService:
         self.config_path = config_path
         self._accountants: List[Dict[str, Any]] = []
         self._accountants_by_name: Dict[str, Dict[str, Any]] = {}
+        self._booking_index: dict[str, tuple[BookingSelection, ...]] | None = None
 
         self._load_accountants()
 
     def _load_accountants(self):
         """Load accountants from YAML file"""
+        self._booking_index = None
         try:
             if not os.path.exists(self.config_path):
-                logger.warning(f"Accountants config not found: {self.config_path}")
+                logger.warning("Accountants config not found")
                 return
 
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f)
 
+            self._booking_index = _build_booking_index(data)
             self._accountants = data.get('accountants', [])
             self._accountants_by_name = {}
 
@@ -61,10 +123,24 @@ class AccountantsService:
                 for alias in acc.get('aliases', []):
                     self._accountants_by_name[alias.lower()] = acc
 
-            logger.info(f"Loaded {len(self._accountants)} accountants from {self.config_path}")
+            logger.info("Accountants config loaded")
 
-        except Exception as e:
-            logger.error(f"Failed to load accountants: {e}")
+        except Exception:
+            self._booking_index = None
+            logger.error("Failed to load accountants config")
+
+    def resolve_booking_accountant(self, name: object) -> BookingSelectionResult:
+        """Resolve only an explicit booking name against validated configured IDs."""
+        if self._booking_index is None:
+            return BookingSelectionResult("invalid_configuration")
+        if not isinstance(name, str) or not _booking_key(name):
+            return BookingSelectionResult("not_found")
+        matches = self._booking_index.get(_booking_key(name), ())
+        if len(matches) > 1:
+            return BookingSelectionResult("ambiguous")
+        if not matches:
+            return BookingSelectionResult("not_found")
+        return BookingSelectionResult("resolved", matches[0])
 
     def get_all_accountants(self) -> List[Dict[str, Any]]:
         """Get all accountants"""

@@ -1,0 +1,37 @@
+version: "2026-09-18-owner-approved-v1"
+timezone: "America/Toronto"
+open_weekdays: [0, 1, 2, 3, 4]
+opens_at: "10:00"
+closes_at: "17:00"
+duration_minutes: 30
+slot_minutes: 30
+pre_buffer_minutes: 0
+post_buffer_minutes: 0
+minimum_notice_minutes: 30
+business_day_horizon: 2
+appointment_format: "in_person"
+maximum_attendees: 1
+office_location: "1901 Banff Ave, Ottawa, ON K1V 7W9"
+seasonal_overrides: []
+closures:
+  coverage_start: "2026-01-01"
+  coverage_end: "2027-12-31"
+  dates:
+    - "2026-01-01"
+    - "2026-02-16"
+    - "2026-04-03"
+    - "2026-05-18"
+    - "2026-07-01"
+    - "2026-09-07"
+    - "2026-10-12"
+    - "2026-12-25"
+    - "2026-12-26"
+    - "2027-01-01"
+    - "2027-02-15"
+    - "2027-03-26"
+    - "2027-05-24"
+    - "2027-07-01"
+    - "2027-09-06"
+    - "2027-10-11"
+    - "2027-12-25"
+    - "2027-12-26"
