@@ -155,8 +155,8 @@ def test_arabic_exact_readback_and_unsupported_language():
     assert unsupported.text is None
     started = state.begin_presentation(offered.token, "ar", "p2", "m2", NOW)
     assert started.status is ProposalStatus.PRESENTATION_STARTED
-    for text in ("مروان", "حسام", "اجتماع 30 دقيقة", "2030-01-08",
-                 "America/Toronto", "1901 Banff Ave"):
+    for text in ("مروان", "حسام", "اجتماع لمدة نصف ساعة", "الثامن من يناير",
+                 "بتوقيت تورونتو", "العاشرة صباحاً", "1901 Banff Ave"):
         assert text in started.text
 
 

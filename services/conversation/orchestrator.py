@@ -41,6 +41,7 @@ from services.conversation.barge_in_diagnostics import (
 from services.conversation.language_policy import explicit_language_request
 from services.calendar.calendar_base import TimeSlot
 from services.calendar.business_time import as_business_time, business_now
+from services.scheduling import spoken_arabic
 from services.scheduling.booking_records import (
     BookingPersistenceError,
     persist_booking_record,
@@ -2037,9 +2038,9 @@ VERIFIED PHONE BOOKING CONTEXT:
             local = proposal.candidate.interval.start.astimezone(
                 __import__("zoneinfo").ZoneInfo(proposal.display_zone))
             if context.language == "ar":
-                return (f"تم تأكيد موعد {proposal.service_display} مع "
-                        f"{proposal.consultant_display} يوم {local.date().isoformat()} "
-                        f"الساعة {local:%H:%M}.")
+                return (f"تم حجز {spoken_arabic.service(proposal.service_display)} لك مع "
+                        f"{spoken_arabic.consultant(proposal.consultant_display)}، "
+                        f"{spoken_arabic.slot(local)}، {spoken_arabic.zone(proposal.display_zone)}.")
             return (f"Your {proposal.service_display} with {proposal.consultant_display} "
                     f"is confirmed for {local:%Y-%m-%d at %H:%M} Toronto time.")
         if outcome == "BOOKING_PENDING":
@@ -2061,8 +2062,8 @@ VERIFIED PHONE BOOKING CONTEXT:
             if marker in outcome:
                 alternatives = outcome.split(marker, 1)[1].split(". Ask", 1)[0].strip()
             if context.language == "ar":
-                return (("لم أتمكن من التحقق من الوقت المطلوب. الأوقات البديلة "
-                         f"المتحقق منها: {alternatives}. اختر وقتاً لأتحقق منه من جديد.")
+                return (("الوقت الذي طلبته غير متاح للحجز. عندي لك هذه الخيارات: "
+                         f"{alternatives}. أي وقت يناسبك لأتحقق منه؟")
                         if alternatives else
                         "لا توجد مواعيد متاحة للحجز مع هذا المحاسب خلال الفترة التي تحققت منها. هل تريد أن أبحث لك عند محاسب آخر؟")
             return (("The requested time was not verified as eligible. Verified "
@@ -2087,16 +2088,25 @@ VERIFIED PHONE BOOKING CONTEXT:
                              "هل تفضل اللغة الإنجليزية أم العربية؟")
         if outcome.startswith("APPOINTMENTS_FOUND:"):
             appointments = context.found_appointments or ()
+            if context.language == "ar":
+                entries = []
+                for number, item in enumerate(appointments, 1):
+                    if not isinstance(item, dict):
+                        continue
+                    start = item.get("start_time")
+                    when = (spoken_arabic.slot(as_business_time(start))
+                            if isinstance(start, _DATETIME_TYPE) and start.tzinfo is not None
+                            and start.utcoffset() is not None else "في وقت لم أتمكن من التحقق منه")
+                    entries.append(f"الموعد رقم {spoken_arabic.number(number)}، مع "
+                                   f"{spoken_arabic.consultant(item.get('staff_name', 'المحاسب'))}، {when}")
+                return (f"وجدت لك هذه المواعيد: {'؛ '.join(entries)}. أي موعد تقصد؟"
+                        if entries else "لم أتمكن من التحقق من تفاصيل الموعد. يمكن لموظف مساعدتك.")
             details = "; ".join(
                 f"{number}: {item.get('staff_name', 'consultant')} on "
                 f"{item.get('formatted_time', 'an unverified time')}"
                 for number, item in enumerate(appointments, 1)
                 if isinstance(item, dict)
             )
-            if context.language == "ar":
-                return (f"وجدت المواعيد التالية: {details}. أي موعد تقصد؟"
-                        if details else
-                        "لم أتمكن من التحقق من تفاصيل الموعد. يمكن لموظف مساعدتك.")
             return (f"I found these appointments: {details}. Which one do you mean?"
                     if details else "I couldn't verify the appointment details. A person can help.")
         if outcome.startswith("NO_APPOINTMENTS_FOUND:"):
@@ -2364,7 +2374,9 @@ VERIFIED PHONE BOOKING CONTEXT:
             if match is None:
                 if assessment.candidates:
                     alternatives = ", ".join(
-                        item.interval.start.astimezone(TORONTO).strftime("%A, %B %d at %I:%M %p")
+                        (spoken_arabic.slot(item.interval.start.astimezone(TORONTO))
+                         if context.language == "ar" else
+                         item.interval.start.astimezone(TORONTO).strftime("%A, %B %d at %I:%M %p"))
                         for item in assessment.candidates[:2]
                     )
                     return (

@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from services.conversation.events import UtteranceIdentity
 from services.scheduling.policy import AppointmentCandidate
+from services.scheduling import spoken_arabic
 
 
 _LIFETIME = timedelta(minutes=2)
@@ -209,11 +210,12 @@ def _readback(proposal: AppointmentProposal, language: str) -> str:
             f"{proposal.customer.email or 'no email'}. Do you confirm this exact appointment?"
         )
     return (
-        f"{proposal.customer.name}، موعد {proposal.service_display} مع "
-        f"{proposal.consultant_display} مقترح يوم {day} من {clock} "
-        f"({proposal.display_zone}) لمدة {minutes} دقيقة، حضورياً في "
-        f"{proposal.location}. رقم التواصل: {proposal.customer.phone}، "
-        f"البريد: {proposal.customer.email or 'لا يوجد'}. هل تؤكد هذا الموعد بالتفاصيل المذكورة؟"
+        f"{proposal.customer.name}، عندي لك {spoken_arabic.service(proposal.service_display)} مع "
+        f"{spoken_arabic.consultant(proposal.consultant_display)} يوم {spoken_arabic.date(start)}، "
+        f"من الساعة {spoken_arabic.clock(start)} إلى {spoken_arabic.clock(end)}، "
+        f"{spoken_arabic.zone(proposal.display_zone)}. مدة الموعد {spoken_arabic.duration(minutes)}، "
+        f"والحضور في المكتب، على عنوان {proposal.location}. رقم التواصل: {proposal.customer.phone}، "
+        f"البريد الإلكتروني: {proposal.customer.email or 'غير مسجل'}. هل أحجز لك هذا الموعد؟"
     )
 
 
