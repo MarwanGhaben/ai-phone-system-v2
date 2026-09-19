@@ -28,8 +28,8 @@ OLD_IMAGE = "sha256:14589fc6411ef54f64e0a519c41729698b113680ebc02fdbd94d53b5a0fa
 LAST_RELEASE = Path("/opt/ai-phone-speech-gate-release.21e0obbh")
 NGINX_HASH = "59ac9bdaa9a86c1022a573c9709faddf7e93a53015da8acfcc4330b3e288f3ab"
 PUBLIC_HEALTH = "https://aiagent.ghaben.ca:8443/health"
-MANIFEST_PATH = "docs/delegation/T020-C-release-hashes.json"
-MANIFEST_SHA256 = "44f8840996bc7f4f69ebee0a7ea95cf3fc3651f284b9a302f255ad869fc1da04"
+MANIFEST_PATH = "docs/delegation/T020-C-contention-hashes.json"
+MANIFEST_SHA256 = "c3f89ece10d06f9edf14ea191fbad9f2b12c1eaa7cc8533b0ec528607a46de4a"
 MIGRATION_0005_SHA256 = "cf9c9e2cdc53569a59833235efa98633b5f7b233f98549a8b2f1b16614866100"
 
 RUNTIME_PATHS = (

@@ -346,8 +346,18 @@ class OperationStore:
         snapshot, digest = intent
         key = (candidate.scope.tenant_id, candidate.scope.business_id,
                "create", proposal.proposal_id, proposal.revision)
+        admission_scope = json.dumps(
+            ["booking-staff-admission-v1", candidate.scope.tenant_id,
+             candidate.scope.business_id, candidate.staff_id],
+            ensure_ascii=False, separators=(",", ":"))
+        admission_lock = int.from_bytes(
+            sha256(admission_scope.encode("utf-8")).digest()[:8], "big", signed=True)
         try:
             async with conn.transaction():
+                # Serialize only admissions for this staff scope. A committed
+                # conflicting claim can then be rejected without a speculative
+                # GiST insertion waiting on its owner's receipt/finalization.
+                await conn.execute("SELECT pg_advisory_xact_lock($1::bigint)", admission_lock)
                 existing = await conn.fetchrow(_SELECT + " WHERE tenant_id=$1 AND business_id=$2 "
                     "AND action=$3 AND proposal_id=$4 AND proposal_revision=$5", *key)
                 if existing is not None:
@@ -363,6 +373,20 @@ class OperationStore:
                     return AdmissionResult(AdmissionStatus.EXPIRED)
                 if candidate.interval.start <= instant:
                     return AdmissionResult(AdmissionStatus.INVALID)
+                occupied = await conn.fetchval("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM public.booking_operations
+                        WHERE tenant_id=$1 AND business_id=$2 AND staff_id=$3
+                          AND state <> 'released'
+                          AND claim_span && tstzrange(
+                              $4::timestamptz-$6::interval,
+                              $5::timestamptz+$7::interval,'[)')
+                    )
+                """, candidate.scope.tenant_id, candidate.scope.business_id,
+                    candidate.staff_id, candidate.interval.start, candidate.interval.end,
+                    proposal.pre_buffer, proposal.post_buffer)
+                if occupied:
+                    return AdmissionResult(AdmissionStatus.INTERVAL_CONFLICT)
                 row = await conn.fetchrow("""
                     INSERT INTO public.booking_operations
                       (operation_id,tenant_id,business_id,staff_id,service_id,action,

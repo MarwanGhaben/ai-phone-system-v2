@@ -1,6 +1,16 @@
 # T020-C verified phone booking and schema 0005 rollout
 
-Status: independent lead review accepted, including all 35 Docker-enabled release
+Status: c60e774's owner rollout stopped before cutover during the synthetic
+20-request journey. A targeted owner replay confirmed PostgreSQL deadlocks during
+admission and provider-receipt persistence. The next candidate adds staff-scoped
+admission serialization and a committed-claim check; it does not retry provider
+creation, change SQL/checksums, or relax the database exclusion constraint.
+Do not rerun c60e774. Await the newly reviewed and published correction SHA.
+The corrected packaged candidate passed all 51 real PostgreSQL journeys with
+zero skips. The real receipt-writer regression failed before the correction and
+passed afterward; the current release offline suite passes 31 checks.
+
+Historical acceptance before that server finding included all 35 Docker-enabled release
 tests, 843 packaged candidate passes and 49 real database journeys. Use the exact
 published commit supplied by the lead for the owner-controlled server run.
 `PUBLISHED_T020_C_COMMIT` is deliberately unfilled. Use only the exact reviewed
@@ -12,10 +22,11 @@ The release derives a candidate from source
 `792952b2965e85513bf0971a41bfaff7bd3377c4` and image
 `sha256:14589fc6411ef54f64e0a519c41729698b113680ebc02fdbd94d53b5a0fa4369`.
 It validates all 108 frozen inputs from
-`T020-C-release-hashes.json`, whose SHA-256 is
-`44f8840996bc7f4f69ebee0a7ea95cf3fc3651f284b9a302f255ad869fc1da04`.
-The original accepted manifest is preserved; the release manifest differs only
-in one test-cleanup hash, documented in the lead review. Runtime and SQL are unchanged.
+`T020-C-contention-hashes.json`, whose SHA-256 is
+`c3f89ece10d06f9edf14ea191fbad9f2b12c1eaa7cc8533b0ec528607a46de4a`.
+Both prior manifests are preserved. Relative to the published release manifest,
+only the operation-store module and its PostgreSQL regression test file change;
+the other 106 assets, including all SQL, remain identical.
 Text inputs use CRLF-to-LF normalization and the three VAD model assets use raw
 bytes. The candidate copies only the declared runtime, consultant/policy, and
 migration assets. It installs no package and uses no floating dependency.

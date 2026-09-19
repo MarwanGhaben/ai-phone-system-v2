@@ -190,6 +190,69 @@ class BookingOperationDatabaseTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def test_conflicting_admission_does_not_wait_for_receipt_writer(self):
+        from services.scheduling.operation_store import AdmissionStatus, DispatchStatus
+
+        intent = approved()
+        now = NOW + timedelta(seconds=30)
+        admitted = await self.store.admit(self.conn, intent, now=now)
+        grant = await self.store.claim_dispatch(self.conn, admitted.operation.operation_id, now=now)
+        self.assertIs(grant.status, DispatchStatus.GRANTED)
+        writer = await self.connection()
+        contender = await self.connection()
+        transaction = writer.transaction()
+        await transaction.start()
+        task = None
+        try:
+            self.assertTrue(await self.store.save_receipt(
+                writer, admitted.operation.operation_id, grant.fence, grant.owner_token,
+                "synthetic-provider-receipt", now=now))
+            task = asyncio.create_task(self.store.admit(
+                contender, approved(proposal_id="competing-receipt"), now=now))
+            # The committed interval already excludes this contender. It must
+            # return conflict without entering GiST's wait on the receipt writer.
+            done, _ = await asyncio.wait({task}, timeout=2)
+            self.assertIn(task, done, "conflicting admission waited on receipt persistence")
+            self.assertIs(task.result().status, AdmissionStatus.INTERVAL_CONFLICT)
+        finally:
+            await transaction.rollback()
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(await self.conn.fetchval("SELECT count(*) FROM public.booking_operations"), 1)
+
+    async def test_admission_wait_is_staff_scoped_and_cancellation_releases_transaction(self):
+        from services.scheduling.operation_store import AdmissionStatus
+
+        now = NOW + timedelta(seconds=30)
+        waiter = await self.connection()
+        other_staff = await self.connection()
+        transaction = self.conn.transaction()
+        await transaction.start()
+        task = None
+        try:
+            first = await self.store.admit(self.conn, approved(), now=now)
+            self.assertIs(first.status, AdmissionStatus.CREATED)
+            task = asyncio.create_task(self.store.admit(
+                waiter, approved(proposal_id="blocked"), now=now))
+            result = await asyncio.wait_for(self.store.admit(other_staff,
+                approved(proposal_id="other-staff", staff="staff-b"), now=now), 2)
+            self.assertIs(result.status, AdmissionStatus.CREATED)
+            self.assertFalse(task.done())
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertFalse(waiter.is_in_transaction())
+        finally:
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await transaction.rollback()
+        retry = await self.store.admit(waiter, approved(proposal_id="after-rollback"), now=now)
+        self.assertIs(retry.status, AdmissionStatus.CREATED)
+
     async def test_get_distinguishes_existing_missing_and_closed_connection(self):
         from services.scheduling.operation_store import OperationReadError
         intent = approved()
