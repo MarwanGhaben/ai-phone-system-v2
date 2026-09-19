@@ -52,3 +52,27 @@ Success prints `LLM_SDK_REPAIR_DEPLOYED_READY_HTTPS_OK`, commit and image.
 On failure, preserve the protected release folder and return only printed
 markers. Do not rerun or share private logs. After success, repeat a short
 Hussam availability request before attempting a confirmed booking.
+
+## Build-reference correction after first repair attempt
+
+The owner repair1855392 stopped after baseline validation in
+`/opt/ai-phone-llm-repair.sqyv8nyh`, before cutover. The exact Docker build pattern
+was reproduced locally: `FROM sha256:<local image ID>` is resolved by BuildKit as
+`docker.io/library/sha256:<tag>` and fails with pull access denied. This matches
+the owner's stop boundary; the server's private log was not read.
+
+The builder now creates a unique temporary local parent tag, checks that it
+resolves to the exact accepted image ID, and uses that tag in `FROM`. It removes
+only that temporary tag afterward, including on failure. The accepted server
+image, repair module, dependencies, schema, settings and recovery behavior are
+unchanged. Candidate revision labels are checked, and failure output names the
+fixed stage without exposing private command output.
+
+Validation: the new build-reference regression failed before the correction.
+Nine offline release tests pass, including mismatched-parent refusal and failed
+build cleanup. The opt-in Docker suite passes all ten tests: the actual builder
+creates a derived Linux image, the SDK probe runs inside it with networking
+disabled, the module hash is checked inside that image, and test container and
+image tags are removed and verified absent. The test uses the available older
+local application parent; the owner script still requires the exact accepted
+server image. No provider or server access occurred during these tests.

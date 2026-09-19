@@ -75,6 +75,30 @@ def load_helper():
     return module
 
 
+def build_candidate(release, source):
+    """Resolve the accepted image through a verified local tag for BuildKit."""
+    build = release.directory / "build"
+    build.mkdir(mode=0o700)
+    (build / "openai_service.py").write_bytes(source)
+    parent = "ai-phone-llm-repair-parent:" + release.directory.name
+    tag = "ai-phone-llm-repair:" + release.directory.name
+    try:
+        release.run("docker", "tag", OLD_IMAGE, parent)
+        if release.inspect_once(parent)["Id"] != OLD_IMAGE:
+            raise RuntimeError("local parent tag differs from accepted image")
+        (build / "Dockerfile").write_bytes((
+            "FROM " + parent + "\nCOPY openai_service.py /app/" + SOURCE
+            + '\nLABEL org.opencontainers.image.revision="' + release.commit + '"\n').encode())
+        release.run("docker", "build", "--network", "none", "--pull=false", "-t", tag,
+                    str(build), timeout=180)
+        candidate = release.inspect_once(tag)
+        if candidate["Config"]["Labels"].get("org.opencontainers.image.revision") != release.commit:
+            raise RuntimeError("candidate revision differs")
+        return candidate["Id"]
+    finally:
+        release.run("docker", "image", "rm", parent, check=False)
+
+
 def execute(release, helper):
     live = ROOT / "docker-compose.override.yml"
     if live.is_symlink() or live.stat().st_uid != 0 or live.stat().st_mode & 0o077:
@@ -136,16 +160,10 @@ def execute(release, helper):
              for name in ("docker-compose.yml", "nginx/nginx.conf")}
     rendered = release.render_compose(live)
     print("LLM_REPAIR_BASELINE_SOURCE_SETTINGS_READY_OK", flush=True)
-    build = release.directory / "build"
-    build.mkdir(mode=0o700)
-    (build / "openai_service.py").write_bytes(source)
-    (build / "Dockerfile").write_bytes((
-        "FROM " + OLD_IMAGE + "\nCOPY openai_service.py /app/" + SOURCE
-        + '\nLABEL org.opencontainers.image.revision="' + release.commit + '"\n').encode())
-    tag = "ai-phone-llm-repair:" + release.directory.name
-    release.run("docker", "build", "--network", "none", "--pull=false", "-t", tag,
-                str(build), timeout=180)
-    candidate = release.inspect_once(tag)["Id"]
+    release.stage = "build"
+    candidate = build_candidate(release, source)
+    print("LLM_REPAIR_LOCAL_PARENT_BUILD_OK", flush=True)
+    release.stage = "sdk-probe"
     name = "llm-repair-sdk-" + release.directory.name
     try:
         result = release.run("docker", "run", "--rm", "--network", "none", "--name", name,
@@ -156,12 +174,14 @@ def execute(release, helper):
         release.run("docker", "rm", "-f", name, check=False)
     candidate_path = release.private_write("candidate-override.json",
         json.dumps(changed_override(original, candidate), indent=2).encode())
+    release.stage = "candidate-configuration"
     expected_rendered = changed_override(rendered, candidate)
     if release.render_compose(candidate_path) != expected_rendered:
         raise RuntimeError("rendered configuration changed beyond app image")
     candidate_hashes = {**hashes, SOURCE: digest(source)}
     probe(candidate_hashes, candidate_path)
     print("LLM_REPAIR_CANDIDATE_SDK_AND_EFFECTIVE_SOURCE_OK", flush=True)
+    release.stage = "pre-cutover"
     if (live.read_bytes() != previous_bytes
             or any((ROOT / name).read_bytes() != value for name, value in files.items())
             or release.inspect_once(release.app_container)["Image"] != OLD_IMAGE
@@ -181,6 +201,7 @@ def execute(release, helper):
             raise RuntimeError("replacement contract differs")
         probe(expected_hashes)
         release.start_ingress()
+    release.stage = "cutover"
     release.mark("cutover-started")
     try:
         release.stop_writers(strict=True)
@@ -212,7 +233,12 @@ def main(commit):
         directory = Path(tempfile.mkdtemp(prefix="ai-phone-llm-repair.", dir="/opt"))
         print("PROTECTED_RELEASE_DIRECTORY=" + str(directory), flush=True)
         helper = load_helper()
-        execute(helper.Release(directory, commit), helper)
+        release = helper.Release(directory, commit)
+        try:
+            execute(release, helper)
+        except BaseException:
+            print("LLM_REPAIR_STOPPED_STAGE=" + release.stage, flush=True)
+            raise
 
 
 if __name__ == "__main__":
