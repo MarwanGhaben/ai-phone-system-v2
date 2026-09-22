@@ -124,7 +124,8 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
     connection = journey.VerifiedCreateDatabaseTests.connection
 
     async def _journey(self, language, *, correction=False, unknown=False,
-                       rollback=False, search_first=False, approval_text=None):
+                       rollback=False, search_first=False, approval_text=None,
+                       delayed_reset=False):
         import services.conversation.orchestrator as module
         pool = await self.driver.create_pool(self.dsn, min_size=1, max_size=10)
         self.addAsyncCleanup(pool.close)
@@ -166,6 +167,13 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
         worker = asyncio.create_task(session.run(orchestrator, "synthetic-call"))
         consumer = asyncio.create_task(orchestrator._consume_stt_transcripts("synthetic-call"))
         stt = orchestrator._call_stt_instances["synthetic-call"]
+        reset_entered, reset_release = asyncio.Event(), asyncio.Event()
+        if delayed_reset:
+            async def reset():
+                if session.proposals._presentation_completed is not None:
+                    reset_entered.set()
+                    await reset_release.wait()
+            stt.reset_for_listening = reset
         gate = None
         try:
             with (mock.patch.object(module, "business_now",
@@ -174,9 +182,13 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
                              return_value=calendar),
                   mock.patch("services.config.accountants_service.get_accountants_service",
                              return_value=journey.SyntheticSelections()),
+                  mock.patch("services.sms.notification_outbox.datetime") as notification_clock,
                   (mock.patch("services.sms.notification_outbox.create_new_booking_jobs",
                               side_effect=RuntimeError("synthetic rollback"))
                    if rollback else nullcontext())):
+                # The entire journey is in September 2026; reminder eligibility
+                # must use that same test clock rather than today's wall clock.
+                notification_clock.now.side_effect = lambda _zone=None: clock.now
                 first_text = ("أريد موعدا يوم الاثنين الساعة العاشرة s@example.invalid"
                               if language == "ar" else
                               "I want Monday at ten, s@example.invalid")
@@ -222,6 +234,10 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
                     language, None, is_final=True,
                     utterance_id=UtteranceIdentity("stt", "epoch", 2),
                     received_at=clock.now))
+                if delayed_reset:
+                    await asyncio.wait_for(reset_entered.wait(), 2)
+                    await until(lambda: session.turn.generation == 2)
+                    reset_release.set()
                 if correction:
                     await asyncio.wait_for(gate.entered.wait(), 10)
                     await stt.queue.put(STTResult("No, change the time", language,
@@ -273,6 +289,7 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
                     orchestrator.llm.requests[confirmation_index].messages))
                 self.assertIsNone(context.pending_booking)
         finally:
+            reset_release.set()
             if gate is not None:
                 gate.release.set()
             session.close()
@@ -284,6 +301,12 @@ class PhoneBookingDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_enabled_english_full_verified_phone_journey(self):
         await self._journey("en")
+
+    async def test_english_confirmation_during_post_readback_reset_creates_once(self):
+        await self._journey("en", delayed_reset=True)
+
+    async def test_arabic_confirmation_during_post_readback_reset_creates_once(self):
+        await self._journey("ar", delayed_reset=True)
 
     async def test_enabled_arabic_full_verified_phone_journey(self):
         await self._journey("ar")

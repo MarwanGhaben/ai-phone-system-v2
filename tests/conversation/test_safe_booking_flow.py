@@ -90,7 +90,7 @@ def test_early_yes_and_interrupted_playback_cannot_authorize_create():
         assert session.admit(early)
         new_token = take_pending(session).token
 
-        async def failed_speech(call_sid, text, language, *, on_booking_playback=None):
+        async def failed_speech(call_sid, text, language, *, on_booking_playback=None, on_booking_playback_complete=None):
             assert on_booking_playback(SimpleNamespace(session_id="stream", generation=1))
             return False
 
@@ -112,11 +112,12 @@ def test_later_presented_yes_dispatches_once_and_replays_are_rejected():
             "America/Toronto", timedelta(0), timedelta(0))
         assert offered.token is not None
 
-        async def speech(call_sid, text, language, *, on_booking_playback=None):
+        async def speech(call_sid, text, language, *, on_booking_playback=None, on_booking_playback_complete=None):
             readback = on_booking_playback(SimpleNamespace(session_id="stream", generation=1))
             assert "Synthetic Customer" in readback
             assert "Synthetic Consultant" in readback
             assert "+14165550100" in readback
+            on_booking_playback_complete(SimpleNamespace(session_id="stream", generation=1), True)
             return True
 
         orchestrator._speak_to_caller = speech
@@ -368,8 +369,10 @@ def test_enabled_availability_check_keeps_owned_acknowledgement():
                              '"date_time":"2026-09-21 10:00"}'
             }]))
 
-        await orchestrator._get_verified_response(
-            "call", session, batch.inputs[-1].text, batch.token)
+        with mock.patch("services.conversation.orchestrator.business_now",
+                        return_value=datetime(2026, 9, 19, 13, tzinfo=timezone.utc)):
+            await orchestrator._get_verified_response(
+                "call", session, batch.inputs[-1].text, batch.token)
 
         orchestrator._acknowledge_availability_search.assert_awaited_once_with(
             "call", context, session.handler,
@@ -437,8 +440,9 @@ def test_unknown_create_outcome_blocks_another_dispatch():
             "Synthetic Consultant", "appointment", "1901 Banff Ave, Ottawa",
             "America/Toronto", timedelta(0), timedelta(0))
 
-        async def speech(call_sid, text, language, *, on_booking_playback=None):
+        async def speech(call_sid, text, language, *, on_booking_playback=None, on_booking_playback_complete=None):
             assert on_booking_playback(SimpleNamespace(session_id="stream", generation=1))
+            on_booking_playback_complete(SimpleNamespace(session_id="stream", generation=1), True)
             return True
 
         orchestrator._speak_to_caller = speech
@@ -532,8 +536,9 @@ def test_correction_revokes_presented_tuple_before_model_work():
             "Synthetic Consultant", "appointment", "1901 Banff Ave, Ottawa",
             "America/Toronto", timedelta(0), timedelta(0))
 
-        async def speech(call_sid, text, language, *, on_booking_playback=None):
+        async def speech(call_sid, text, language, *, on_booking_playback=None, on_booking_playback_complete=None):
             assert on_booking_playback(SimpleNamespace(session_id="stream", generation=1))
+            on_booking_playback_complete(SimpleNamespace(session_id="stream", generation=1), True)
             return True
 
         orchestrator._speak_to_caller = speech
@@ -558,10 +563,11 @@ def test_queued_approval_before_playback_finishes_cannot_become_later_consent():
             "America/Toronto", timedelta(0), timedelta(0))
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def speech(call_sid, text, language, *, on_booking_playback=None):
+        async def speech(call_sid, text, language, *, on_booking_playback=None, on_booking_playback_complete=None):
             assert on_booking_playback(SimpleNamespace(session_id="stream", generation=1))
             started.set()
             await release.wait()
+            on_booking_playback_complete(SimpleNamespace(session_id="stream", generation=1), True)
             return True
 
         orchestrator._speak_to_caller = speech
@@ -593,8 +599,9 @@ def test_expired_presented_proposal_cannot_dispatch():
             "Synthetic Consultant", "appointment", "1901 Banff Ave, Ottawa",
             "America/Toronto", timedelta(0), timedelta(0))
 
-        async def speech(call_sid, text, language, *, on_booking_playback=None):
+        async def speech(call_sid, text, language, *, on_booking_playback=None, on_booking_playback_complete=None):
             assert on_booking_playback(SimpleNamespace(session_id="stream", generation=1))
+            on_booking_playback_complete(SimpleNamespace(session_id="stream", generation=1), True)
             return True
 
         orchestrator._speak_to_caller = speech

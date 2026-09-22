@@ -3619,7 +3619,8 @@ CRITICAL INSTRUCTIONS:
         return response
 
     async def _speak_to_caller(self, call_sid: str, text: str, language: str,
-                               *, on_booking_playback=None, speech_guard=None) -> bool:
+                               *, on_booking_playback=None, on_booking_playback_complete=None,
+                               speech_guard=None) -> bool:
         """
         Speak response to caller using streaming TTS.
 
@@ -3766,10 +3767,16 @@ CRITICAL INSTRUCTIONS:
                 return False
 
             audio_duration = stream_result.bytes_sent / 8000.0
+            def acknowledged(playback):
+                if on_booking_playback_complete is not None:
+                    on_booking_playback_complete(
+                        playback, bool(authorized() and self._speech_is_current(call_sid, owner)))
+
             playback_confirmed = await twilio_handler.wait_for_playback(
                 owner.playback,
                 stream_result,
-                timeout=max(1.0, audio_duration + 2.0)
+                timeout=max(1.0, audio_duration + 2.0),
+                **({"on_acknowledged": acknowledged} if on_booking_playback_complete is not None else {})
             )
             if not playback_confirmed:
                 logger.warning(

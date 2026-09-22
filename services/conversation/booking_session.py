@@ -22,6 +22,14 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def confirmation_diagnostic(stage: str, reason: str) -> None:
+    """Fixed internal classifications only, without caller or appointment data."""
+    try:
+        logger.info("BookingConfirmationDiagnostic stage={} reason={}", stage, reason)
+    except Exception:
+        pass
+
+
 class BookingSession:
     """One bounded logical call session; all transitions run on its event loop."""
 
@@ -167,17 +175,22 @@ class BookingSession:
         presentation = None
         pair = None
         readback = None
+        proposal_state = self.proposals
+        completion_recorded = False
+        presented = False
 
         def begun(owner):
             nonlocal presentation, pair, readback
-            if not self.turn.check_output(token).allowed or self.closed:
+            if (not self.turn.check_output(token).allowed or self.closed
+                    or self.proposals is not proposal_state):
                 return None
             # Twilio's mark name is private to wait_for_playback; that method
             # returns success only for this current PlaybackOwner's exact mark.
             # Bind both state tokens to its handler session and generation.
             pair = (owner.session_id, str(owner.generation))
-            decision = self.proposals.begin_presentation(
+            decision = proposal_state.begin_presentation(
                 self.offer_token, language, *pair, at=self.clock())
+            confirmation_diagnostic("presentation_start", decision.status.value)
             if decision.status is not ProposalStatus.PRESENTATION_STARTED:
                 return None
             presentation = decision.presentation_token
@@ -185,39 +198,59 @@ class BookingSession:
             readback = decision.text
             return decision.text
 
-        success = False
+        def completed(owner, success):
+            nonlocal completion_recorded, presented
+            if completion_recorded or presentation is None or pair is None:
+                return
+            completion_recorded = True
+            matching = pair == (owner.session_id, str(owner.generation))
+            outcome = proposal_state.complete_presentation(
+                presentation, *pair,
+                success=bool(success is True and matching
+                             and self.proposals is proposal_state
+                             and self.turn.check_output(token).allowed
+                             and self.owns(self.context, self.handler)),
+                completed_at=self.clock())
+            presented = outcome.status is ProposalStatus.PRESENTED
+            confirmation_diagnostic("presentation_complete", outcome.status.value)
+            if presented and readback is not None:
+                self.context.add_assistant_message(readback)
+
         try:
-            success = await orchestrator._speak_to_caller(
-                call_sid, "", language, on_booking_playback=begun)
+            await orchestrator._speak_to_caller(
+                call_sid, "", language, on_booking_playback=begun,
+                on_booking_playback_complete=completed)
         finally:
-            if presentation is not None and pair is not None:
-                outcome = self.proposals.complete_presentation(
+            if not completion_recorded and presentation is not None and pair is not None:
+                outcome = proposal_state.complete_presentation(
                     presentation, *pair,
-                    success=bool(success and self.turn.check_output(token).allowed
-                                 and self.owns(self.context, self.handler)),
+                    success=False,
                     completed_at=self.clock())
-                success = outcome.status is ProposalStatus.PRESENTED
-                if success and readback is not None:
-                    self.context.add_assistant_message(readback)
-        return success
+                confirmation_diagnostic("presentation_complete", outcome.status.value)
+        return presented
 
     async def confirm(self, caller_text: str, language: str, token) -> BookingOutcome | None:
         from services.llm.tool_protocol import caller_approval
         if (self.closed or self.unresolved or self.current_receipt is None
                 or self.offer_token is None or not self.turn.check_output(token).allowed):
+            confirmation_diagnostic("confirmation", "not_ready")
             return None
         literal = caller_approval(caller_text, language)
         if literal is None:
+            confirmation_diagnostic("confirmation", "unrecognized_answer")
             return None
         decision = self.proposals.confirm(self.offer_token, self.current_receipt,
                                           literal, self.clock())
+        confirmation_diagnostic("confirmation", decision.status.value)
         if decision.status is not ProposalStatus.APPROVED:
             return None
         claimed = self.proposals.consume(self.offer_token, self.clock())
+        confirmation_diagnostic("claim", claimed.status.value)
         if claimed.status is not ProposalStatus.CLAIMED:
             return None
         operation_key = claimed.approved.proposal.proposal_id
         if not self.turn.claim_dispatch(token, operation_key).granted:
+            confirmation_diagnostic("dispatch_gate", "not_granted")
             return None
         self.dispatch_token, self.approval = token, claimed.approved
         trusted = TrustedBookingContext(
@@ -235,9 +268,11 @@ class BookingSession:
             self.unresolved = True
             raise
         except Exception:
+            confirmation_diagnostic("create_result", "exception")
             self.turn.record_outcome(operation_key, OperationOutcome.UNKNOWN)
             self.unresolved = True
             return BookingOutcome.PENDING
+        confirmation_diagnostic("create_result", result.outcome.value)
         if result.outcome is BookingOutcome.VERIFIED:
             self.turn.record_outcome(operation_key, OperationOutcome.KNOWN_SUCCESS)
         elif result.outcome in (BookingOutcome.INELIGIBLE, BookingOutcome.CONFLICT,

@@ -81,6 +81,7 @@ class TwilioMediaStreamHandler:
         self._active_playback: PlaybackOwner | None = None
         self._playback_closed = False
         self._pending_marks: dict[str, tuple[PlaybackOwner, asyncio.Future]] = {}
+        self._mark_observers: dict[str, Callable] = {}
         self._send_tasks: set[asyncio.Task] = set()
         self._send_cleanup_complete = asyncio.Event()
         self._send_cleanup_complete.set()
@@ -241,7 +242,17 @@ class TwilioMediaStreamHandler:
             return
         owner, playback_wait = pending
         if self.is_current_playback(owner) and not playback_wait.done():
-            playback_wait.set_result(True)
+            observer = self._mark_observers.pop(mark_name, None)
+            if observer is not None:
+                try:
+                    observer(owner)
+                except Exception:
+                    logger.warning("Twilio: Playback acknowledgement observer failed")
+                    if not playback_wait.done():
+                        playback_wait.set_result(False)
+                    return
+            if not playback_wait.done():
+                playback_wait.set_result(self.is_current_playback(owner))
 
     async def begin_playback(self) -> PlaybackOwner:
         """Retire the prior generation and order its clear before new media."""
@@ -460,12 +471,16 @@ class TwilioMediaStreamHandler:
         owner: PlaybackOwner,
         stream_result: PlaybackStreamResult,
         timeout: float,
+        *,
+        on_acknowledged: Optional[Callable] = None,
     ) -> bool:
         if not stream_result.completed or not self.is_current_playback(owner):
             return False
         mark_name = f"playback-{uuid4().hex}"
         playback_wait = asyncio.get_running_loop().create_future()
         self._pending_marks[mark_name] = (owner, playback_wait)
+        if on_acknowledged is not None:
+            self._mark_observers[mark_name] = on_acknowledged
         send_task: asyncio.Task | None = None
         deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
 
@@ -503,6 +518,7 @@ class TwilioMediaStreamHandler:
             raise
         finally:
             self._pending_marks.pop(mark_name, None)
+            self._mark_observers.pop(mark_name, None)
 
     @property
     def cleanup_pending(self) -> bool:
