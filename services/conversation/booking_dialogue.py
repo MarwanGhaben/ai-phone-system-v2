@@ -117,13 +117,21 @@ def turn_language(text: str, reported: str | None, current: str) -> str:
         return "ar"
     # Names, yes/no, times and email spellings are not a language switch.
     words = re.findall(r"[a-z]+", text.casefold())
-    if (reported == "en" and len(words) >= 3
-            and set(words) & {"i", "what", "when", "where", "can", "could", "please", "would", "how"}):
+    # Canonical STT commits can omit detected language or carry the configured
+    # fallback. Clear caller text must not require a provider 'en' label.
+    if (len(words) >= 3
+            and (set(words) & {"i", "what", "when", "where", "can", "could", "please", "would", "how"}
+                 or re.search(r"\bmy (?:name|email|phone number) is\b", text, re.I))):
         return "en"
     return current if current in ("ar", "en") else "en"
 
 
 def plain_reply_ok(text: str, language: str) -> bool:
+    if language == "en":
+        arabic = len(re.findall(r"[\u0621-\u064a]", text))
+        latin = len(re.findall(r"[a-z]", text, re.I))
+        if arabic > latin:
+            return False
     if language == "ar" and not re.search(r"[\u0621-\u064a]", text):
         return False
     if language == "ar" and re.search(r"\b(?:staff member|appointment|toronto time|am|pm)\b", text, re.I):

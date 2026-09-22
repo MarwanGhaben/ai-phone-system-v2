@@ -173,4 +173,28 @@ def explicit_language_request(utterance: str) -> LanguageDecision | None:
         return "ar"
     if normalized in _ENGLISH_REQUESTS:
         return "en"
+    # Whole-utterance conversational requests, including common polite wrappers.
+    # Never search for a language word inside quotes, negation or unrelated facts.
+    conversational = re.sub(r"^no,\s*", "", normalized)
+    conversational = re.sub(r",?\s+please$", "", conversational)
+    conversational = re.sub(r"^please\s+", "", conversational)
+    conversational = re.sub(
+        r"^(?:(?:can|could|would|will) you |(?:can|could) we |"
+        r"i (?:want|would like) you to )(?:please )?", "", conversational)
+    match = re.fullmatch(
+        r"(?:(?:speak|talk)(?: to me| with me)?(?: in)?|"
+        r"(?:reply|respond|answer)(?: to me)? in|"
+        r"(?:switch|change)(?: (?:the )?language)? to|use) (english|arabic)",
+        conversational)
+    if match:
+        return "en" if match[1] == "english" else "ar"
+    if conversational in ("english", "arabic"):
+        return "en" if conversational == "english" else "ar"
     return None
+
+
+def persistent_language_request(utterance: str) -> bool:
+    """Distinguish saving a preference from changing this conversation's language."""
+    return explicit_language_request(utterance) is not None and bool(re.search(
+        r"\b(?:always|remember|save)\b|احفظ|دايما|دايماً",
+        _normalize_utterance(utterance)))

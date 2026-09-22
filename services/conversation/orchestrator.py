@@ -38,7 +38,7 @@ from services.conversation.barge_in_diagnostics import (
     bound_diagnostic_window,
     reset_diagnostic_state,
 )
-from services.conversation.language_policy import explicit_language_request
+from services.conversation.language_policy import explicit_language_request, persistent_language_request
 from services.calendar.calendar_base import TimeSlot
 from services.calendar.business_time import as_business_time, business_now
 from services.scheduling import spoken_arabic
@@ -1814,8 +1814,9 @@ Remember: This is a real phone call. Speak in COMPLETE SENTENCES. Be clear and h
 
     async def _process_verified_turn(self, call_sid, session, utterance, token) -> None:
         context = session.context
-        if not session.owns(self._conversations.get(call_sid),
-                            self._twilio_handlers.get(call_sid)):
+        if (not session.turn.check_output(token).allowed
+                or not session.owns(self._conversations.get(call_sid),
+                                    self._twilio_handlers.get(call_sid))):
             return
         context.language = turn_language(utterance.text, utterance.language, context.language)
         context.state = ConversationState.THINKING
@@ -1903,6 +1904,15 @@ VERIFIED PHONE BOOKING CONTEXT:
             parse_linked_calls, tool_result_message)
 
         context = session.context
+        requested_language = explicit_language_request(user_input)
+        if requested_language and not persistent_language_request(user_input):
+            if (not session.turn.check_output(token).allowed
+                    or not session.owns(self._conversations.get(call_sid),
+                                        self._twilio_handlers.get(call_sid))):
+                return _ABORTED_RESPONSE
+            context.language = requested_language
+            return ("Of course. I'll speak English." if requested_language == "en"
+                    else "بالتأكيد، سأتحدث معك بالعربية.")
         caller_day = requested_day(user_input, business_now())
         def localized(english: str, arabic: str) -> str:
             return arabic if context.language == "ar" else english
