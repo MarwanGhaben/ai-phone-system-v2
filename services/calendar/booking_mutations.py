@@ -12,12 +12,46 @@ import re
 from typing import Awaitable, Callable
 from urllib.parse import quote
 
+from loguru import logger
+
 from services.calendar.service_facts import _duration
 
 
 _TIME = re.compile(r"(?P<base>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(?P<fraction>\d{1,7}))?(?P<offset>Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)\Z")
 _HOST = "https://graph.microsoft.com/v1.0/solutions/bookingBusinesses/"
 _TOKEN_HOST = "https://login.microsoftonline.com/"
+_ERROR_CODES = frozenset({
+    "BadRequest", "Request_BadRequest", "ErrorInvalidRequest",
+    "InvalidAuthenticationToken", "Authorization_RequestDenied", "ErrorAccessDenied",
+    "TooManyRequests", "ErrorTooManyRequests", "ServiceUnavailable",
+    "InternalServerError", "UnknownError", "ResourceNotFound", "ErrorItemNotFound",
+})
+
+
+def record_create_diagnostic(stage: str, reason: str, *,
+                             http_status: int | None = None, body: bytes | None = None) -> None:
+    """Fixed classifications only; never retain provider messages or customer data.
+
+    Call sites supply constant stage/reason values. Logging cannot affect a
+    booking result, cause a second POST, or turn an uncertain result into success.
+    """
+    try:
+        code = "none" if body is None else "unclassified"
+        if body is not None:
+            try:
+                wire = json.loads(body)
+                error = wire.get("error") if type(wire) is dict else None
+                candidate = error.get("code") if type(error) is dict else None
+                if type(candidate) is str and candidate in _ERROR_CODES:
+                    code = candidate
+            except (ValueError, TypeError, RecursionError):
+                pass
+        logger.info("BookingCreateDiagnostic {}", json.dumps({
+            "stage": stage, "reason": reason,
+            "http_status": http_status, "provider_code": code,
+        }, sort_keys=True))
+    except Exception:
+        pass
 
 
 def _valid(value: object) -> bool:
@@ -323,6 +357,7 @@ class GraphBookingMutations:
                 or prepared.request.tenant_id != self.tenant_id
                 or prepared.request.business_id != self.business_id):
             return MutationResponse("invalid")
+        http_status = None
         try:
             async def create_request(permit: _Permit):
                 async with self._slots:
@@ -342,17 +377,25 @@ class GraphBookingMutations:
                                  "Content-Type": "application/json"}, content=prepared.body)
             result = await self._owned(create_request)
             if result is None:
+                record_create_diagnostic("transport", "not_sent")
                 return MutationResponse("not_sent")
             status, body = result
+            http_status = status
             if status != 201:
+                record_create_diagnostic("transport", "http_rejected", http_status=status, body=body)
                 return MutationResponse("uncertain")
             wire = json.loads(body, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
             provider_id = wire.get("id") if type(wire) is dict else None
+            record_create_diagnostic("transport", "receipt_received" if _provider_id(provider_id)
+                                     else "receipt_invalid", http_status=status)
             return (MutationResponse("receipt", provider_id) if _provider_id(provider_id)
                     else MutationResponse("uncertain"))
         except asyncio.CancelledError:
+            record_create_diagnostic("transport", "cancelled", http_status=http_status)
             raise
         except Exception:
+            record_create_diagnostic("transport", "response_invalid" if http_status is not None
+                                     else "transport_failed", http_status=http_status)
             return MutationResponse("uncertain")
 
     async def read_exact(self, provider_id: str, request: BookingMutationRequest) -> VerifiedAppointment | None:

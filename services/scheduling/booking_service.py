@@ -8,7 +8,9 @@ from enum import Enum
 from typing import Callable, Protocol
 from uuid import UUID
 
-from services.calendar.booking_mutations import BookingMutationRequest, GraphBookingMutations
+from services.calendar.booking_mutations import (
+    BookingMutationRequest, GraphBookingMutations, record_create_diagnostic,
+)
 from services.config.accountants_service import AccountantsService
 from services.scheduling.booking_check import (assess_booking, load_booking_policy,
                                                 make_booking_query, EVIDENCE_AGE)
@@ -209,16 +211,20 @@ class BookingService:
         if grant.status is not DispatchStatus.GRANTED:
             return BookingResult(BookingOutcome.PENDING if grant.status is DispatchStatus.UNAVAILABLE
                                  else BookingOutcome.STORE_ERROR, op.operation_id)
+        record_create_diagnostic("dispatch", "claimed")
         # The claim has committed. This check also prevents entering transport
         # admission when the final authority await itself crosses expiry.
         if not await self._authorized(context, approval):
+            record_create_diagnostic("dispatch", "authority_lost")
             return BookingResult(BookingOutcome.PENDING, op.operation_id)
         try:
             dispatch_check = self._now()
         except ValueError:
+            record_create_diagnostic("dispatch", "invalid_clock")
             return BookingResult(BookingOutcome.PENDING, op.operation_id)
         if (dispatch_check < checked_at or dispatch_check < approval.approved_at
                 or dispatch_check >= proposal.expires_at):
+            record_create_diagnostic("dispatch", "expired_or_backwards_clock")
             return BookingResult(BookingOutcome.PENDING, op.operation_id)
 
         denial = BookingOutcome.PENDING
@@ -275,7 +281,11 @@ class BookingService:
             except Exception:
                 return False
 
-        response = await self.mutations.create_once(prepared, before_send=before_send)
+        try:
+            response = await self.mutations.create_once(prepared, before_send=before_send)
+        except asyncio.CancelledError:
+            record_create_diagnostic("create", "cancelled")
+            raise
         if response.status == "not_sent":
             return BookingResult(denial, op.operation_id)
         if response.status != "receipt" or response.provider_id is None:
@@ -286,13 +296,18 @@ class BookingService:
                                                      grant.owner_token, response.provider_id,
                                                      now=self._now())
         except asyncio.CancelledError:
+            record_create_diagnostic("receipt_store", "cancelled")
             raise
         except Exception:
+            record_create_diagnostic("receipt_store", "store_error")
             return BookingResult(BookingOutcome.PENDING, op.operation_id)
         if not saved:
+            record_create_diagnostic("receipt_store", "not_saved")
             return BookingResult(BookingOutcome.PENDING, op.operation_id)
+        record_create_diagnostic("receipt_store", "saved")
         verified = await self.mutations.read_exact(response.provider_id, request)
         if verified is None:
+            record_create_diagnostic("readback", "unverified")
             return BookingResult(BookingOutcome.PENDING, op.operation_id)
         return await self._finalize(approval, context, op.operation_id, grant.fence,
                                     grant.owner_token, response.provider_id, request)

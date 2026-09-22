@@ -182,9 +182,9 @@ def decode_availability(
 ) -> AvailabilityResult:
     """Decode one complete availability response into the accepted domain types.
 
-    Distinct overlapping free intervals are retained in provider order. Exact
-    duplicates and free/non-free contradictions are rejected; adjacent evidence
-    is not overlapping.
+    Distinct overlapping free intervals are retained in provider order. Repeated
+    evidence for the same staff, classification and instants is counted once.
+    Free/non-free contradictions are rejected; adjacent evidence is not overlapping.
     """
     _require_contract(query, observed_at)
     try:
@@ -255,7 +255,7 @@ def decode_availability(
                     _invalid()
                 identity = (staff_id, kind, interval.start, interval.end)
                 if identity in seen_items:
-                    _invalid()
+                    continue
                 seen_items.add(identity)
                 if kind == "incomplete":
                     response_incomplete = True

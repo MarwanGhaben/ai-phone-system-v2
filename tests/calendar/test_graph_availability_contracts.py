@@ -408,7 +408,7 @@ def test_equal_reversed_and_out_of_window_intervals_are_invalid() -> None:
                        AvailabilityFailureCategory.INVALID_RESPONSE)
 
 
-def test_exact_bounds_are_allowed_and_duplicate_items_are_rejected() -> None:
+def test_exact_bounds_are_allowed_and_duplicate_items_are_idempotent() -> None:
     query = make_query(
         start=datetime(2026, 6, 18, 14, 0, tzinfo=UTC),
         end=datetime(2026, 6, 18, 15, 0, tzinfo=UTC),
@@ -418,8 +418,7 @@ def test_exact_bounds_are_allowed_and_duplicate_items_are_rejected() -> None:
     assert accepted.status is AvailabilityStatus.AVAILABLE
 
     duplicate = decode(payload([staff_entry(items=[exact, dict(exact)])]), query)
-    assert_failure(duplicate, AvailabilityStatus.INVALID_RESPONSE,
-                   AvailabilityFailureCategory.INVALID_RESPONSE)
+    assert duplicate == accepted
 
 
 def test_free_non_free_overlap_is_invalid_but_adjacent_and_free_overlap_are_valid() -> None:
