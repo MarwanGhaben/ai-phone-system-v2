@@ -45,7 +45,9 @@ def _validate_item(item):
     try:
         start = parse_graph_datetime(item['startDateTime']['dateTime'])
         end = parse_graph_datetime(item['endDateTime']['dateTime'])
-        if end <= start:
+        # Graph can include equal endpoints alongside usable intervals. They
+        # occupy no time and the slot generator emits nothing for them.
+        if end < start:
             raise AvailabilityReadError()
     except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
         raise AvailabilityReadError() from None

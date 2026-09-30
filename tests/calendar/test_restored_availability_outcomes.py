@@ -41,6 +41,9 @@ def restored_guard():
     scope = {'__name__': 'restored_guard_fixture'}
     exec(compile(fixture, 'restored_guard_fixture', 'exec'), scope)
     guard = scope['BookingSafetyGuardsTests']()
+    # This fixture borrows synchronous setUp only, not unittest's async runner.
+    # Its mock.patch cleanups must still execute when pytest tears it down.
+    guard._callCleanup = lambda function, *args, **kwargs: function(*args, **kwargs)
     guard.setUp()
     try:
         yield guard
@@ -165,3 +168,37 @@ def test_only_restored_check_method_changes():
     previous, candidate = methods(before), methods(after)
     assert previous.keys() == candidate.keys()
     assert [name for name in previous if previous[name] != candidate[name]] == ['_check_booking']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('language', ['en', 'ar'])
+@pytest.mark.parametrize('zero_status', ['available', 'busy', 'outOfOffice'])
+async def test_zero_duration_entry_preserves_real_slots_and_pending_offer(restored_guard, language, zero_status):
+    """Live Rami/Abdul responses each include an equal-endpoint entry."""
+    guard = restored_guard
+    guard.context.language = language
+    response = wire('available')
+    zero = {
+        'status': zero_status,
+        'startDateTime': {'dateTime': '2030-01-08T10:00:00-05:00'},
+        'endDateTime': {'dateTime': '2030-01-08T10:00:00-05:00'},
+    }
+    response['value'][0]['availabilityItems'].insert(0, zero)
+    service = calendar(response)
+    slots = await service.get_available_slots('service-1', 'staff-1')
+    assert len(slots) == 2
+    assert all(slot.end_time > slot.start_time for slot in slots)
+    guard.calendar.get_available_slots = service.get_available_slots
+    reply = await guard.orchestrator._check_booking('call-a', guard._arguments())
+    assert reply.startswith('SLOT_AVAILABLE:'), reply
+    assert guard.context.pending_booking['staff_id'] == 'staff-1'
+    guard.calendar.create_booking.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['available', 'busy', 'outOfOffice'])
+async def test_only_zero_duration_entries_never_create_a_slot(status):
+    response = wire(status)
+    item = response['value'][0]['availabilityItems'][0]
+    item['endDateTime'] = dict(item['startDateTime'])
+    assert await calendar(response).get_available_slots('service-1', 'staff-1') == []
