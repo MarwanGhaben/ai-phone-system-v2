@@ -41,6 +41,7 @@ class OpenAILLM(LLMServiceBase):
 
     # Token counts for common models (rough estimates)
     TOKEN_COSTS = {
+        "gpt-6-luna": {"input": 0.10, "output": 0.50},
         "gpt-4o": {"input": 2.50, "output": 10.00},  # per 1M tokens
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
         "gpt-4-turbo": {"input": 10.00, "output": 30.00},
@@ -88,6 +89,18 @@ class OpenAILLM(LLMServiceBase):
             self._client = AsyncOpenAI(**kwargs)
         return self._client
 
+    def _generation_parameters(self, request: LLMRequest) -> dict:
+        """Keep the voice budget while forwarding Luna fields through SDK 1.10."""
+        if self.model == "gpt-6-luna":
+            return {
+                "temperature": request.temperature,
+                "extra_body": {
+                    "reasoning_effort": "none",
+                    "max_completion_tokens": request.max_tokens,
+                },
+            }
+        return {"temperature": request.temperature, "max_tokens": request.max_tokens}
+
     async def chat(self, request: LLMRequest) -> LLMResponse:
         """
         Non-streaming chat completion
@@ -109,8 +122,7 @@ class OpenAILLM(LLMServiceBase):
             response = await client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
+                **self._generation_parameters(request),
                 stream=False,
             )
 
@@ -155,33 +167,35 @@ class OpenAILLM(LLMServiceBase):
             response = await client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
+                **self._generation_parameters(request),
                 stream=True,
             )
 
             content_so_far = ""
 
-            async for chunk in response:
-                # Check if this is the final chunk
-                if chunk.choices[0].finish_reason is not None:
-                    yield LLMChunk(
-                        delta="",
-                        content=content_so_far,
-                        is_final=True,
-                        finish_reason=chunk.choices[0].finish_reason
-                    )
-                    break
+            try:
+                async for chunk in response:
+                    # Check if this is the final chunk
+                    if chunk.choices[0].finish_reason is not None:
+                        yield LLMChunk(
+                            delta="",
+                            content=content_so_far,
+                            is_final=True,
+                            finish_reason=chunk.choices[0].finish_reason
+                        )
+                        break
 
-                # Extract delta content
-                delta = chunk.choices[0].delta.content or ""
-                if delta:
-                    content_so_far += delta
-                    yield LLMChunk(
-                        delta=delta,
-                        content=content_so_far,
-                        is_final=False
-                    )
+                    # Extract delta content
+                    delta = chunk.choices[0].delta.content or ""
+                    if delta:
+                        content_so_far += delta
+                        yield LLMChunk(
+                            delta=delta,
+                            content=content_so_far,
+                            is_final=False
+                        )
+            finally:
+                await response.close()
 
         except Exception as e:
             logger.error(f"OpenAI: Streaming error: {e}")
@@ -220,8 +234,7 @@ class OpenAILLM(LLMServiceBase):
             kwargs = {
                 "model": self.model,
                 "messages": messages,
-                "temperature": request.temperature,
-                "max_tokens": request.max_tokens,
+                **self._generation_parameters(request),
                 "stream": False,
             }
             if openai_tools:
@@ -230,7 +243,7 @@ class OpenAILLM(LLMServiceBase):
                 if request.metadata.get("single_tool_call") is True:
                     # The pinned 1.10 SDK predates this named parameter, but
                     # extra_body forwards it unchanged to the API request.
-                    kwargs["extra_body"] = {"parallel_tool_calls": False}
+                    kwargs.setdefault("extra_body", {})["parallel_tool_calls"] = False
 
             response = await client.chat.completions.create(**kwargs)
 
