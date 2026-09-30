@@ -16,6 +16,7 @@ from loguru import logger
 
 from config.settings import get_settings
 from services.calendar.business_time import business_now, parse_graph_datetime
+from services.calendar.legacy_availability import AvailabilityReadError, completed_staff_availability
 from services.calendar.contracts import decode_availability
 from services.calendar.service_facts import ServiceFactsRead, decode_service_facts
 from services.calendar.calendar_base import (
@@ -692,11 +693,14 @@ class MSBookingsService(CalendarServiceBase):
             days_ahead: Number of days to look ahead
 
         Returns:
-            List of available time slots
+            List of available time slots, empty only after a completed read.
+
+        Raises:
+            AvailabilityReadError: Availability could not be established.
         """
         if not await self.is_available():
             logger.warning("MS Bookings: Not configured")
-            return []
+            raise AvailabilityReadError()
 
         try:
             # Ensure staff is loaded
@@ -737,11 +741,13 @@ class MSBookingsService(CalendarServiceBase):
 
             result = await self._make_request("POST", endpoint, json_data=payload)
 
+            staff_availability = completed_staff_availability(result, staff_ids)
+
             slots = []
             slot_duration = 30  # minutes
 
-            if result and 'value' in result:
-                for staff_avail in result['value']:
+            if staff_availability:
+                for staff_avail in staff_availability:
                     sid = staff_avail.get('staffId', '')
                     staff_name = "Staff Member"
                     for s in self._staff_cache.values():
@@ -778,10 +784,11 @@ class MSBookingsService(CalendarServiceBase):
             logger.info(f"MS Bookings: Found {len(slots)} available slots")
             return slots  # Return all slots — truncation here broke day matching
 
-        except Exception as e:
-            logger.error(f"MS Bookings: Failed to get availability: {e}")
-
-        return []
+        except AvailabilityReadError:
+            raise
+        except Exception:
+            logger.warning("MS Bookings: Availability read failed")
+            raise AvailabilityReadError() from None
 
     async def create_booking(self, service_id: str, staff_id: str,
                             start_time: datetime, customer_name: str,
