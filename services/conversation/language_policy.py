@@ -1,8 +1,8 @@
 """Deterministic policy for explicit caller language requests.
 
-The matcher intentionally recognizes only complete, auditable utterances.  It is
-not a language detector and must not infer a preference from arbitrary caller or
-assistant text.
+The matcher recognizes complete requests and explicit independent clauses. It
+is not a language detector and must not infer a preference from arbitrary caller
+or assistant text.
 """
 
 from __future__ import annotations
@@ -162,7 +162,7 @@ def _normalize_utterance(utterance: str) -> str:
     return re.sub(r"\s+", " ", normalized)
 
 
-def explicit_language_request(utterance: str) -> LanguageDecision | None:
+def _whole_language_request(utterance: str) -> LanguageDecision | None:
     """Return the explicitly requested language for a complete utterance."""
 
     if not isinstance(utterance, str):
@@ -193,8 +193,40 @@ def explicit_language_request(utterance: str) -> LanguageDecision | None:
     return None
 
 
+def explicit_language_request(utterance: str) -> LanguageDecision | None:
+    """Recognize a direct request alone or as an independent conversation clause.
+
+    Do not search arbitrary text for language keywords. Conflicting, quoted,
+    reported and negated compound statements require dialogue clarification.
+    """
+    if not isinstance(utterance, str) or len(utterance) > 2048:
+        return None
+    whole = _whole_language_request(utterance)
+    if whole is not None:
+        return whole
+    normalized = _normalize_utterance(utterance)
+    if re.search(
+        r'["“”«»]|\b(?:said|says|say|quoted?|told|asked|no|not|never|'
+        r"don't|dont|doesn't|isn't|or|either)\b|"
+        r"(?:^|\s)(?:قال|قالت|بيقول|لا|مش|مو|ليس|أو|او)(?:\s|$)",
+        normalized,
+    ):
+        return None
+    # STT often omits punctuation. Task-start boundaries permit a complete
+    # leading language request without accepting language words inside a task.
+    clauses = re.split(
+        r"[,،;؛!?؟]+|\s+(?:and|then)\s+|"
+        r"\s+(?=(?:i (?:want|need|would)|can you check|could you check|"
+        r"check |book |بدي |بدنا |احجز |شوف |أنا |انا ))", normalized)
+    if not 1 < len(clauses) <= 8:
+        return None
+    requests = {decision for clause in clauses
+                if (decision := _whole_language_request(clause)) is not None}
+    return requests.pop() if len(requests) == 1 else None
+
+
 def persistent_language_request(utterance: str) -> bool:
     """Distinguish saving a preference from changing this conversation's language."""
-    return explicit_language_request(utterance) is not None and bool(re.search(
+    return _whole_language_request(utterance) is not None and bool(re.search(
         r"\b(?:always|remember|save)\b|احفظ|دايما|دايماً",
         _normalize_utterance(utterance)))
