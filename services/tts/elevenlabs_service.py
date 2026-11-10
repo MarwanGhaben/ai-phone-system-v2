@@ -173,10 +173,11 @@ class ElevenLabsStream:
                 "xi-api-key": self._service.api_key,
                 "Content-Type": "application/json",
             }
-            params = {
-                "output_format": self._service.output_format,
-                "optimize_streaming_latency": "2",
-            }
+            params = {"output_format": self._service.output_format}
+            # Eleven v4 models refuse the deprecated latency option with HTTP 400
+            # (owner server check, 2026-11-10). Earlier models keep it unchanged.
+            if not str(self._service.model).startswith("eleven_v4"):
+                params["optimize_streaming_latency"] = "2"
             body = {
                 "text": self._request.text,
                 "model_id": self._service.model,
