@@ -18,6 +18,7 @@ from enum import Enum
 import hashlib
 import json
 import math
+import os
 from typing import Any, AsyncIterator, Deque, Optional
 from uuid import uuid4
 from loguru import logger
@@ -69,6 +70,30 @@ class STTTransportOutcome(str, Enum):
     REMOTE_CLOSED = "remote_closed"
     RECEIVER_ERROR = "receiver_error"
     LOCAL_DISCONNECT = "local_disconnect"
+
+
+VAD_SILENCE_ENV = "ELEVENLABS_STT_VAD_SILENCE_SECS"
+DEFAULT_VAD_SILENCE_SECS = 0.7
+MIN_VAD_SILENCE_SECS = 0.3
+MAX_VAD_SILENCE_SECS = 1.5
+
+
+def vad_silence_threshold_param() -> str:
+    """Return the caller-pause threshold as a short decimal string; never raises."""
+    value = DEFAULT_VAD_SILENCE_SECS
+    try:
+        raw = os.environ.get(VAD_SILENCE_ENV)
+        if isinstance(raw, str) and raw.strip():
+            parsed = float(raw.strip())
+            if (
+                math.isfinite(parsed)
+                and MIN_VAD_SILENCE_SECS <= parsed <= MAX_VAD_SILENCE_SECS
+            ):
+                value = parsed
+    except Exception:
+        value = DEFAULT_VAD_SILENCE_SECS
+    text = f"{value:.3f}".rstrip("0")
+    return text + "0" if text.endswith(".") else text
 
 
 class ElevenLabsSTT(STTServiceBase):
@@ -275,7 +300,7 @@ class ElevenLabsSTT(STTServiceBase):
             "audio_format": "ulaw_8000",
             "sample_rate": "8000",
             "commit_strategy": "vad",
-            "vad_silence_threshold_secs": "0.3",
+            "vad_silence_threshold_secs": vad_silence_threshold_param(),
             "include_language_detection": "true",
         }
         if self.language:

@@ -80,8 +80,10 @@ def _query(url: str) -> dict[str, list[str]]:
     return parse_qs(urlsplit(url).query, keep_blank_values=True)
 
 
-def test_probe_queries_match_actual_local_adapter_constructor() -> None:
+def test_probe_queries_match_actual_local_adapter_constructor(monkeypatch) -> None:
     from services.stt.elevenlabs_stt_service import ElevenLabsSTT
+    # The diagnostic script keeps the original 0.3 s threshold; pin the adapter to it.
+    monkeypatch.setenv("ELEVENLABS_STT_VAD_SILENCE_SECS", "0.3")
 
     for arm in probe.arms():
         adapter = ElevenLabsSTT(

@@ -29,13 +29,13 @@ BASE_QUERY = {
     "audio_format": ["ulaw_8000"],
     "sample_rate": ["8000"],
     "commit_strategy": ["vad"],
-    "vad_silence_threshold_secs": ["0.3"],
+    "vad_silence_threshold_secs": ["0.7"],
     "include_language_detection": ["true"],
 }
 BASE_URL = (
     "wss://api.elevenlabs.io/v1/speech-to-text/realtime?"
     "model_id=scribe_v2_realtime&audio_format=ulaw_8000&sample_rate=8000&"
-    "commit_strategy=vad&vad_silence_threshold_secs=0.3&"
+    "commit_strategy=vad&vad_silence_threshold_secs=0.7&"
     "include_language_detection=true"
 )
 
