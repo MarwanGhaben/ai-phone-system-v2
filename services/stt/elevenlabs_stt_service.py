@@ -96,6 +96,24 @@ def vad_silence_threshold_param() -> str:
     return text + "0" if text.endswith(".") else text
 
 
+LANGUAGE_LOCK_ENV = "ELEVENLABS_STT_LANGUAGE_LOCK"
+_LANGUAGE_UNLOCK_VALUES = frozenset({"off", "false", "0", "no", "unlocked"})
+
+
+def language_lock_enabled() -> bool:
+    """True when the provider may be told the caller language (default); never raises.
+
+    Only an explicit unlock value lets the provider always auto-detect.
+    """
+    try:
+        raw = os.environ.get(LANGUAGE_LOCK_ENV)
+        if isinstance(raw, str) and raw.strip().lower() in _LANGUAGE_UNLOCK_VALUES:
+            return False
+    except Exception:
+        pass
+    return True
+
+
 class ElevenLabsSTT(STTServiceBase):
     """
     ElevenLabs Scribe v2 Realtime STT Service
@@ -251,6 +269,17 @@ class ElevenLabsSTT(STTServiceBase):
                 or revision != self._terminal_revision
             ):
                 return False
+            if (
+                not language_lock_enabled()
+                and self._websocket is not None
+                and self._status == STTStatus.CONNECTED
+            ):
+                # Unlocked: the provider always auto-detects, so only record the
+                # language; a healthy transport stays untouched. A dead one is
+                # still replaced below, as before.
+                self.language = language_code
+                logger.info("ElevenLabs STT: Language recorded without transport change")
+                return True
             logger.info("ElevenLabs STT: Replacing transport for language change")
             self.language = language_code
             return await self._replace_transport_locked(revision)
@@ -303,7 +332,7 @@ class ElevenLabsSTT(STTServiceBase):
             "vad_silence_threshold_secs": vad_silence_threshold_param(),
             "include_language_detection": "true",
         }
-        if self.language:
+        if self.language and language_lock_enabled():
             params["language_code"] = self.language
         if self.filter_background_audio:
             params["filter_background_audio"] = "true"

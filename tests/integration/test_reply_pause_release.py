@@ -30,6 +30,7 @@ reply_builder = load("restored_reply_builder_for_reply_pause", "scripts/build_re
 OLD_IMAGE = repair.ACCEPTED_IMAGE
 REVISION = repair.ACCEPTED_REVISION
 VOICE_REVISION = "3d70fd1d461b809aec9ecbf8033aa4d85df13d49"
+REVISION_COMMIT = "84a9f975eda54c2003e41b8b55e74dff5d8d7aba"  # this release's own commit
 SETTINGS = {"elevenlabs_model": "eleven_v4_turbo", "elevenlabs_voice_id": "SomeVoice0123456789ab"}
 
 
@@ -111,7 +112,14 @@ class Harness:
         pass
 
     def git_bytes(self, path):
-        return (ROOT / path).read_bytes() + (b"# unreviewed" if self.fault == "source" else b"")
+        if path == repair.STT_PATH:
+            # The working tree carries the later language lock change; this release
+            # installs the file as committed at its own commit.
+            data = subprocess.check_output(
+                ["git", "-c", "safe.directory=*", "show", REVISION_COMMIT + ":" + path], cwd=ROOT)
+        else:
+            data = (ROOT / path).read_bytes()
+        return data + (b"# unreviewed" if self.fault == "source" else b"")
 
     def run(self, *args, **kwargs):
         self.events.append(args)
@@ -376,7 +384,11 @@ def test_controlled_override_changes_only_the_app_image():
 
 
 def test_pinned_hashes_match_the_files_in_the_working_tree():
-    assert digest((ROOT / repair.STT_PATH).read_bytes()) == repair.SOURCES[repair.STT_PATH]
+    # The speech recognition file in the working tree was changed by the later language
+    # lock release; this release pinned the file as committed at its own commit.
+    released_stt = subprocess.check_output(
+        ["git", "-c", "safe.directory=*", "show", REVISION_COMMIT + ":" + repair.STT_PATH], cwd=ROOT)
+    assert digest(released_stt) == repair.SOURCES[repair.STT_PATH]
     assert digest(reply_builder.patch_orchestrator(BASELINE)) == repair.SOURCES[repair.ORCHESTRATOR]
     assert digest((ROOT / repair.PROBE_PATH).read_bytes()) == repair.PROBE_SHA
     assert digest((ROOT / repair.BUILDER_PATH).read_bytes()) == repair.BUILDER_SHA
